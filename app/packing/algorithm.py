@@ -88,12 +88,10 @@ def is_supported(placed_boxes: List[PlacedBox], bx: float, by: float, bz: float,
     return supported_area >= bottom_area * 0.999
 
 
-def check_weight_bearing(placed_boxes: List[PlacedBox], bx: float, by: float, bz: float,
-                         bl: float, bw: float, b_weight: float) -> bool:
-    if bz <= 0.001:
-        return True
-
-    total_weight_on_level = 0.0
+def get_supporting_boxes(placed_boxes: List[PlacedBox], bx: float, by: float, bz: float,
+                         bl: float, bw: float) -> List[Tuple[PlacedBox, float]]:
+    """返回所有直接支撑新箱子的箱子及其接触面积"""
+    supporters = []
     for pb in placed_boxes:
         pb_top_z = pb.z + pb.height
         if abs(pb_top_z - bz) > 0.001:
@@ -106,13 +104,29 @@ def check_weight_bearing(placed_boxes: List[PlacedBox], bx: float, by: float, bz
 
         if x_overlap_end > x_overlap_start and y_overlap_end > y_overlap_start:
             overlap_area = (x_overlap_end - x_overlap_start) * (y_overlap_end - y_overlap_start)
-            pb_top_area = pb.length * pb.width
-            if pb_top_area > 0:
-                weight_ratio = overlap_area / pb_top_area
-                distributed_weight = b_weight * weight_ratio
-                if distributed_weight > pb.max_top_load + 0.001:
-                    return False
-            total_weight_on_level += b_weight
+            supporters.append((pb, overlap_area))
+    return supporters
+
+
+def check_weight_bearing(placed_boxes: List[PlacedBox], bx: float, by: float, bz: float,
+                         bl: float, bw: float, b_weight: float) -> bool:
+    """检查承压限制：新箱子重量按接触面积比例分配给各支撑箱"""
+    if bz <= 0.001:
+        return True
+
+    supporters = get_supporting_boxes(placed_boxes, bx, by, bz, bl, bw)
+    if not supporters:
+        return False
+
+    total_contact_area = sum(area for _, area in supporters)
+    if total_contact_area <= 0.001:
+        return False
+
+    for pb, contact_area in supporters:
+        weight_ratio = contact_area / total_contact_area
+        load_on_pb = b_weight * weight_ratio
+        if load_on_pb > pb.max_top_load + 0.001:
+            return False
 
     return True
 
@@ -149,6 +163,9 @@ def generate_extreme_points(placed: PlacedBox) -> List[ExtremePoint]:
     points.append(ExtremePoint(placed.x + placed.length, placed.y, placed.z))
     points.append(ExtremePoint(placed.x, placed.y + placed.width, placed.z))
     points.append(ExtremePoint(placed.x, placed.y, placed.z + placed.height))
+    points.append(ExtremePoint(placed.x + placed.length, placed.y + placed.width, placed.z))
+    points.append(ExtremePoint(placed.x + placed.length, placed.y, placed.z + placed.height))
+    points.append(ExtremePoint(placed.x, placed.y + placed.width, placed.z + placed.height))
     return points
 
 
@@ -198,7 +215,8 @@ def calculate_cog(placed_boxes: List[PlacedBox]) -> Tuple[float, float, float]:
 
 
 def drop_box(placed_boxes: List[PlacedBox], bx: float, by: float, bz: float,
-             bl: float, bw: float, bh: float) -> float:
+             bl: float, bw: float) -> float:
+    """让箱子自由下落到被支撑的位置"""
     if bz <= 0.001:
         return 0.0
 
@@ -215,23 +233,68 @@ def drop_box(placed_boxes: List[PlacedBox], bx: float, by: float, bz: float,
         y_overlap_end = min(by + bw, pb.y + pb.width)
 
         if x_overlap_end > x_overlap_start + 0.001 and y_overlap_end > y_overlap_start + 0.001:
-            if pb_top > final_z + 0.001:
-                overlap_area = (x_overlap_end - x_overlap_start) * (y_overlap_end - y_overlap_start)
-                bottom_area = bl * bw
-                if overlap_area >= bottom_area * 0.5:
+            overlap_area = (x_overlap_end - x_overlap_start) * (y_overlap_end - y_overlap_start)
+            bottom_area = bl * bw
+            if overlap_area >= bottom_area * 0.5:
+                if pb_top > final_z + 0.001:
                     final_z = pb_top
 
     return final_z
 
 
+def calculate_cog_offset(cog_x: float, cog_y: float, container_l: float, container_w: float) -> Tuple[float, float]:
+    """计算重心相对于中心的偏移比例"""
+    center_x = container_l / 2
+    center_y = container_w / 2
+    offset_x_ratio = abs(cog_x - center_x) / container_l
+    offset_y_ratio = abs(cog_y - center_y) / container_w
+    return offset_x_ratio, offset_y_ratio
+
+
+def predict_new_cog(placed_boxes: List[PlacedBox], new_box_weight: float,
+                    new_box_cx: float, new_box_cy: float, new_box_cz: float
+                    ) -> Tuple[float, float, float]:
+    """预测放置新箱子后的重心"""
+    current_weight = sum(pb.weight for pb in placed_boxes)
+    new_total_weight = current_weight + new_box_weight
+
+    if new_total_weight <= 0.001:
+        return (new_box_cx, new_box_cy, new_box_cz)
+
+    if current_weight <= 0.001:
+        return (new_box_cx, new_box_cy, new_box_cz)
+
+    current_cx, current_cy, current_cz = calculate_cog(placed_boxes)
+
+    new_cx = (current_cx * current_weight + new_box_cx * new_box_weight) / new_total_weight
+    new_cy = (current_cy * current_weight + new_box_cy * new_box_weight) / new_total_weight
+    new_cz = (current_cz * current_weight + new_box_cz * new_box_weight) / new_total_weight
+
+    return (new_cx, new_cy, new_cz)
+
+
 def pack_boxes(container_length: float, container_width: float, container_height: float,
                container_max_weight: float, boxes: List[Box]) -> Dict:
+    """
+    三维装箱算法 - 极值点法
+    约束：
+    - 底部支撑：至少99.9%底面被支撑
+    - 箱壁限制：不超出集装箱
+    - 总重量：不超过载重上限
+    - 承压限制：上面的货不能超过下面货的承压上限（按接触面积比例分配重量）
+    - 翻转约束：不可翻转的货物保持原方向
+    - 重心平衡：放置时优先选择让重心居中的位置，最终重心偏移不超过长宽的15%
+    """
     sorted_boxes = sorted(boxes, key=lambda b: (b.length * b.width * b.height, b.weight), reverse=True)
 
     extreme_points = [ExtremePoint(0, 0, 0)]
     placed_boxes: List[PlacedBox] = []
     unplaced_boxes = []
     total_weight = 0.0
+
+    center_x = container_length / 2
+    center_y = container_width / 2
+    max_offset_ratio = 0.15
 
     for box in sorted_boxes:
         placed = False
@@ -252,7 +315,7 @@ def pack_boxes(container_length: float, container_width: float, container_height
                 if ep.z + bh > container_height + 0.001:
                     continue
 
-                dropped_z = drop_box(placed_boxes, ep.x, ep.y, ep.z, bl, bw, bh)
+                dropped_z = drop_box(placed_boxes, ep.x, ep.y, ep.z, bl, bw)
 
                 if not can_place_at(placed_boxes, ep.x, ep.y, dropped_z, bl, bw, bh,
                                     container_length, container_width, container_height):
@@ -264,7 +327,26 @@ def pack_boxes(container_length: float, container_width: float, container_height
                 if not check_weight_bearing(placed_boxes, ep.x, ep.y, dropped_z, bl, bw, box.weight):
                     continue
 
-                score = dropped_z * 10000000 + ep.y * 10000 + ep.x
+                new_cx = ep.x + bl / 2
+                new_cy = ep.y + bw / 2
+                new_cz = dropped_z + bh / 2
+
+                future_cog_x, future_cog_y, future_cog_z = predict_new_cog(
+                    placed_boxes, box.weight, new_cx, new_cy, new_cz
+                )
+
+                offset_x_ratio = abs(future_cog_x - center_x) / container_length
+                offset_y_ratio = abs(future_cog_y - center_y) / container_width
+                cog_offset_score = offset_x_ratio + offset_y_ratio
+
+                if len(placed_boxes) > 3:
+                    if offset_x_ratio > max_offset_ratio or offset_y_ratio > max_offset_ratio:
+                        continue
+
+                score = (dropped_z * 1000000
+                         + cog_offset_score * 100000
+                         + ep.y * 100
+                         + ep.x)
 
                 if score < best_score:
                     best_score = score
@@ -314,13 +396,10 @@ def pack_boxes(container_length: float, container_width: float, container_height
 
     cog_x, cog_y, cog_z = calculate_cog(placed_boxes)
 
-    center_x = container_length / 2
-    center_y = container_width / 2
-
     offset_x_ratio = abs(cog_x - center_x) / container_length
     offset_y_ratio = abs(cog_y - center_y) / container_width
 
-    cog_within_limit = offset_x_ratio <= 0.15 and offset_y_ratio <= 0.15
+    cog_within_limit = offset_x_ratio <= max_offset_ratio and offset_y_ratio <= max_offset_ratio
 
     placed_cargo_list = []
     for pb in placed_boxes:
