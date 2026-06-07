@@ -140,9 +140,45 @@ class PackingPlanDetail(PackingPlan):
     unplaced_cargos: List[dict] = []
 
 
+class SplitBoxPlan(BaseModel):
+    box_index: int
+    container_id: int
+    container_name: str
+    container_length: float
+    container_width: float
+    container_height: float
+    placed_cargos: List[PlacedCargo]
+    placed_count: int
+    total_weight: float
+    volume_utilization: float
+    center_of_gravity: dict
+    cog_within_limit: bool
+    cog_offset_x_ratio: float
+    cog_offset_y_ratio: float
+
+
+class ContainerUsageSummary(BaseModel):
+    container_id: int
+    container_name: str
+    count: int
+
+
+class SplitPackingResult(BaseModel):
+    total_boxes: int
+    total_cargos: int
+    placed_cargos_count: int
+    unplaced_cargos: List[dict]
+    total_weight: float
+    average_volume_utilization: float
+    container_usage: List[ContainerUsageSummary]
+    boxes: List[SplitBoxPlan]
+    recommendation: str
+
+
 class PackingCompareRequest(BaseModel):
     cargo_ids: List[int]
     container_ids: List[int] = []
+    enable_split: bool = False
 
 
 class PackingCompareResult(BaseModel):
@@ -150,6 +186,7 @@ class PackingCompareResult(BaseModel):
     plans: List[PackingPlan]
     ranking: List[dict]
     recommendation: str
+    split_result: Optional[SplitPackingResult] = None
 
 
 class ThreeViewsResponse(BaseModel):

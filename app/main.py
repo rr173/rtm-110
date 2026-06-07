@@ -9,6 +9,7 @@ from app import models, schemas, crud
 from app.packing.algorithm import pack_boxes, Box, rank_plans
 from app.packing.visualizer import render_three_views, CARGO_COLORS
 from app.packing.sequence_engine import generate_packing_sequence, get_step_snapshot
+from app.packing.split_engine import split_cargos_into_boxes, ContainerSpec
 
 Base.metadata.create_all(bind=engine)
 
@@ -231,11 +232,29 @@ def compare_packing(request: schemas.PackingCompareRequest, save: bool = True, d
     else:
         overall_recommendation = "无可用方案"
 
+    split_result = None
+    if request.enable_split:
+        container_specs = []
+        for container_id in container_ids:
+            container = crud.get_container(db, container_id=container_id)
+            if container:
+                container_specs.append(ContainerSpec(
+                    id=container.id,
+                    name=container.name,
+                    length=container.length,
+                    width=container.width,
+                    height=container.height,
+                    max_weight=container.max_weight
+                ))
+
+        split_result = split_cargos_into_boxes(boxes, container_specs)
+
     return {
         "comparison_id": comparison_id,
         "plans": saved_plans,
         "ranking": ranking,
-        "recommendation": overall_recommendation
+        "recommendation": overall_recommendation,
+        "split_result": split_result
     }
 
 
