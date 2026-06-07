@@ -426,5 +426,101 @@ def pack_boxes(container_length: float, container_width: float, container_height
             "y": cog_y,
             "z": cog_z
         },
-        "cog_within_limit": cog_within_limit
+        "cog_within_limit": cog_within_limit,
+        "cog_offset_x_ratio": offset_x_ratio,
+        "cog_offset_y_ratio": offset_y_ratio
     }
+
+
+def calculate_plan_score(
+    volume_utilization: float,
+    cog_offset_x_ratio: float,
+    cog_offset_y_ratio: float,
+    placed_count: int,
+    total_cargos: int,
+    cog_within_limit: bool
+) -> float:
+    """
+    计算方案综合得分（越高越好）
+    权重：
+    - 体积利用率：50%
+    - 重心稳定性：30%
+    - 装载率（已装/总数）：20%
+    """
+    utilization_score = volume_utilization * 50
+
+    cog_offset_total = cog_offset_x_ratio + cog_offset_y_ratio
+    max_offset = 0.3
+    cog_score = max(0, (1 - cog_offset_total / max_offset)) * 30
+    if not cog_within_limit:
+        cog_score *= 0.5
+
+    placement_rate = placed_count / total_cargos if total_cargos > 0 else 0
+    placement_score = placement_rate * 20
+
+    total_score = utilization_score + cog_score + placement_score
+    return round(total_score, 2)
+
+
+def generate_recommendation(
+    plan: dict,
+    all_plans: list,
+    rank: int
+) -> str:
+    """
+    生成方案推荐理由
+    """
+    reasons = []
+
+    if rank == 1:
+        reasons.append("综合评分最高，是最优选择")
+
+    best_util = max(p["volume_utilization"] for p in all_plans)
+    if plan["volume_utilization"] >= best_util - 0.001:
+        reasons.append(f"体积利用率最高（{plan['volume_utilization']*100:.1f}%）")
+
+    min_cog = min(p["cog_offset_x_ratio"] + p["cog_offset_y_ratio"] for p in all_plans)
+    current_cog = plan["cog_offset_x_ratio"] + plan["cog_offset_y_ratio"]
+    if current_cog <= min_cog + 0.001:
+        reasons.append("重心最稳定")
+
+    max_placed = max(p["placed_count"] for p in all_plans)
+    if plan["placed_count"] >= max_placed:
+        reasons.append(f"装载数量最多（{plan['placed_count']}/{plan['total_cargos']}件）")
+
+    if plan["cog_within_limit"]:
+        reasons.append("重心偏移在安全范围内")
+    else:
+        reasons.append("注意：重心偏移超出安全范围")
+
+    if plan["unplaced_count"] > 0:
+        reasons.append(f"有{plan['unplaced_count']}件货物未装入")
+
+    return "；".join(reasons)
+
+
+def rank_plans(plans: list) -> list:
+    """
+    对多个方案进行排名
+    plans: 每个元素是包含方案信息的字典
+    返回：带排名和推荐理由的方案列表
+    """
+    for plan in plans:
+        score = calculate_plan_score(
+            volume_utilization=plan["volume_utilization"],
+            cog_offset_x_ratio=plan["cog_offset_x_ratio"],
+            cog_offset_y_ratio=plan["cog_offset_y_ratio"],
+            placed_count=plan["placed_count"],
+            total_cargos=plan["total_cargos"],
+            cog_within_limit=plan["cog_within_limit"]
+        )
+        plan["score"] = score
+
+    sorted_plans = sorted(plans, key=lambda p: p["score"], reverse=True)
+
+    for idx, plan in enumerate(sorted_plans):
+        rank = idx + 1
+        plan["rank"] = rank
+        plan["recommendation"] = generate_recommendation(plan, sorted_plans, rank)
+
+    return sorted_plans

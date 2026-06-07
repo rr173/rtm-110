@@ -79,3 +79,71 @@ class PackingResult(BaseModel):
     volume_utilization: float
     center_of_gravity: dict
     cog_within_limit: bool
+
+
+class PackedCargoSchema(BaseModel):
+    id: int
+    plan_id: int
+    cargo_id: int
+    cargo_name: str
+    x: float
+    y: float
+    z: float
+    length: float
+    width: float
+    height: float
+    weight: float
+    orientation: str
+
+    class Config:
+        from_attributes = True
+
+
+class PackingPlanBase(BaseModel):
+    container_id: int
+    container_name: str
+    total_cargos: int
+    placed_count: int
+    unplaced_count: int
+    total_weight: float
+    volume_utilization: float
+    cog_x: float
+    cog_y: float
+    cog_z: float
+    cog_within_limit: bool
+    cog_offset_x_ratio: float
+    cog_offset_y_ratio: float
+    score: float = 0.0
+    rank: int = 0
+    recommendation: str = ""
+
+
+class PackingPlanCreate(PackingPlanBase):
+    plan_no: str
+    placed_cargos: List[PlacedCargo] = []
+
+
+class PackingPlan(PackingPlanBase):
+    id: int
+    plan_no: str
+    created_at: str
+
+    class Config:
+        from_attributes = True
+
+
+class PackingPlanDetail(PackingPlan):
+    placed_cargos: List[PackedCargoSchema] = []
+    unplaced_cargos: List[dict] = []
+
+
+class PackingCompareRequest(BaseModel):
+    cargo_ids: List[int]
+    container_ids: List[int] = []
+
+
+class PackingCompareResult(BaseModel):
+    comparison_id: str
+    plans: List[PackingPlan]
+    ranking: List[dict]
+    recommendation: str

@@ -1,5 +1,7 @@
 from sqlalchemy.orm import Session
 from app import models, schemas
+from datetime import datetime
+import uuid
 
 
 def get_container(db: Session, container_id: int):
@@ -87,3 +89,87 @@ def create_default_containers(db: Session):
     ]
     db.add_all(default_containers)
     db.commit()
+
+
+def generate_plan_no() -> str:
+    return f"PLAN-{uuid.uuid4().hex[:8].upper()}"
+
+
+def create_packing_plan(db: Session, plan_data: dict, placed_cargos: list) -> models.PackingPlan:
+    plan_no = generate_plan_no()
+    db_plan = models.PackingPlan(
+        plan_no=plan_no,
+        container_id=plan_data["container_id"],
+        container_name=plan_data["container_name"],
+        total_cargos=plan_data["total_cargos"],
+        placed_count=plan_data["placed_count"],
+        unplaced_count=plan_data["unplaced_count"],
+        total_weight=plan_data["total_weight"],
+        volume_utilization=plan_data["volume_utilization"],
+        cog_x=plan_data["cog_x"],
+        cog_y=plan_data["cog_y"],
+        cog_z=plan_data["cog_z"],
+        cog_within_limit=plan_data["cog_within_limit"],
+        cog_offset_x_ratio=plan_data["cog_offset_x_ratio"],
+        cog_offset_y_ratio=plan_data["cog_offset_y_ratio"],
+        score=plan_data.get("score", 0.0),
+        rank=plan_data.get("rank", 0),
+        recommendation=plan_data.get("recommendation", "")
+    )
+    db.add(db_plan)
+    db.flush()
+
+    for pc in placed_cargos:
+        db_packed = models.PackedCargo(
+            plan_id=db_plan.id,
+            cargo_id=pc["cargo_id"],
+            cargo_name=pc["cargo_name"],
+            x=pc["x"],
+            y=pc["y"],
+            z=pc["z"],
+            length=pc["length"],
+            width=pc["width"],
+            height=pc["height"],
+            weight=pc["weight"],
+            orientation=pc["orientation"]
+        )
+        db.add(db_packed)
+
+    db.commit()
+    db.refresh(db_plan)
+    return db_plan
+
+
+def get_packing_plan(db: Session, plan_id: int = None, plan_no: str = None) -> models.PackingPlan:
+    if plan_id:
+        return db.query(models.PackingPlan).filter(models.PackingPlan.id == plan_id).first()
+    if plan_no:
+        return db.query(models.PackingPlan).filter(models.PackingPlan.plan_no == plan_no).first()
+    return None
+
+
+def get_packing_plans(db: Session, skip: int = 0, limit: int = 100) -> list:
+    return db.query(models.PackingPlan).order_by(models.PackingPlan.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def get_packed_cargos(db: Session, plan_id: int) -> list:
+    return db.query(models.PackedCargo).filter(models.PackedCargo.plan_id == plan_id).all()
+
+
+def delete_packing_plan(db: Session, plan_id: int = None, plan_no: str = None):
+    plan = get_packing_plan(db, plan_id=plan_id, plan_no=plan_no)
+    if plan:
+        db.delete(plan)
+        db.commit()
+    return plan
+
+
+def update_packing_plan_score(db: Session, plan_id: int, score: float, rank: int, recommendation: str):
+    plan = get_packing_plan(db, plan_id=plan_id)
+    if plan:
+        plan.score = score
+        plan.rank = rank
+        plan.recommendation = recommendation
+        db.commit()
+        db.refresh(plan)
+    return plan
