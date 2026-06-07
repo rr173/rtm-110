@@ -10,10 +10,14 @@ from app.packing.algorithm import pack_boxes, Box, rank_plans
 from app.packing.visualizer import render_three_views, CARGO_COLORS
 from app.packing.sequence_engine import generate_packing_sequence, get_step_snapshot
 from app.packing.split_engine import split_cargos_into_boxes, ContainerSpec
+from app.packing.trailer_cog_engine import (
+    TrailerSpec, BoxSpec, PlacedBox,
+    optimize_box_positions, generate_unload_sequence
+)
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="集装箱三维配载计算服务", version="1.1.0")
+app = FastAPI(title="集装箱三维配载计算服务", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,6 +32,8 @@ app.add_middleware(
 def startup_event():
     db = next(get_db())
     crud.create_default_containers(db)
+    crud.create_default_trailers(db)
+    crud.create_demo_trailer_scenarios(db)
 
 
 @app.get("/")
@@ -575,3 +581,241 @@ def get_packing_snapshot(
         "front_view": views["front_view"],
         "side_view": views["side_view"]
     }
+
+
+@app.get("/trailers", response_model=List[schemas.Trailer])
+def list_trailers(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    trailers = crud.get_trailers(db, skip=skip, limit=limit)
+    return trailers
+
+
+@app.get("/trailers/{trailer_id}", response_model=schemas.Trailer)
+def get_trailer(trailer_id: int, db: Session = Depends(get_db)):
+    trailer = crud.get_trailer(db, trailer_id=trailer_id)
+    if trailer is None:
+        raise HTTPException(status_code=404, detail="拖车不存在")
+    return trailer
+
+
+@app.post("/trailers", response_model=schemas.Trailer)
+def create_trailer(trailer: schemas.TrailerCreate, db: Session = Depends(get_db)):
+    return crud.create_trailer(db=db, trailer=trailer)
+
+
+@app.delete("/trailers/{trailer_id}")
+def delete_trailer(trailer_id: int, db: Session = Depends(get_db)):
+    trailer = crud.delete_trailer(db, trailer_id=trailer_id)
+    if trailer is None:
+        raise HTTPException(status_code=404, detail="拖车不存在")
+    return {"message": "删除成功"}
+
+
+@app.post("/trailer/optimize", response_model=schemas.TrailerLoadOptimizationResult)
+def optimize_trailer_load(
+    request: schemas.TrailerLoadRequest,
+    save: bool = True,
+    db: Session = Depends(get_db)
+):
+    trailer = crud.get_trailer(db, trailer_id=request.trailer_id)
+    if trailer is None:
+        raise HTTPException(status_code=404, detail="拖车不存在")
+
+    trailer_spec = TrailerSpec(
+        total_length=trailer.total_length,
+        platform_length=trailer.platform_length,
+        platform_width=trailer.platform_width,
+        front_axle_position=trailer.front_axle_position,
+        rear_axle_position=trailer.rear_axle_position,
+        front_axle_max_load=trailer.front_axle_max_load,
+        rear_axle_max_load=trailer.rear_axle_max_load,
+        total_max_weight=trailer.total_max_weight
+    )
+
+    box_specs = []
+    for box in request.boxes:
+        box_specs.append(BoxSpec(
+            box_id=box.box_id,
+            box_name=box.box_name,
+            length=box.length,
+            width=box.width,
+            weight=box.weight,
+            cog_offset_x=box.cog_offset_x
+        ))
+
+    opt_result = optimize_box_positions(trailer_spec, box_specs)
+
+    placed_boxes = []
+    for lb in opt_result["loaded_boxes"]:
+        placed_boxes.append(PlacedBox(
+            box_id=lb["box_id"],
+            box_name=lb["box_name"],
+            x=lb["x"],
+            y=lb["y"],
+            length=lb["length"],
+            width=lb["width"],
+            weight=lb["weight"],
+            cog_offset_x=lb["cog_offset_x"]
+        ))
+
+    unload_result = generate_unload_sequence(trailer_spec, placed_boxes, max_lr_ratio=0.15)
+
+    plan_id = None
+    plan_no = None
+    if save:
+        plan_data = {
+            "trailer_id": trailer.id,
+            "trailer_name": trailer.name,
+            "total_boxes": opt_result["total_boxes"],
+            "total_weight": opt_result["total_weight"],
+            "front_axle_load": opt_result["front_axle_load"],
+            "rear_axle_load": opt_result["rear_axle_load"],
+            "front_axle_load_ratio": opt_result["front_axle_load_ratio"],
+            "rear_axle_load_ratio": opt_result["rear_axle_load_ratio"],
+            "axles_within_limit": opt_result["axles_within_limit"],
+            "left_right_balance_ratio": opt_result["left_right_balance_ratio"],
+            "left_right_within_limit": opt_result["left_right_within_limit"],
+            "cog_x": opt_result["cog_x"],
+            "cog_y": opt_result["cog_y"],
+            "score": opt_result["score"],
+            "recommendation": opt_result["recommendation"]
+        }
+        db_plan = crud.create_trailer_load_plan(
+            db, plan_data,
+            opt_result["loaded_boxes"],
+            unload_result["sequence"]
+        )
+        plan_id = db_plan.id
+        plan_no = db_plan.plan_no
+
+    return {
+        "plan_id": plan_id,
+        "plan_no": plan_no,
+        "trailer_id": trailer.id,
+        "trailer_name": trailer.name,
+        "total_boxes": opt_result["total_boxes"],
+        "total_weight": opt_result["total_weight"],
+        "front_axle_load": opt_result["front_axle_load"],
+        "rear_axle_load": opt_result["rear_axle_load"],
+        "front_axle_load_ratio": opt_result["front_axle_load_ratio"],
+        "rear_axle_load_ratio": opt_result["rear_axle_load_ratio"],
+        "axles_within_limit": opt_result["axles_within_limit"],
+        "left_right_balance_ratio": opt_result["left_right_balance_ratio"],
+        "left_right_within_limit": opt_result["left_right_within_limit"],
+        "cog_x": opt_result["cog_x"],
+        "cog_y": opt_result["cog_y"],
+        "score": opt_result["score"],
+        "recommendation": opt_result["recommendation"],
+        "loaded_boxes": opt_result["loaded_boxes"],
+        "unload_sequence": unload_result["sequence"],
+        "all_steps_valid": unload_result["all_steps_valid"],
+        "invalid_steps_count": unload_result["invalid_steps_count"]
+    }
+
+
+@app.get("/trailer/plans", response_model=List[schemas.TrailerLoadPlan])
+def list_trailer_plans(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    plans = crud.get_trailer_load_plans(db, skip=skip, limit=limit)
+    result = []
+    for plan in plans:
+        result.append({
+            "id": plan.id,
+            "plan_no": plan.plan_no,
+            "trailer_id": plan.trailer_id,
+            "trailer_name": plan.trailer_name,
+            "total_boxes": plan.total_boxes,
+            "total_weight": plan.total_weight,
+            "front_axle_load": plan.front_axle_load,
+            "rear_axle_load": plan.rear_axle_load,
+            "front_axle_load_ratio": plan.front_axle_load_ratio,
+            "rear_axle_load_ratio": plan.rear_axle_load_ratio,
+            "axles_within_limit": plan.axles_within_limit,
+            "left_right_balance_ratio": plan.left_right_balance_ratio,
+            "left_right_within_limit": plan.left_right_within_limit,
+            "cog_x": plan.cog_x,
+            "cog_y": plan.cog_y,
+            "score": plan.score,
+            "recommendation": plan.recommendation,
+            "created_at": plan.created_at.isoformat() if plan.created_at else ""
+        })
+    return result
+
+
+@app.get("/trailer/plans/{plan_identifier}", response_model=schemas.TrailerLoadPlanDetail)
+def get_trailer_plan_detail(plan_identifier: str, db: Session = Depends(get_db)):
+    plan = None
+    if plan_identifier.isdigit():
+        plan = crud.get_trailer_load_plan(db, plan_id=int(plan_identifier))
+    if plan is None:
+        plan = crud.get_trailer_load_plan(db, plan_no=plan_identifier)
+
+    if plan is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+
+    loaded_boxes = crud.get_trailer_loaded_boxes(db, plan_id=plan.id)
+    unload_steps = crud.get_unload_steps(db, plan_id=plan.id)
+
+    loaded_boxes_list = []
+    for lb in loaded_boxes:
+        loaded_boxes_list.append({
+            "box_id": lb.box_id,
+            "box_name": lb.box_name,
+            "x": lb.x,
+            "y": lb.y,
+            "length": lb.length,
+            "width": lb.width,
+            "weight": lb.weight,
+            "cog_offset_x": lb.cog_offset_x
+        })
+
+    unload_sequence_list = []
+    for step in unload_steps:
+        unload_sequence_list.append({
+            "step_number": step.step_number,
+            "box_id": step.box_id,
+            "box_name": step.box_name,
+            "front_axle_load_before": step.front_axle_load_before,
+            "rear_axle_load_before": step.rear_axle_load_before,
+            "front_axle_load_after": step.front_axle_load_after,
+            "rear_axle_load_after": step.rear_axle_load_after,
+            "left_weight_before": step.left_weight_before,
+            "right_weight_before": step.right_weight_before,
+            "left_right_ratio_before": step.left_right_ratio_before,
+            "left_right_within_limit_before": step.left_right_within_limit_before,
+            "axles_within_limit_before": step.axles_within_limit_before
+        })
+
+    return {
+        "id": plan.id,
+        "plan_no": plan.plan_no,
+        "trailer_id": plan.trailer_id,
+        "trailer_name": plan.trailer_name,
+        "total_boxes": plan.total_boxes,
+        "total_weight": plan.total_weight,
+        "front_axle_load": plan.front_axle_load,
+        "rear_axle_load": plan.rear_axle_load,
+        "front_axle_load_ratio": plan.front_axle_load_ratio,
+        "rear_axle_load_ratio": plan.rear_axle_load_ratio,
+        "axles_within_limit": plan.axles_within_limit,
+        "left_right_balance_ratio": plan.left_right_balance_ratio,
+        "left_right_within_limit": plan.left_right_within_limit,
+        "cog_x": plan.cog_x,
+        "cog_y": plan.cog_y,
+        "score": plan.score,
+        "recommendation": plan.recommendation,
+        "created_at": plan.created_at.isoformat() if plan.created_at else "",
+        "loaded_boxes": loaded_boxes_list,
+        "unload_sequence": unload_sequence_list
+    }
+
+
+@app.delete("/trailer/plans/{plan_identifier}")
+def delete_trailer_plan(plan_identifier: str, db: Session = Depends(get_db)):
+    plan = None
+    if plan_identifier.isdigit():
+        plan = crud.delete_trailer_load_plan(db, plan_id=int(plan_identifier))
+    if plan is None:
+        plan = crud.delete_trailer_load_plan(db, plan_no=plan_identifier)
+
+    if plan is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+    return {"message": "删除成功", "plan_no": plan.plan_no}

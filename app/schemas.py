@@ -256,3 +256,129 @@ class StepSnapshotResponse(BaseModel):
     top_view: str
     front_view: str
     side_view: str
+
+
+class TrailerBase(BaseModel):
+    name: str
+    total_length: float = Field(gt=0, description="拖车总长 mm")
+    platform_length: float = Field(gt=0, description="平板长度 mm")
+    platform_width: float = Field(gt=0, description="平板宽度 mm")
+    front_axle_position: float = Field(description="前轴位置（距前端距离） mm")
+    rear_axle_position: float = Field(description="后轴位置（距前端距离） mm")
+    front_axle_max_load: float = Field(gt=0, description="前轴最大承重 kg")
+    rear_axle_max_load: float = Field(gt=0, description="后轴最大承重 kg")
+    total_max_weight: float = Field(gt=0, description="总限重 kg")
+
+
+class TrailerCreate(TrailerBase):
+    pass
+
+
+class Trailer(TrailerBase):
+    id: int
+    is_default: bool = False
+
+    class Config:
+        from_attributes = True
+
+
+class TrailerBoxSpec(BaseModel):
+    box_id: int
+    box_name: str
+    length: float = Field(gt=0, description="箱体长度 mm")
+    width: float = Field(gt=0, description="箱体宽度 mm")
+    weight: float = Field(gt=0, description="箱体重量 kg")
+    cog_offset_x: float = Field(default=0.0, description="重心沿长度方向偏移（相对几何中心，正=向前） mm")
+
+
+class TrailerLoadBox(BaseModel):
+    box_id: int
+    box_name: str
+    x: float
+    y: float
+    length: float
+    width: float
+    weight: float
+    cog_offset_x: float
+
+
+class TrailerUnloadStep(BaseModel):
+    step_number: int
+    box_id: int
+    box_name: str
+    front_axle_load_before: float
+    rear_axle_load_before: float
+    front_axle_load_after: float
+    rear_axle_load_after: float
+    left_weight_before: float
+    right_weight_before: float
+    left_right_ratio_before: float
+    left_right_within_limit_before: bool
+    axles_within_limit_before: bool
+
+
+class TrailerLoadPlanBase(BaseModel):
+    trailer_id: int
+    trailer_name: str
+    total_boxes: int
+    total_weight: float
+    front_axle_load: float
+    rear_axle_load: float
+    front_axle_load_ratio: float
+    rear_axle_load_ratio: float
+    axles_within_limit: bool
+    left_right_balance_ratio: float
+    left_right_within_limit: bool
+    cog_x: float
+    cog_y: float
+    score: float = 0.0
+    recommendation: str = ""
+
+
+class TrailerLoadPlanCreate(TrailerLoadPlanBase):
+    plan_no: str
+    loaded_boxes: List[TrailerLoadBox] = []
+    unload_sequence: List[TrailerUnloadStep] = []
+
+
+class TrailerLoadPlan(TrailerLoadPlanBase):
+    id: int
+    plan_no: str
+    created_at: str
+
+    class Config:
+        from_attributes = True
+
+
+class TrailerLoadPlanDetail(TrailerLoadPlan):
+    loaded_boxes: List[TrailerLoadBox] = []
+    unload_sequence: List[TrailerUnloadStep] = []
+
+
+class TrailerLoadRequest(BaseModel):
+    trailer_id: int
+    boxes: List[TrailerBoxSpec]
+
+
+class TrailerLoadOptimizationResult(BaseModel):
+    plan_id: Optional[int] = None
+    plan_no: Optional[str] = None
+    trailer_id: int
+    trailer_name: str
+    total_boxes: int
+    total_weight: float
+    front_axle_load: float
+    rear_axle_load: float
+    front_axle_load_ratio: float
+    rear_axle_load_ratio: float
+    axles_within_limit: bool
+    left_right_balance_ratio: float
+    left_right_within_limit: bool
+    cog_x: float
+    cog_y: float
+    score: float
+    recommendation: str
+    loaded_boxes: List[TrailerLoadBox]
+    unload_sequence: List[TrailerUnloadStep]
+    all_steps_valid: bool
+    invalid_steps_count: int
