@@ -163,7 +163,7 @@ def render_front_view(
 
     visuals = _generate_cargo_visuals(placed_cargos)
 
-    sorted_by_y = sorted(visuals, key=lambda v: v.y + v.width, reverse=True)
+    sorted_by_y = sorted(visuals, key=lambda v: v.y + v.width, reverse=False)
 
     svg_parts = []
 
@@ -237,7 +237,7 @@ def render_side_view(
 
     visuals = _generate_cargo_visuals(placed_cargos)
 
-    sorted_by_x = sorted(visuals, key=lambda v: v.x + v.length, reverse=True)
+    sorted_by_x = sorted(visuals, key=lambda v: v.x + v.length, reverse=False)
 
     svg_parts = []
 

@@ -98,16 +98,11 @@ def build_dependency_graph(
     返回：key 是货物 idx，value 是该货物依赖的货物 idx 列表（这些货物必须先放）
     
     依赖规则：
-    1. 支撑依赖：被支撑的货物依赖于支撑它的货物（支撑货物必须先放）
-    2. 入箱路径依赖：被挡住的货物依赖于挡住它的货物（挡住的货物必须后放？不对...
+    1. 支撑依赖：如果 cargo_i 被 cargo_j 支撑（j在下面），则 cargo_i 依赖 cargo_j（j先放）
+    2. 入箱路径依赖：如果 cargo_i 挡住了 cargo_j（i在前面靠近门，j在里面），
+       则 cargo_i 依赖 cargo_j（j必须先放进去，然后i才能放，否则j会被i挡住）
     
-    重新思考：
-    - 如果 A 挡住了 B 的入箱路径（A 在 B 前面，更靠近箱门），那么 B 必须在 A 之前放入
-      因为 B 放入时，A 还不在那里挡路
-    - 如果 B 在 A 的上面（A 支撑 B），那么 A 必须在 B 之前放入
-    
-    所以：
-    - dependencies[B] 包含 A 表示：B 依赖于 A，即 A 必须先于 B 放入
+    即 dependencies[X] 包含 Y 表示：X 依赖 Y，Y 必须先于 X 放入
     """
     dependencies: Dict[int, List[int]] = {c.idx: [] for c in cargos}
 
@@ -121,8 +116,8 @@ def build_dependency_graph(
                     dependencies[cargo_i.idx].append(cargo_j.idx)
 
             if _blocks_entry_path(cargo_i, cargo_j, container_width):
-                if cargo_i.idx not in dependencies[cargo_j.idx]:
-                    dependencies[cargo_j.idx].append(cargo_i.idx)
+                if cargo_j.idx not in dependencies[cargo_i.idx]:
+                    dependencies[cargo_i.idx].append(cargo_j.idx)
 
     return dependencies
 
@@ -167,19 +162,50 @@ def check_cog_limit(
 def _get_dynamic_cog_limit(placed_count: int, total_count: int, base_limit: float) -> float:
     """
     动态重心限制：前几件适当放宽，逐渐收紧
-    - 前3件：完全不限制（先装进去再说，物理上单个货不可能满足20%）
-    - 3-5件：放宽到 2 * base_limit
-    - 5-10件：放宽到 1.5 * base_limit
-    - 10件以上：严格按 base_limit
+    - 前2件：完全不限制（物理上单件/两件不可能满足20%）
+    - 2-5件：放宽到 1.5 * base_limit
+    - 5-8件：放宽到 1.2 * base_limit
+    - 8件以上：严格按 base_limit
     """
-    if placed_count < 3:
+    if placed_count < 2:
         return 1.0
     elif placed_count < 5:
-        return min(base_limit * 2.0, 1.0)
-    elif placed_count < 10:
         return min(base_limit * 1.5, 1.0)
+    elif placed_count < 8:
+        return min(base_limit * 1.2, 1.0)
     else:
         return base_limit
+
+
+def _cog_offset_score(
+    cog_x: float, cog_y: float,
+    center_x: float, center_y: float,
+    container_length: float, container_width: float
+) -> float:
+    """计算重心偏移的综合评分（越小越好）"""
+    offset_x_ratio = abs(cog_x - center_x) / container_length
+    offset_y_ratio = abs(cog_y - center_y) / container_width
+    return offset_x_ratio + offset_y_ratio
+
+
+def _center_pull_bonus(
+    current_cog_x: float, current_cog_y: float,
+    new_cog_x: float, new_cog_y: float,
+    center_x: float, center_y: float
+) -> float:
+    """
+    计算"重心向中心移动"的奖励值
+    返回正数表示变好（向中心移动），负数表示变差
+    """
+    current_dist_x = abs(current_cog_x - center_x)
+    current_dist_y = abs(current_cog_y - center_y)
+    new_dist_x = abs(new_cog_x - center_x)
+    new_dist_y = abs(new_cog_y - center_y)
+    
+    improvement_x = current_dist_x - new_dist_x
+    improvement_y = current_dist_y - new_dist_y
+    
+    return improvement_x + improvement_y
 
 
 def generate_packing_sequence(
@@ -198,7 +224,8 @@ def generate_packing_sequence(
     3. 使用贪心策略选择每一步放入的货物：
        - 只选择所有依赖都已满足的货物
        - 优先选择满足当前动态重心限制的货物
-       - 在可选货物中选择使得新增后重心偏移最小的
+       - 在可选货物中，选择使得新增后重心偏移最小的
+       - 优先选择能把重心向中心拉的货物
        - 重心偏移相同时，选择体积大的先放（更稳定）
     
     物理约束：
@@ -239,6 +266,8 @@ def generate_packing_sequence(
     placed_cargos_list: List[CargoItem] = []
 
     total_count = len(cargos)
+    center_x = container_length / 2
+    center_y = container_width / 2
     step = 0
 
     while remaining:
@@ -257,6 +286,11 @@ def generate_packing_sequence(
 
         current_limit = _get_dynamic_cog_limit(len(placed_cargos_list), total_count, max_cog_offset_ratio)
 
+        if placed_cargos_list:
+            current_cog_x, current_cog_y, current_cog_z = calculate_cog(placed_cargos_list)
+        else:
+            current_cog_x, current_cog_y, current_cog_z = center_x, center_y, 0
+
         feasible_candidates = []
         infeasible_candidates = []
 
@@ -264,41 +298,52 @@ def generate_packing_sequence(
             cargo = next(c for c in cargos if c.idx == idx)
             temp_placed = placed_cargos_list + [cargo]
 
-            within_limit, offset_x, offset_y = check_cog_limit(
-                temp_placed, container_length, container_width, current_limit
-            )
+            new_cog_x, new_cog_y, new_cog_z = calculate_cog(temp_placed)
 
-            cog_score = offset_x + offset_y
-            volume_score = -cargo.volume / 1000000
+            offset_x_ratio = abs(new_cog_x - center_x) / container_length
+            offset_y_ratio = abs(new_cog_y - center_y) / container_width
+            within_limit = offset_x_ratio <= current_limit and offset_y_ratio <= current_limit
 
-            score = cog_score * 1000 + volume_score
+            cog_score = offset_x_ratio + offset_y_ratio
+
+            pull_bonus = _center_pull_bonus(
+                current_cog_x, current_cog_y,
+                new_cog_x, new_cog_y,
+                center_x, center_y
+            ) / max(container_length, container_width)
+
+            volume_score = -cargo.volume / 10000000
+
+            score = cog_score - pull_bonus * 2 + volume_score
 
             if within_limit:
-                feasible_candidates.append((idx, score, offset_x, offset_y))
+                feasible_candidates.append((idx, score, offset_x_ratio, offset_y_ratio, new_cog_x, new_cog_y, new_cog_z))
             else:
-                infeasible_candidates.append((idx, score, offset_x, offset_y))
+                overshoot = max(0, offset_x_ratio - current_limit) + max(0, offset_y_ratio - current_limit)
+                penalty_score = score + overshoot * 100
+                infeasible_candidates.append((idx, penalty_score, offset_x_ratio, offset_y_ratio, new_cog_x, new_cog_y, new_cog_z))
 
         if feasible_candidates:
             feasible_candidates.sort(key=lambda x: x[1])
-            best_idx = feasible_candidates[0][0]
-            best_offset_x = feasible_candidates[0][2]
-            best_offset_y = feasible_candidates[0][3]
+            best = feasible_candidates[0]
+            best_idx = best[0]
+            best_offset_x = best[2]
+            best_offset_y = best[3]
+            best_cog_x, best_cog_y, best_cog_z = best[4], best[5], best[6]
         else:
             infeasible_candidates.sort(key=lambda x: x[1])
-            best_idx = infeasible_candidates[0][0]
-            best_offset_x = infeasible_candidates[0][2]
-            best_offset_y = infeasible_candidates[0][3]
+            best = infeasible_candidates[0]
+            best_idx = best[0]
+            best_offset_x = best[2]
+            best_offset_y = best[3]
+            best_cog_x, best_cog_y, best_cog_z = best[4], best[5], best[6]
 
         cargo = next(c for c in cargos if c.idx == best_idx)
         placed_cargos_list.append(cargo)
         placed_set.add(best_idx)
         remaining.remove(best_idx)
 
-        cog_x, cog_y, cog_z = calculate_cog(placed_cargos_list)
-
-        within_final_limit, final_offset_x, final_offset_y = check_cog_limit(
-            placed_cargos_list, container_length, container_width, max_cog_offset_ratio
-        )
+        within_final_limit = best_offset_x <= max_cog_offset_ratio and best_offset_y <= max_cog_offset_ratio
 
         sequence.append({
             "step": step,
@@ -317,12 +362,12 @@ def generate_packing_sequence(
             },
             "weight": cargo.weight,
             "cog_after": {
-                "x": cog_x,
-                "y": cog_y,
-                "z": cog_z
+                "x": best_cog_x,
+                "y": best_cog_y,
+                "z": best_cog_z
             },
-            "cog_offset_x_ratio": final_offset_x,
-            "cog_offset_y_ratio": final_offset_y,
+            "cog_offset_x_ratio": best_offset_x,
+            "cog_offset_y_ratio": best_offset_y,
             "cog_within_limit": within_final_limit,
             "dynamic_limit_used": current_limit
         })
@@ -330,9 +375,9 @@ def generate_packing_sequence(
     all_placed = len(sequence) == len(cargos)
 
     final_cog_x, final_cog_y, final_cog_z = calculate_cog(placed_cargos_list)
-    final_within, final_offset_x, final_offset_y = check_cog_limit(
-        placed_cargos_list, container_length, container_width, max_cog_offset_ratio
-    )
+    final_offset_x = abs(final_cog_x - center_x) / container_length
+    final_offset_y = abs(final_cog_y - center_y) / container_width
+    final_within = final_offset_x <= max_cog_offset_ratio and final_offset_y <= max_cog_offset_ratio
 
     all_steps_within_limit = all(s["cog_within_limit"] for s in sequence)
 
