@@ -173,7 +173,7 @@ def compare_packing(request: schemas.PackingCompareRequest, save: bool = True, d
     if save:
         for plan_info in ranked_plans:
             plan_data = {k: v for k, v in plan_info.items() if k != "placed_cargos" and k != "unplaced_cargos"}
-            db_plan = crud.create_packing_plan(db, plan_data, plan_info["placed_cargos"])
+            db_plan = crud.create_packing_plan(db, plan_data, plan_info["placed_cargos"], plan_info["unplaced_cargos"])
             crud.update_packing_plan_score(
                 db, db_plan.id,
                 plan_info["score"],
@@ -199,7 +199,8 @@ def compare_packing(request: schemas.PackingCompareRequest, save: bool = True, d
                 "score": db_plan.score,
                 "rank": db_plan.rank,
                 "recommendation": db_plan.recommendation,
-                "created_at": db_plan.created_at.isoformat() if db_plan.created_at else ""
+                "created_at": db_plan.created_at.isoformat() if db_plan.created_at else "",
+                "unplaced_cargos": plan_info["unplaced_cargos"]
             })
     else:
         saved_plans = ranked_plans
@@ -270,6 +271,8 @@ def calculate_packing(container_id: int, cargo_ids: List[int], save: bool = Fals
         boxes=boxes
     )
 
+    plan_id = None
+    plan_no = None
     if save:
         plan_data = {
             "container_id": container.id,
@@ -286,9 +289,9 @@ def calculate_packing(container_id: int, cargo_ids: List[int], save: bool = Fals
             "cog_offset_x_ratio": result["cog_offset_x_ratio"],
             "cog_offset_y_ratio": result["cog_offset_y_ratio"],
         }
-        db_plan = crud.create_packing_plan(db, plan_data, result["placed_cargos"])
-        result["plan_id"] = db_plan.id
-        result["plan_no"] = db_plan.plan_no
+        db_plan = crud.create_packing_plan(db, plan_data, result["placed_cargos"], result["unplaced_cargos"])
+        plan_id = db_plan.id
+        plan_no = db_plan.plan_no
 
     return {
         "container_id": container.id,
@@ -298,7 +301,9 @@ def calculate_packing(container_id: int, cargo_ids: List[int], save: bool = Fals
         "total_weight": result["total_weight"],
         "volume_utilization": result["volume_utilization"],
         "center_of_gravity": result["center_of_gravity"],
-        "cog_within_limit": result["cog_within_limit"]
+        "cog_within_limit": result["cog_within_limit"],
+        "plan_id": plan_id,
+        "plan_no": plan_no
     }
 
 
@@ -343,6 +348,15 @@ def get_packing_plan_detail(plan_identifier: str, db: Session = Depends(get_db))
         raise HTTPException(status_code=404, detail="方案不存在")
 
     placed_cargos = crud.get_packed_cargos(db, plan_id=plan.id)
+    unplaced_cargos = crud.get_unplaced_cargos(db, plan_id=plan.id)
+
+    unplaced_list = []
+    for uc in unplaced_cargos:
+        unplaced_list.append({
+            "cargo_id": uc.cargo_id,
+            "cargo_name": uc.cargo_name,
+            "reason": uc.reason
+        })
 
     return {
         "id": plan.id,
@@ -365,7 +379,7 @@ def get_packing_plan_detail(plan_identifier: str, db: Session = Depends(get_db))
         "recommendation": plan.recommendation,
         "created_at": plan.created_at.isoformat() if plan.created_at else "",
         "placed_cargos": placed_cargos,
-        "unplaced_cargos": []
+        "unplaced_cargos": unplaced_list
     }
 
 

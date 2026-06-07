@@ -55,6 +55,7 @@ class PackingPlan(Base):
     created_at = Column(DateTime, server_default=func.now())
 
     placed_cargos = relationship("PackedCargo", back_populates="plan", cascade="all, delete-orphan")
+    unplaced_cargos = relationship("UnplacedCargo", back_populates="plan", cascade="all, delete-orphan")
 
 
 class PackedCargo(Base):
@@ -74,3 +75,15 @@ class PackedCargo(Base):
     orientation = Column(String)
 
     plan = relationship("PackingPlan", back_populates="placed_cargos")
+
+
+class UnplacedCargo(Base):
+    __tablename__ = "unplaced_cargos"
+
+    id = Column(Integer, primary_key=True, index=True)
+    plan_id = Column(Integer, ForeignKey("packing_plans.id"))
+    cargo_id = Column(Integer)
+    cargo_name = Column(String)
+    reason = Column(String)
+
+    plan = relationship("PackingPlan", back_populates="unplaced_cargos")

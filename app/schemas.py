@@ -79,6 +79,8 @@ class PackingResult(BaseModel):
     volume_utilization: float
     center_of_gravity: dict
     cog_within_limit: bool
+    plan_id: Optional[int] = None
+    plan_no: Optional[str] = None
 
 
 class PackedCargoSchema(BaseModel):
@@ -116,6 +118,7 @@ class PackingPlanBase(BaseModel):
     score: float = 0.0
     rank: int = 0
     recommendation: str = ""
+    unplaced_cargos: Optional[List[dict]] = None
 
 
 class PackingPlanCreate(PackingPlanBase):

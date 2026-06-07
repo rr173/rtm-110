@@ -95,7 +95,7 @@ def generate_plan_no() -> str:
     return f"PLAN-{uuid.uuid4().hex[:8].upper()}"
 
 
-def create_packing_plan(db: Session, plan_data: dict, placed_cargos: list) -> models.PackingPlan:
+def create_packing_plan(db: Session, plan_data: dict, placed_cargos: list, unplaced_cargos: list = None) -> models.PackingPlan:
     plan_no = generate_plan_no()
     db_plan = models.PackingPlan(
         plan_no=plan_no,
@@ -135,6 +135,16 @@ def create_packing_plan(db: Session, plan_data: dict, placed_cargos: list) -> mo
         )
         db.add(db_packed)
 
+    if unplaced_cargos:
+        for uc in unplaced_cargos:
+            db_unplaced = models.UnplacedCargo(
+                plan_id=db_plan.id,
+                cargo_id=uc.get("cargo_id", 0),
+                cargo_name=uc.get("cargo_name", ""),
+                reason=uc.get("reason", "")
+            )
+            db.add(db_unplaced)
+
     db.commit()
     db.refresh(db_plan)
     return db_plan
@@ -154,6 +164,10 @@ def get_packing_plans(db: Session, skip: int = 0, limit: int = 100) -> list:
 
 def get_packed_cargos(db: Session, plan_id: int) -> list:
     return db.query(models.PackedCargo).filter(models.PackedCargo.plan_id == plan_id).all()
+
+
+def get_unplaced_cargos(db: Session, plan_id: int) -> list:
+    return db.query(models.UnplacedCargo).filter(models.UnplacedCargo.plan_id == plan_id).all()
 
 
 def delete_packing_plan(db: Session, plan_id: int = None, plan_no: str = None):

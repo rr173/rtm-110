@@ -273,6 +273,21 @@ def predict_new_cog(placed_boxes: List[PlacedBox], new_box_weight: float,
     return (new_cx, new_cy, new_cz)
 
 
+def get_dynamic_cog_limit(placed_count: int, total_count: int) -> float:
+    """
+    动态重心限制：前几件不限制，逐渐收紧
+    - 前10件：完全不限制（先装进去再说）
+    - 10-20件：放宽到30%
+    - 20件以上：20%（比原来15%更合理）
+    """
+    if placed_count < 10:
+        return 1.0
+    elif placed_count < 20:
+        return 0.30
+    else:
+        return 0.20
+
+
 def pack_boxes(container_length: float, container_width: float, container_height: float,
                container_max_weight: float, boxes: List[Box]) -> Dict:
     """
@@ -283,9 +298,10 @@ def pack_boxes(container_length: float, container_width: float, container_height
     - 总重量：不超过载重上限
     - 承压限制：上面的货不能超过下面货的承压上限（按接触面积比例分配重量）
     - 翻转约束：不可翻转的货物保持原方向
-    - 重心平衡：放置时优先选择让重心居中的位置，最终重心偏移不超过长宽的15%
+    - 重心平衡：优先选重心居中的位置，动态调整限制避免卡掉太多货
     """
     sorted_boxes = sorted(boxes, key=lambda b: (b.length * b.width * b.height, b.weight), reverse=True)
+    total_boxes = len(sorted_boxes)
 
     extreme_points = [ExtremePoint(0, 0, 0)]
     placed_boxes: List[PlacedBox] = []
@@ -294,7 +310,6 @@ def pack_boxes(container_length: float, container_width: float, container_height
 
     center_x = container_length / 2
     center_y = container_width / 2
-    max_offset_ratio = 0.15
 
     for box in sorted_boxes:
         placed = False
@@ -302,6 +317,8 @@ def pack_boxes(container_length: float, container_width: float, container_height
 
         best_placement = None
         best_score = float('inf')
+
+        current_limit = get_dynamic_cog_limit(len(placed_boxes), total_boxes)
 
         for ep_idx, ep in enumerate(extreme_points):
             for (bl, bw, bh, orientation) in orientations:
@@ -339,9 +356,8 @@ def pack_boxes(container_length: float, container_width: float, container_height
                 offset_y_ratio = abs(future_cog_y - center_y) / container_width
                 cog_offset_score = offset_x_ratio + offset_y_ratio
 
-                if len(placed_boxes) > 3:
-                    if offset_x_ratio > max_offset_ratio or offset_y_ratio > max_offset_ratio:
-                        continue
+                if offset_x_ratio > current_limit or offset_y_ratio > current_limit:
+                    continue
 
                 score = (dropped_z * 1000000
                          + cog_offset_score * 100000
@@ -399,7 +415,8 @@ def pack_boxes(container_length: float, container_width: float, container_height
     offset_x_ratio = abs(cog_x - center_x) / container_length
     offset_y_ratio = abs(cog_y - center_y) / container_width
 
-    cog_within_limit = offset_x_ratio <= max_offset_ratio and offset_y_ratio <= max_offset_ratio
+    final_cog_limit = 0.20
+    cog_within_limit = offset_x_ratio <= final_cog_limit and offset_y_ratio <= final_cog_limit
 
     placed_cargo_list = []
     for pb in placed_boxes:
@@ -443,22 +460,35 @@ def calculate_plan_score(
     """
     计算方案综合得分（越高越好）
     权重：
-    - 体积利用率：50%
-    - 重心稳定性：30%
-    - 装载率（已装/总数）：20%
+    - 体积利用率：40%
+    - 重心稳定性：20%
+    - 装载率（已装/总数）：40%（最重要，装不下一切免谈）
+
+    惩罚机制：
+    - 装载率低于50%：大幅减分
+    - 装载率低于30%：直接不及格
     """
-    utilization_score = volume_utilization * 50
+    placement_rate = placed_count / total_cargos if total_cargos > 0 else 0
+
+    utilization_score = volume_utilization * 40
 
     cog_offset_total = cog_offset_x_ratio + cog_offset_y_ratio
-    max_offset = 0.3
-    cog_score = max(0, (1 - cog_offset_total / max_offset)) * 30
+    max_offset = 0.4
+    cog_score = max(0, (1 - cog_offset_total / max_offset)) * 20
     if not cog_within_limit:
-        cog_score *= 0.5
+        cog_score *= 0.7
 
-    placement_rate = placed_count / total_cargos if total_cargos > 0 else 0
-    placement_score = placement_rate * 20
+    placement_score = placement_rate * 40
 
     total_score = utilization_score + cog_score + placement_score
+
+    if placement_rate < 0.3:
+        total_score *= 0.3
+    elif placement_rate < 0.5:
+        total_score *= 0.6
+    elif placement_rate < 0.7:
+        total_score *= 0.85
+
     return round(total_score, 2)
 
 
@@ -471,26 +501,32 @@ def generate_recommendation(
     生成方案推荐理由
     """
     reasons = []
+    placement_rate = plan["placed_count"] / plan["total_cargos"] if plan["total_cargos"] > 0 else 0
 
-    if rank == 1:
+    if placement_rate < 0.5:
+        reasons.append("⚠️ 装载率不足50%，不建议使用")
+
+    if rank == 1 and placement_rate >= 0.5:
         reasons.append("综合评分最高，是最优选择")
+    elif rank == 1 and placement_rate < 0.5:
+        reasons.append("所有方案装载率都偏低，仅作参考")
 
     best_util = max(p["volume_utilization"] for p in all_plans)
-    if plan["volume_utilization"] >= best_util - 0.001:
+    if plan["volume_utilization"] >= best_util - 0.001 and plan["volume_utilization"] > 0.05:
         reasons.append(f"体积利用率最高（{plan['volume_utilization']*100:.1f}%）")
 
     min_cog = min(p["cog_offset_x_ratio"] + p["cog_offset_y_ratio"] for p in all_plans)
     current_cog = plan["cog_offset_x_ratio"] + plan["cog_offset_y_ratio"]
-    if current_cog <= min_cog + 0.001:
+    if current_cog <= min_cog + 0.001 and placement_rate >= 0.3:
         reasons.append("重心最稳定")
 
     max_placed = max(p["placed_count"] for p in all_plans)
-    if plan["placed_count"] >= max_placed:
+    if plan["placed_count"] >= max_placed and plan["placed_count"] > 0:
         reasons.append(f"装载数量最多（{plan['placed_count']}/{plan['total_cargos']}件）")
 
-    if plan["cog_within_limit"]:
+    if plan["cog_within_limit"] and placement_rate >= 0.3:
         reasons.append("重心偏移在安全范围内")
-    else:
+    elif not plan["cog_within_limit"] and placement_rate >= 0.3:
         reasons.append("注意：重心偏移超出安全范围")
 
     if plan["unplaced_count"] > 0:
