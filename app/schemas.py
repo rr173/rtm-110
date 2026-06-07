@@ -150,3 +150,72 @@ class PackingCompareResult(BaseModel):
     plans: List[PackingPlan]
     ranking: List[dict]
     recommendation: str
+
+
+class ThreeViewsResponse(BaseModel):
+    plan_id: int
+    plan_no: str
+    container_name: str
+    container_length: float
+    container_width: float
+    container_height: float
+    top_view: str
+    front_view: str
+    side_view: str
+    cargo_count: int
+    cargo_colors: List[dict]
+
+
+class SequenceStepInfo(BaseModel):
+    step: int
+    cargo_idx: int
+    cargo_id: int
+    cargo_name: str
+    position: dict
+    dimensions: dict
+    weight: float
+    cog_after: dict
+    cog_offset_x_ratio: float
+    cog_offset_y_ratio: float
+    cog_within_limit: bool
+
+
+class PackingSequenceResponse(BaseModel):
+    plan_id: int
+    plan_no: str
+    total_steps: int
+    cargo_count: int
+    all_placed: bool
+    all_steps_within_limit: bool
+    max_cog_offset_ratio: float
+    final_cog: dict
+    final_cog_within_limit: bool
+    final_cog_offset_x_ratio: float
+    final_cog_offset_y_ratio: float
+    sequence: List[dict]
+
+
+class SnapshotCargoInfo(BaseModel):
+    cargo_idx: int
+    cargo_id: int
+    cargo_name: str
+    position: dict
+    dimensions: dict
+    weight: float
+
+
+class StepSnapshotResponse(BaseModel):
+    plan_id: int
+    plan_no: str
+    step: int
+    total_steps: int
+    placed_count: int
+    placed_cargos: List[dict]
+    cog: dict
+    cog_within_limit: bool
+    cog_offset_x_ratio: float
+    cog_offset_y_ratio: float
+    last_placed: Optional[dict] = None
+    top_view: str
+    front_view: str
+    side_view: str

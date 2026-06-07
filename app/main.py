@@ -7,6 +7,8 @@ import uuid
 from app.database import engine, get_db, Base
 from app import models, schemas, crud
 from app.packing.algorithm import pack_boxes, Box, rank_plans
+from app.packing.visualizer import render_three_views, CARGO_COLORS
+from app.packing.sequence_engine import generate_packing_sequence, get_step_snapshot
 
 Base.metadata.create_all(bind=engine)
 
@@ -394,3 +396,163 @@ def delete_packing_plan(plan_identifier: str, db: Session = Depends(get_db)):
     if plan is None:
         raise HTTPException(status_code=404, detail="方案不存在")
     return {"message": "删除成功", "plan_no": plan.plan_no}
+
+
+def _get_plan_and_cargos(plan_identifier: str, db: Session):
+    plan = None
+    if plan_identifier.isdigit():
+        plan = crud.get_packing_plan(db, plan_id=int(plan_identifier))
+    if plan is None:
+        plan = crud.get_packing_plan(db, plan_no=plan_identifier)
+
+    if plan is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+
+    container = crud.get_container(db, container_id=plan.container_id)
+    if container is None:
+        raise HTTPException(status_code=404, detail="集装箱信息不存在")
+
+    packed_cargos = crud.get_packed_cargos(db, plan_id=plan.id)
+    placed_cargos = []
+    for pc in packed_cargos:
+        placed_cargos.append({
+            "cargo_id": pc.cargo_id,
+            "cargo_name": pc.cargo_name,
+            "x": pc.x,
+            "y": pc.y,
+            "z": pc.z,
+            "length": pc.length,
+            "width": pc.width,
+            "height": pc.height,
+            "weight": pc.weight,
+            "orientation": pc.orientation
+        })
+
+    return plan, container, placed_cargos
+
+
+@app.get("/plans/{plan_identifier}/views", response_model=schemas.ThreeViewsResponse)
+def get_packing_views(
+    plan_identifier: str,
+    view_width: int = 500,
+    db: Session = Depends(get_db)
+):
+    plan, container, placed_cargos = _get_plan_and_cargos(plan_identifier, db)
+
+    views = render_three_views(
+        container_length=container.length,
+        container_width=container.width,
+        container_height=container.height,
+        placed_cargos=placed_cargos,
+        view_width=view_width
+    )
+
+    cargo_colors = []
+    for idx, cargo in enumerate(placed_cargos):
+        color_idx = idx % len(CARGO_COLORS)
+        cargo_colors.append({
+            "idx": idx,
+            "cargo_id": cargo["cargo_id"],
+            "cargo_name": cargo["cargo_name"],
+            "color": CARGO_COLORS[color_idx],
+            "label": str(idx + 1)
+        })
+
+    return {
+        "plan_id": plan.id,
+        "plan_no": plan.plan_no,
+        "container_name": plan.container_name,
+        "container_length": container.length,
+        "container_width": container.width,
+        "container_height": container.height,
+        "top_view": views["top_view"],
+        "front_view": views["front_view"],
+        "side_view": views["side_view"],
+        "cargo_count": len(placed_cargos),
+        "cargo_colors": cargo_colors
+    }
+
+
+@app.get("/plans/{plan_identifier}/sequence", response_model=schemas.PackingSequenceResponse)
+def get_packing_sequence(
+    plan_identifier: str,
+    max_cog_offset: float = 0.20,
+    db: Session = Depends(get_db)
+):
+    plan, container, placed_cargos = _get_plan_and_cargos(plan_identifier, db)
+
+    sequence_result = generate_packing_sequence(
+        container_length=container.length,
+        container_width=container.width,
+        container_height=container.height,
+        placed_cargos=placed_cargos,
+        max_cog_offset_ratio=max_cog_offset
+    )
+
+    return {
+        "plan_id": plan.id,
+        "plan_no": plan.plan_no,
+        "total_steps": sequence_result["total_steps"],
+        "cargo_count": sequence_result["cargo_count"],
+        "all_placed": sequence_result["all_placed"],
+        "all_steps_within_limit": sequence_result["all_steps_within_limit"],
+        "max_cog_offset_ratio": sequence_result["max_cog_offset_ratio"],
+        "final_cog": sequence_result["final_cog"],
+        "final_cog_within_limit": sequence_result["final_cog_within_limit"],
+        "final_cog_offset_x_ratio": sequence_result["final_cog_offset_x_ratio"],
+        "final_cog_offset_y_ratio": sequence_result["final_cog_offset_y_ratio"],
+        "sequence": sequence_result["sequence"]
+    }
+
+
+@app.get("/plans/{plan_identifier}/snapshot/{step}", response_model=schemas.StepSnapshotResponse)
+def get_packing_snapshot(
+    plan_identifier: str,
+    step: int,
+    view_width: int = 500,
+    max_cog_offset: float = 0.20,
+    db: Session = Depends(get_db)
+):
+    plan, container, placed_cargos = _get_plan_and_cargos(plan_identifier, db)
+
+    sequence_result = generate_packing_sequence(
+        container_length=container.length,
+        container_width=container.width,
+        container_height=container.height,
+        placed_cargos=placed_cargos,
+        max_cog_offset_ratio=max_cog_offset
+    )
+
+    snapshot = get_step_snapshot(
+        container_length=container.length,
+        container_width=container.width,
+        container_height=container.height,
+        placed_cargos=placed_cargos,
+        sequence_result=sequence_result,
+        step_number=step
+    )
+
+    views = render_three_views(
+        container_length=container.length,
+        container_width=container.width,
+        container_height=container.height,
+        placed_cargos=snapshot["placed_cargos"],
+        view_width=view_width
+    )
+
+    return {
+        "plan_id": plan.id,
+        "plan_no": plan.plan_no,
+        "step": snapshot["step"],
+        "total_steps": snapshot["total_steps"],
+        "placed_count": snapshot["placed_count"],
+        "placed_cargos": snapshot["placed_cargos"],
+        "cog": snapshot["cog"],
+        "cog_within_limit": snapshot["cog_within_limit"],
+        "cog_offset_x_ratio": snapshot["cog_offset_x_ratio"],
+        "cog_offset_y_ratio": snapshot["cog_offset_y_ratio"],
+        "last_placed": snapshot["last_placed"],
+        "top_view": views["top_view"],
+        "front_view": views["front_view"],
+        "side_view": views["side_view"]
+    }
