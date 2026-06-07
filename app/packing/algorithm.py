@@ -1,0 +1,351 @@
+from typing import List, Tuple, Dict
+from dataclasses import dataclass
+
+
+@dataclass
+class Box:
+    cargo_id: int
+    cargo_name: str
+    length: float
+    width: float
+    height: float
+    weight: float
+    can_rotate_horizontal: bool
+    can_flip: bool
+    max_top_load: float
+
+
+@dataclass
+class PlacedBox:
+    cargo_id: int
+    cargo_name: str
+    x: float
+    y: float
+    z: float
+    length: float
+    width: float
+    height: float
+    weight: float
+    max_top_load: float
+    orientation: str
+
+
+@dataclass
+class ExtremePoint:
+    x: float
+    y: float
+    z: float
+
+
+def get_orientations(box: Box) -> List[Tuple[float, float, float, str]]:
+    orientations = []
+    l, w, h = box.length, box.width, box.height
+
+    orientations.append((l, w, h, "original"))
+
+    if box.can_rotate_horizontal:
+        orientations.append((w, l, h, "rotated_90"))
+
+    if box.can_flip:
+        orientations.append((l, h, w, "flipped_l"))
+        orientations.append((w, h, l, "flipped_w"))
+        if box.can_rotate_horizontal:
+            orientations.append((h, l, w, "flipped_rotated_l"))
+            orientations.append((h, w, l, "flipped_rotated_w"))
+
+    seen = set()
+    unique = []
+    for o in orientations:
+        key = (round(o[0], 3), round(o[1], 3), round(o[2], 3))
+        if key not in seen:
+            seen.add(key)
+            unique.append(o)
+    return unique
+
+
+def is_supported(placed_boxes: List[PlacedBox], bx: float, by: float, bz: float,
+                 bl: float, bw: float) -> bool:
+    if bz <= 0.001:
+        return True
+
+    bottom_area = bl * bw
+    supported_area = 0.0
+
+    for pb in placed_boxes:
+        pb_top_z = pb.z + pb.height
+        if abs(pb_top_z - bz) > 0.001:
+            continue
+
+        x_overlap_start = max(bx, pb.x)
+        x_overlap_end = min(bx + bl, pb.x + pb.length)
+        y_overlap_start = max(by, pb.y)
+        y_overlap_end = min(by + bw, pb.y + pb.width)
+
+        if x_overlap_end > x_overlap_start and y_overlap_end > y_overlap_start:
+            overlap_area = (x_overlap_end - x_overlap_start) * (y_overlap_end - y_overlap_start)
+            supported_area += overlap_area
+
+    return supported_area >= bottom_area * 0.999
+
+
+def check_weight_bearing(placed_boxes: List[PlacedBox], bx: float, by: float, bz: float,
+                         bl: float, bw: float, b_weight: float) -> bool:
+    if bz <= 0.001:
+        return True
+
+    total_weight_on_level = 0.0
+    for pb in placed_boxes:
+        pb_top_z = pb.z + pb.height
+        if abs(pb_top_z - bz) > 0.001:
+            continue
+
+        x_overlap_start = max(bx, pb.x)
+        x_overlap_end = min(bx + bl, pb.x + pb.length)
+        y_overlap_start = max(by, pb.y)
+        y_overlap_end = min(by + bw, pb.y + pb.width)
+
+        if x_overlap_end > x_overlap_start and y_overlap_end > y_overlap_start:
+            overlap_area = (x_overlap_end - x_overlap_start) * (y_overlap_end - y_overlap_start)
+            pb_top_area = pb.length * pb.width
+            if pb_top_area > 0:
+                weight_ratio = overlap_area / pb_top_area
+                distributed_weight = b_weight * weight_ratio
+                if distributed_weight > pb.max_top_load + 0.001:
+                    return False
+            total_weight_on_level += b_weight
+
+    return True
+
+
+def boxes_overlap(x1: float, y1: float, z1: float, l1: float, w1: float, h1: float,
+                  x2: float, y2: float, z2: float, l2: float, w2: float, h2: float) -> bool:
+    if x1 >= x2 + l2 - 0.001 or x2 >= x1 + l1 - 0.001:
+        return False
+    if y1 >= y2 + w2 - 0.001 or y2 >= y1 + w1 - 0.001:
+        return False
+    if z1 >= z2 + h2 - 0.001 or z2 >= z1 + h1 - 0.001:
+        return False
+    return True
+
+
+def can_place_at(placed_boxes: List[PlacedBox], bx: float, by: float, bz: float,
+                 bl: float, bw: float, bh: float, container_l: float, container_w: float,
+                 container_h: float) -> bool:
+    if bx < -0.001 or by < -0.001 or bz < -0.001:
+        return False
+    if bx + bl > container_l + 0.001 or by + bw > container_w + 0.001 or bz + bh > container_h + 0.001:
+        return False
+
+    for pb in placed_boxes:
+        if boxes_overlap(bx, by, bz, bl, bw, bh,
+                         pb.x, pb.y, pb.z, pb.length, pb.width, pb.height):
+            return False
+
+    return True
+
+
+def generate_extreme_points(placed: PlacedBox) -> List[ExtremePoint]:
+    points = []
+    points.append(ExtremePoint(placed.x + placed.length, placed.y, placed.z))
+    points.append(ExtremePoint(placed.x, placed.y + placed.width, placed.z))
+    points.append(ExtremePoint(placed.x, placed.y, placed.z + placed.height))
+    return points
+
+
+def is_point_dominated(ep: ExtremePoint, other: ExtremePoint) -> bool:
+    return (other.x <= ep.x + 0.001 and
+            other.y <= ep.y + 0.001 and
+            other.z <= ep.z + 0.001 and
+            (other.x < ep.x - 0.001 or other.y < ep.y - 0.001 or other.z < ep.z - 0.001))
+
+
+def prune_extreme_points(points: List[ExtremePoint], placed_boxes: List[PlacedBox],
+                         container_l: float, container_w: float, container_h: float) -> List[ExtremePoint]:
+    unique = []
+    seen = set()
+    for ep in points:
+        key = (round(ep.x, 2), round(ep.y, 2), round(ep.z, 2))
+        if key not in seen:
+            seen.add(key)
+            if ep.x <= container_l + 0.001 and ep.y <= container_w + 0.001 and ep.z <= container_h + 0.001:
+                unique.append(ep)
+
+    pruned = []
+    for i, ep1 in enumerate(unique):
+        dominated = False
+        for j, ep2 in enumerate(unique):
+            if i == j:
+                continue
+            if is_point_dominated(ep1, ep2):
+                dominated = True
+                break
+        if not dominated:
+            pruned.append(ep1)
+
+    return pruned
+
+
+def calculate_cog(placed_boxes: List[PlacedBox]) -> Tuple[float, float, float]:
+    total_weight = sum(pb.weight for pb in placed_boxes)
+    if total_weight == 0:
+        return (0, 0, 0)
+
+    cx = sum(pb.weight * (pb.x + pb.length / 2) for pb in placed_boxes) / total_weight
+    cy = sum(pb.weight * (pb.y + pb.width / 2) for pb in placed_boxes) / total_weight
+    cz = sum(pb.weight * (pb.z + pb.height / 2) for pb in placed_boxes) / total_weight
+
+    return (cx, cy, cz)
+
+
+def drop_box(placed_boxes: List[PlacedBox], bx: float, by: float, bz: float,
+             bl: float, bw: float, bh: float) -> float:
+    if bz <= 0.001:
+        return 0.0
+
+    final_z = 0.0
+
+    for pb in placed_boxes:
+        pb_top = pb.z + pb.height
+        if pb_top > bz + 0.001:
+            continue
+
+        x_overlap_start = max(bx, pb.x)
+        x_overlap_end = min(bx + bl, pb.x + pb.length)
+        y_overlap_start = max(by, pb.y)
+        y_overlap_end = min(by + bw, pb.y + pb.width)
+
+        if x_overlap_end > x_overlap_start + 0.001 and y_overlap_end > y_overlap_start + 0.001:
+            if pb_top > final_z + 0.001:
+                overlap_area = (x_overlap_end - x_overlap_start) * (y_overlap_end - y_overlap_start)
+                bottom_area = bl * bw
+                if overlap_area >= bottom_area * 0.5:
+                    final_z = pb_top
+
+    return final_z
+
+
+def pack_boxes(container_length: float, container_width: float, container_height: float,
+               container_max_weight: float, boxes: List[Box]) -> Dict:
+    sorted_boxes = sorted(boxes, key=lambda b: (b.length * b.width * b.height, b.weight), reverse=True)
+
+    extreme_points = [ExtremePoint(0, 0, 0)]
+    placed_boxes: List[PlacedBox] = []
+    unplaced_boxes = []
+    total_weight = 0.0
+
+    for box in sorted_boxes:
+        placed = False
+        orientations = get_orientations(box)
+
+        best_placement = None
+        best_score = float('inf')
+
+        for ep_idx, ep in enumerate(extreme_points):
+            for (bl, bw, bh, orientation) in orientations:
+                if total_weight + box.weight > container_max_weight + 0.001:
+                    continue
+
+                if ep.x + bl > container_length + 0.001:
+                    continue
+                if ep.y + bw > container_width + 0.001:
+                    continue
+                if ep.z + bh > container_height + 0.001:
+                    continue
+
+                dropped_z = drop_box(placed_boxes, ep.x, ep.y, ep.z, bl, bw, bh)
+
+                if not can_place_at(placed_boxes, ep.x, ep.y, dropped_z, bl, bw, bh,
+                                    container_length, container_width, container_height):
+                    continue
+
+                if not is_supported(placed_boxes, ep.x, ep.y, dropped_z, bl, bw):
+                    continue
+
+                if not check_weight_bearing(placed_boxes, ep.x, ep.y, dropped_z, bl, bw, box.weight):
+                    continue
+
+                score = dropped_z * 10000000 + ep.y * 10000 + ep.x
+
+                if score < best_score:
+                    best_score = score
+                    best_placement = (ep_idx, ep.x, ep.y, dropped_z, bl, bw, bh, orientation)
+
+        if best_placement is not None:
+            ep_idx, px, py, pz, pl, pw, ph, orientation = best_placement
+
+            placed_box = PlacedBox(
+                cargo_id=box.cargo_id,
+                cargo_name=box.cargo_name,
+                x=px,
+                y=py,
+                z=pz,
+                length=pl,
+                width=pw,
+                height=ph,
+                weight=box.weight,
+                max_top_load=box.max_top_load,
+                orientation=orientation
+            )
+
+            placed_boxes.append(placed_box)
+            total_weight += box.weight
+
+            used_ep = extreme_points.pop(ep_idx)
+
+            new_points = generate_extreme_points(placed_box)
+            extreme_points.extend(new_points)
+            extreme_points = prune_extreme_points(extreme_points, placed_boxes,
+                                                  container_length, container_width, container_height)
+
+            extreme_points.sort(key=lambda ep: ep.z * 10000000 + ep.y * 10000 + ep.x)
+
+            placed = True
+
+        if not placed:
+            unplaced_boxes.append({
+                "cargo_id": box.cargo_id,
+                "cargo_name": box.cargo_name,
+                "reason": "无法找到合适的摆放位置"
+            })
+
+    total_volume = container_length * container_width * container_height
+    used_volume = sum(pb.length * pb.width * pb.height for pb in placed_boxes)
+    volume_utilization = used_volume / total_volume if total_volume > 0 else 0
+
+    cog_x, cog_y, cog_z = calculate_cog(placed_boxes)
+
+    center_x = container_length / 2
+    center_y = container_width / 2
+
+    offset_x_ratio = abs(cog_x - center_x) / container_length
+    offset_y_ratio = abs(cog_y - center_y) / container_width
+
+    cog_within_limit = offset_x_ratio <= 0.15 and offset_y_ratio <= 0.15
+
+    placed_cargo_list = []
+    for pb in placed_boxes:
+        placed_cargo_list.append({
+            "cargo_id": pb.cargo_id,
+            "cargo_name": pb.cargo_name,
+            "x": pb.x,
+            "y": pb.y,
+            "z": pb.z,
+            "length": pb.length,
+            "width": pb.width,
+            "height": pb.height,
+            "weight": pb.weight,
+            "orientation": pb.orientation
+        })
+
+    return {
+        "placed_cargos": placed_cargo_list,
+        "unplaced_cargos": unplaced_boxes,
+        "total_weight": total_weight,
+        "volume_utilization": volume_utilization,
+        "center_of_gravity": {
+            "x": cog_x,
+            "y": cog_y,
+            "z": cog_z
+        },
+        "cog_within_limit": cog_within_limit
+    }
