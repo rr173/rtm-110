@@ -43,6 +43,7 @@ def startup_event():
     crud.create_demo_trailer_scenarios(db)
     crud.create_default_hazard_matrix(db)
     crud.create_demo_hazard_cargos(db)
+    crud.create_demo_temperature_cargos(db)
     crud.init_plan_hash_and_version(db)
 
 
@@ -130,6 +131,7 @@ def compare_packing(request: schemas.PackingCompareRequest, save: bool = True, d
         if cargo is None:
             raise HTTPException(status_code=404, detail=f"货物 ID {cargo_id} 不存在")
         total_cargos += cargo.quantity
+        temp_class = getattr(cargo, 'temperature_class', 'AMBIENT') or 'AMBIENT'
         for i in range(cargo.quantity):
             boxes.append(Box(
                 cargo_id=cargo.id,
@@ -140,7 +142,8 @@ def compare_packing(request: schemas.PackingCompareRequest, save: bool = True, d
                 weight=cargo.weight,
                 can_rotate_horizontal=cargo.can_rotate_horizontal,
                 can_flip=cargo.can_flip,
-                max_top_load=cargo.max_top_load
+                max_top_load=cargo.max_top_load,
+                temperature_class=temp_class
             ))
 
     plans_data = []
@@ -287,6 +290,7 @@ def calculate_packing(container_id: int, cargo_ids: List[int], save: bool = Fals
         if cargo is None:
             raise HTTPException(status_code=404, detail=f"货物 ID {cargo_id} 不存在")
         total_cargos += cargo.quantity
+        temp_class = getattr(cargo, 'temperature_class', 'AMBIENT') or 'AMBIENT'
         for i in range(cargo.quantity):
             boxes.append(Box(
                 cargo_id=cargo.id,
@@ -297,7 +301,8 @@ def calculate_packing(container_id: int, cargo_ids: List[int], save: bool = Fals
                 weight=cargo.weight,
                 can_rotate_horizontal=cargo.can_rotate_horizontal,
                 can_flip=cargo.can_flip,
-                max_top_load=cargo.max_top_load
+                max_top_load=cargo.max_top_load,
+                temperature_class=temp_class
             ))
 
     result = pack_boxes(
@@ -919,9 +924,12 @@ def run_compliance_audit(request: schemas.ComplianceAuditRequest, db: Session = 
         "hazard_check_passed": audit.hazard_check_passed,
         "weight_check_passed": audit.weight_check_passed,
         "name_check_passed": audit.name_check_passed,
+        "temperature_check_passed": audit.temperature_check_passed,
         "hazard_violations": audit.hazard_violations,
         "weight_violations": audit.weight_violations,
         "name_violations": audit.name_violations,
+        "temperature_violations": audit.temperature_violations,
+        "temperature_violations_count": len(audit.temperature_violations) if audit.temperature_violations else 0,
         "audit_details": audit.audit_details,
         "auditor": audit.auditor,
         "remarks": audit.remarks,
@@ -953,6 +961,11 @@ def list_audits(plan_identifier: Optional[str] = None, skip: int = 0, limit: int
             "hazard_violations_count": len(a.hazard_violations) if a.hazard_violations else 0,
             "weight_violations_count": len(a.weight_violations) if a.weight_violations else 0,
             "name_violations_count": len(a.name_violations) if a.name_violations else 0,
+            "temperature_violations_count": len(a.temperature_violations) if a.temperature_violations else 0,
+            "hazard_check_passed": a.hazard_check_passed,
+            "weight_check_passed": a.weight_check_passed,
+            "name_check_passed": a.name_check_passed,
+            "temperature_check_passed": a.temperature_check_passed,
             "remarks": a.remarks,
             "audited_at": a.audited_at.isoformat() if a.audited_at else "",
         })
@@ -981,9 +994,12 @@ def get_audit_detail(audit_identifier: str, db: Session = Depends(get_db)):
         "hazard_check_passed": audit.hazard_check_passed,
         "weight_check_passed": audit.weight_check_passed,
         "name_check_passed": audit.name_check_passed,
+        "temperature_check_passed": audit.temperature_check_passed,
         "hazard_violations": audit.hazard_violations,
         "weight_violations": audit.weight_violations,
         "name_violations": audit.name_violations,
+        "temperature_violations": audit.temperature_violations,
+        "temperature_violations_count": len(audit.temperature_violations) if audit.temperature_violations else 0,
         "audit_details": audit.audit_details,
         "auditor": audit.auditor,
         "remarks": audit.remarks,

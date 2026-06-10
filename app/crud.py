@@ -131,7 +131,8 @@ def create_packing_plan(db: Session, plan_data: dict, placed_cargos: list, unpla
             width=pc["width"],
             height=pc["height"],
             weight=pc["weight"],
-            orientation=pc["orientation"]
+            orientation=pc["orientation"],
+            temperature_class=pc.get("temperature_class", "AMBIENT")
         )
         db.add(db_packed)
 
@@ -840,4 +841,88 @@ def init_plan_hash_and_version(db: Session):
             plan.content_hash = compute_plan_content_hash(db, plan.id)
     if plans:
         db.commit()
+
+
+def create_demo_temperature_cargos(db: Session):
+    existing = db.query(models.Cargo).filter(
+        models.Cargo.temperature_class.in_(["FROZEN", "REFRIGERATED"])
+    ).all()
+    if existing:
+        return
+    demo_cargos = [
+        models.Cargo(
+            name="冷冻牛肉箱", length=600, width=400, height=300, weight=25,
+            can_rotate_horizontal=True, can_flip=True, max_top_load=50, quantity=15,
+            hazard_class=None, declared_name="冷冻牛肉箱", declared_weight=25.0,
+            temperature_class="FROZEN"
+        ),
+        models.Cargo(
+            name="冷冻海鲜箱", length=550, width=350, height=250, weight=18,
+            can_rotate_horizontal=True, can_flip=True, max_top_load=40, quantity=12,
+            hazard_class=None, declared_name="冷冻海鲜箱", declared_weight=18.0,
+            temperature_class="FROZEN"
+        ),
+        models.Cargo(
+            name="冷冻水饺箱", length=500, width=350, height=200, weight=12,
+            can_rotate_horizontal=True, can_flip=True, max_top_load=60, quantity=20,
+            hazard_class=None, declared_name="冷冻水饺箱", declared_weight=12.0,
+            temperature_class="FROZEN"
+        ),
+        models.Cargo(
+            name="冷藏鲜奶箱", length=450, width=300, height=350, weight=20,
+            can_rotate_horizontal=True, can_flip=False, max_top_load=30, quantity=18,
+            hazard_class=None, declared_name="冷藏鲜奶箱", declared_weight=20.0,
+            temperature_class="REFRIGERATED"
+        ),
+        models.Cargo(
+            name="冷藏水果箱", length=550, width=400, height=300, weight=15,
+            can_rotate_horizontal=True, can_flip=False, max_top_load=25, quantity=16,
+            hazard_class=None, declared_name="冷藏水果箱", declared_weight=15.0,
+            temperature_class="REFRIGERATED"
+        ),
+        models.Cargo(
+            name="冷藏蔬菜箱", length=500, width=350, height=280, weight=12,
+            can_rotate_horizontal=True, can_flip=False, max_top_load=35, quantity=14,
+            hazard_class=None, declared_name="冷藏蔬菜箱", declared_weight=12.0,
+            temperature_class="REFRIGERATED"
+        ),
+        models.Cargo(
+            name="冷藏药品箱", length=400, width=300, height=250, weight=10,
+            can_rotate_horizontal=True, can_flip=False, max_top_load=20, quantity=10,
+            hazard_class=None, declared_name="冷藏药品箱", declared_weight=10.0,
+            temperature_class="REFRIGERATED"
+        ),
+        models.Cargo(
+            name="常温家电箱", length=800, width=600, height=500, weight=35,
+            can_rotate_horizontal=True, can_flip=True, max_top_load=50, quantity=8,
+            hazard_class=None, declared_name="常温家电箱", declared_weight=35.0,
+            temperature_class="AMBIENT"
+        ),
+        models.Cargo(
+            name="常温服装箱", length=600, width=400, height=300, weight=12,
+            can_rotate_horizontal=True, can_flip=True, max_top_load=80, quantity=25,
+            hazard_class=None, declared_name="常温服装箱", declared_weight=12.0,
+            temperature_class="AMBIENT"
+        ),
+        models.Cargo(
+            name="常温日用品箱", length=500, width=350, height=300, weight=15,
+            can_rotate_horizontal=True, can_flip=True, max_top_load=60, quantity=22,
+            hazard_class=None, declared_name="常温日用品箱", declared_weight=15.0,
+            temperature_class="AMBIENT"
+        ),
+        models.Cargo(
+            name="常温零食箱", length=450, width=300, height=250, weight=10,
+            can_rotate_horizontal=True, can_flip=True, max_top_load=70, quantity=30,
+            hazard_class=None, declared_name="常温零食箱", declared_weight=10.0,
+            temperature_class="AMBIENT"
+        ),
+        models.Cargo(
+            name="常温图书箱", length=400, width=300, height=200, weight=18,
+            can_rotate_horizontal=True, can_flip=True, max_top_load=100, quantity=20,
+            hazard_class=None, declared_name="常温图书箱", declared_weight=18.0,
+            temperature_class="AMBIENT"
+        ),
+    ]
+    db.add_all(demo_cargos)
+    db.commit()
 

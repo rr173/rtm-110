@@ -203,8 +203,9 @@ def run_full_compliance_audit(db: Session, plan_id: int, auditor: str = None) ->
     hz_passed, hz_violations = run_hazard_segregation_check(db, plan_id)
     wt_passed, wt_violations = run_weight_deviation_check(db, plan_id)
     nm_passed, nm_violations = run_declared_name_match_check(db, plan_id)
+    tp_passed, tp_violations = run_temperature_zone_check(db, plan_id)
 
-    overall_passed = hz_passed and wt_passed and nm_passed
+    overall_passed = hz_passed and wt_passed and nm_passed and tp_passed
 
     audit_details = {
         "plan_info": {
@@ -243,6 +244,11 @@ def run_full_compliance_audit(db: Session, plan_id: int, auditor: str = None) ->
                 "violation_count": len(nm_violations),
                 "description": "货物申报品名逐条匹配校验"
             },
+            "temperature_zone": {
+                "passed": tp_passed,
+                "violation_count": len(tp_violations),
+                "description": "冷链温控分区隔离校验(相邻缓冲+冷冻容积60%限制)"
+            },
         },
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }
@@ -254,6 +260,8 @@ def run_full_compliance_audit(db: Session, plan_id: int, auditor: str = None) ->
         remarks_parts.append(f"重量偏差违规{len(wt_violations)}项")
     if not nm_passed:
         remarks_parts.append(f"品名匹配违规{len(nm_violations)}项")
+    if not tp_passed:
+        remarks_parts.append(f"温控分区违规{len(tp_violations)}项")
     remarks = "通过全部合规校验" if overall_passed else "校验失败: " + "; ".join(remarks_parts)
 
     audit_data = {
@@ -265,9 +273,11 @@ def run_full_compliance_audit(db: Session, plan_id: int, auditor: str = None) ->
         "hazard_check_passed": hz_passed,
         "weight_check_passed": wt_passed,
         "name_check_passed": nm_passed,
+        "temperature_check_passed": tp_passed,
         "hazard_violations": hz_violations,
         "weight_violations": wt_violations,
         "name_violations": nm_violations,
+        "temperature_violations": tp_violations,
         "audit_details": audit_details,
         "auditor": auditor,
         "remarks": remarks,
@@ -284,16 +294,165 @@ def run_full_compliance_audit(db: Session, plan_id: int, auditor: str = None) ->
         "hazard_check_passed": hz_passed,
         "weight_check_passed": wt_passed,
         "name_check_passed": nm_passed,
+        "temperature_check_passed": tp_passed,
         "hazard_violations_count": len(hz_violations),
         "weight_violations_count": len(wt_violations),
         "name_violations_count": len(nm_violations),
+        "temperature_violations_count": len(tp_violations),
         "hazard_violations": hz_violations,
         "weight_violations": wt_violations,
         "name_violations": nm_violations,
+        "temperature_violations": tp_violations,
         "remarks": remarks,
         "audit_details": audit_details,
         "audited_at": db_audit.audited_at.isoformat() if db_audit.audited_at else "",
     }
+
+
+TEMPERATURE_PRIORITY = {
+    "FROZEN": 3,
+    "REFRIGERATED": 2,
+    "AMBIENT": 1,
+}
+
+TEMPERATURE_LABELS = {
+    "FROZEN": "冷冻(-18℃以下)",
+    "REFRIGERATED": "冷藏(0-5℃)",
+    "AMBIENT": "常温",
+}
+
+
+def _get_temperature_priority(tc: str) -> int:
+    return TEMPERATURE_PRIORITY.get(tc, 1)
+
+
+def _boxes_are_adjacent(box_a, box_b) -> bool:
+    ax1, ay1, az1 = box_a.x, box_a.y, box_a.z
+    ax2, ay2, az2 = box_a.x + box_a.length, box_a.y + box_a.width, box_a.z + box_a.height
+    bx1, by1, bz1 = box_b.x, box_b.y, box_b.z
+    bx2, by2, bz2 = box_b.x + box_b.length, box_b.y + box_b.width, box_b.z + box_b.height
+
+    overlap_x = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    overlap_y = max(0.0, min(ay2, by2) - max(ay1, by1))
+    overlap_z = max(0.0, min(az2, bz2) - max(az1, bz1))
+
+    touch_x = abs(ax2 - bx1) < 0.1 or abs(bx2 - ax1) < 0.1
+    touch_y = abs(ay2 - by1) < 0.1 or abs(by2 - ay1) < 0.1
+    touch_z = abs(az2 - bz1) < 0.1 or abs(bz2 - az1) < 0.1
+
+    if touch_x and overlap_y > 0 and overlap_z > 0:
+        return True
+    if touch_y and overlap_x > 0 and overlap_z > 0:
+        return True
+    if touch_z and overlap_x > 0 and overlap_y > 0:
+        return True
+
+    return False
+
+
+def _get_cargo_temperature_class(db: Session, cargo_id: int, packed_cargo) -> str:
+    if hasattr(packed_cargo, 'temperature_class') and packed_cargo.temperature_class:
+        return packed_cargo.temperature_class
+    cargo = crud.get_cargo(db, cargo_id=cargo_id)
+    if cargo and hasattr(cargo, 'temperature_class') and cargo.temperature_class:
+        return cargo.temperature_class
+    return "AMBIENT"
+
+
+def run_temperature_zone_check(
+    db: Session, plan_id: int, frozen_volume_limit_ratio: float = 0.6
+) -> Tuple[bool, List[Dict[str, Any]]]:
+    plan = crud.get_packing_plan(db, plan_id=plan_id)
+    if not plan:
+        return False, [{"error": "方案不存在", "violation_type": "error"}]
+
+    packed_cargos = crud.get_packed_cargos(db, plan_id=plan_id)
+    container = crud.get_container(db, container_id=plan.container_id)
+    if not container:
+        return False, [{"error": "集装箱信息不存在", "violation_type": "error"}]
+
+    violations = []
+    n = len(packed_cargos)
+
+    temp_info = []
+    for pc in packed_cargos:
+        tc = _get_cargo_temperature_class(db, pc.cargo_id, pc)
+        volume = (pc.length * pc.width * pc.height) / 1e9
+        temp_info.append({
+            "packed": pc,
+            "temperature_class": tc,
+            "priority": _get_temperature_priority(tc),
+            "volume_cbm": volume,
+        })
+
+    frozen_total_volume = sum(
+        info["volume_cbm"] for info in temp_info if info["temperature_class"] == "FROZEN"
+    )
+    container_total_volume = (container.length * container.width * container.height) / 1e9
+    frozen_volume_ratio = frozen_total_volume / container_total_volume if container_total_volume > 0 else 0
+
+    if frozen_volume_ratio > frozen_volume_limit_ratio:
+        violations.append({
+            "violation_type": "frozen_volume_exceeded",
+            "description": (
+                f"冷冻货物总体积({frozen_total_volume:.3f} CBM)占集装箱可用容积"
+                f"({container_total_volume:.3f} CBM)的比例为{frozen_volume_ratio*100:.1f}%，"
+                f"超过最大允许比例{frozen_volume_limit_ratio*100:.0f}%"
+            ),
+            "frozen_volume_cbm": round(frozen_total_volume, 4),
+            "container_volume_cbm": round(container_total_volume, 4),
+            "frozen_volume_ratio": round(frozen_volume_ratio, 4),
+            "max_allowed_ratio": frozen_volume_limit_ratio,
+        })
+
+    adjacent_pairs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _boxes_are_adjacent(temp_info[i]["packed"], temp_info[j]["packed"]):
+                adjacent_pairs.append((i, j))
+
+    checked_pairs = set()
+    for i, j in adjacent_pairs:
+        pair_key = tuple(sorted([i, j]))
+        if pair_key in checked_pairs:
+            continue
+        checked_pairs.add(pair_key)
+
+        info_a = temp_info[i]
+        info_b = temp_info[j]
+        tc_a = info_a["temperature_class"]
+        tc_b = info_b["temperature_class"]
+        prio_a = info_a["priority"]
+        prio_b = info_b["priority"]
+
+        if prio_a == prio_b:
+            continue
+
+        prio_diff = abs(prio_a - prio_b)
+        if prio_diff >= 2:
+            pc_a = info_a["packed"]
+            pc_b = info_b["packed"]
+            violations.append({
+                "violation_type": "direct_adjacency",
+                "cargo_a_id": pc_a.cargo_id,
+                "cargo_a_name": pc_a.cargo_name,
+                "temperature_class_a": tc_a,
+                "temperature_class_a_label": TEMPERATURE_LABELS.get(tc_a, tc_a),
+                "cargo_b_id": pc_b.cargo_id,
+                "cargo_b_name": pc_b.cargo_name,
+                "temperature_class_b": tc_b,
+                "temperature_class_b_label": TEMPERATURE_LABELS.get(tc_b, tc_b),
+                "position_a": {"x": pc_a.x, "y": pc_a.y, "z": pc_a.z},
+                "position_b": {"x": pc_b.x, "y": pc_b.y, "z": pc_b.z},
+                "description": (
+                    f"{TEMPERATURE_LABELS.get(tc_a, tc_a)}货物({pc_a.cargo_name})与"
+                    f"{TEMPERATURE_LABELS.get(tc_b, tc_b)}货物({pc_b.cargo_name})直接相邻，"
+                    f"中间缺少{'' if prio_a > prio_b else TEMPERATURE_LABELS.get('REFRIGERATED', '冷藏')}"
+                    f"缓冲层或隔热隔板"
+                ),
+            })
+
+    return len(violations) == 0, violations
 
 
 def _get_cargo_info(db: Session, cargo_id: int):

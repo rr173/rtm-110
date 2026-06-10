@@ -36,6 +36,7 @@ class CargoBase(BaseModel):
     hazard_class: Optional[int] = Field(default=None, ge=1, le=6, description="危险品等级 1-6类，None为普通货物")
     declared_name: Optional[str] = Field(default=None, description="海关申报品名")
     declared_weight: Optional[float] = Field(default=None, ge=0, description="海关申报重量 kg")
+    temperature_class: Optional[str] = Field(default="AMBIENT", description="温控等级: FROZEN冷冻(-18℃以下)/REFRIGERATED冷藏(0-5℃)/AMBIENT常温")
 
 
 class CargoCreate(CargoBase):
@@ -55,6 +56,7 @@ class CargoUpdate(BaseModel):
     hazard_class: Optional[int] = None
     declared_name: Optional[str] = None
     declared_weight: Optional[float] = None
+    temperature_class: Optional[str] = None
 
 
 class Cargo(CargoBase):
@@ -75,6 +77,7 @@ class PlacedCargo(BaseModel):
     height: float
     weight: float
     orientation: str
+    temperature_class: Optional[str] = "AMBIENT"
 
 
 class PackingResult(BaseModel):
@@ -103,6 +106,7 @@ class PackedCargoSchema(BaseModel):
     height: float
     weight: float
     orientation: str
+    temperature_class: Optional[str] = "AMBIENT"
 
     class Config:
         from_attributes = True
@@ -447,6 +451,23 @@ class NameViolation(BaseModel):
     issue: str
 
 
+class TemperatureViolation(BaseModel):
+    violation_type: str
+    cargo_a_id: Optional[int] = None
+    cargo_a_name: Optional[str] = None
+    temperature_class_a: Optional[str] = None
+    cargo_b_id: Optional[int] = None
+    cargo_b_name: Optional[str] = None
+    temperature_class_b: Optional[str] = None
+    position_a: Optional[dict] = None
+    position_b: Optional[dict] = None
+    description: str
+    frozen_volume_cbm: Optional[float] = None
+    container_volume_cbm: Optional[float] = None
+    frozen_volume_ratio: Optional[float] = None
+    max_allowed_ratio: Optional[float] = None
+
+
 class ComplianceAuditRequest(BaseModel):
     plan_identifier: str = Field(description="方案ID或方案编号")
 
@@ -458,9 +479,11 @@ class ComplianceAuditBase(BaseModel):
     hazard_check_passed: bool = True
     weight_check_passed: bool = True
     name_check_passed: bool = True
+    temperature_check_passed: bool = True
     hazard_violations: List[Any] = []
     weight_violations: List[Any] = []
     name_violations: List[Any] = []
+    temperature_violations: List[Any] = []
     audit_details: Dict[str, Any] = {}
     auditor: Optional[str] = None
     remarks: Optional[str] = None
@@ -484,6 +507,7 @@ class ComplianceAudit(ComplianceAuditBase):
 class ComplianceAuditDetail(ComplianceAudit):
     plan_no: Optional[str] = None
     container_name: Optional[str] = None
+    temperature_violations_count: Optional[int] = 0
 
 
 class CustomsDocumentItemBase(BaseModel):

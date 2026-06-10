@@ -32,6 +32,7 @@ class Cargo(Base):
     hazard_class = Column(Integer, nullable=True, comment="危险品等级 1-6类，None为普通货物")
     declared_name = Column(String, nullable=True, comment="海关申报品名")
     declared_weight = Column(Float, nullable=True, comment="海关申报重量 kg")
+    temperature_class = Column(String, nullable=True, default="AMBIENT", comment="温控等级: FROZEN冷冻(-18℃以下)/REFRIGERATED冷藏(0-5℃)/AMBIENT常温")
 
 
 class PackingPlan(Base):
@@ -83,6 +84,7 @@ class PackedCargo(Base):
     height = Column(Float)
     weight = Column(Float)
     orientation = Column(String)
+    temperature_class = Column(String, nullable=True, default="AMBIENT", comment="温控等级: FROZEN/REFRIGERATED/AMBIENT")
 
     plan = relationship("PackingPlan", back_populates="placed_cargos")
 
@@ -204,9 +206,11 @@ class ComplianceAudit(Base):
     hazard_check_passed = Column(Boolean, default=True, comment="危险品隔离校验")
     weight_check_passed = Column(Boolean, default=True, comment="重量偏差校验")
     name_check_passed = Column(Boolean, default=True, comment="品名匹配校验")
+    temperature_check_passed = Column(Boolean, default=True, comment="温控分区校验")
     hazard_violations = Column(JSON, default=list, comment="危险品违规详情")
     weight_violations = Column(JSON, default=list, comment="重量违规详情")
     name_violations = Column(JSON, default=list, comment="品名违规详情")
+    temperature_violations = Column(JSON, default=list, comment="温控违规详情")
     audit_details = Column(JSON, default=dict, comment="完整审计报告")
     auditor = Column(String, nullable=True, comment="审计员")
     audited_at = Column(DateTime, server_default=func.now())

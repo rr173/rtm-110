@@ -13,6 +13,7 @@ class Box:
     can_rotate_horizontal: bool
     can_flip: bool
     max_top_load: float
+    temperature_class: str = "AMBIENT"
 
 
 @dataclass
@@ -28,6 +29,7 @@ class PlacedBox:
     weight: float
     max_top_load: float
     orientation: str
+    temperature_class: str = "AMBIENT"
 
 
 @dataclass
@@ -382,7 +384,8 @@ def pack_boxes(container_length: float, container_width: float, container_height
                 height=ph,
                 weight=box.weight,
                 max_top_load=box.max_top_load,
-                orientation=orientation
+                orientation=orientation,
+                temperature_class=box.temperature_class
             )
 
             placed_boxes.append(placed_box)
@@ -430,7 +433,8 @@ def pack_boxes(container_length: float, container_width: float, container_height
             "width": pb.width,
             "height": pb.height,
             "weight": pb.weight,
-            "orientation": pb.orientation
+            "orientation": pb.orientation,
+            "temperature_class": pb.temperature_class
         })
 
     return {
