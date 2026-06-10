@@ -464,3 +464,378 @@ def create_demo_trailer_scenarios(db: Session):
         }
 
         create_trailer_load_plan(db, plan_data, opt_result["loaded_boxes"], unload_result["sequence"])
+
+
+import hashlib
+import json
+
+
+def compute_plan_content_hash(db: Session, plan_id: int) -> str:
+    plan = get_packing_plan(db, plan_id=plan_id)
+    if not plan:
+        return ""
+    packed_cargos = get_packed_cargos(db, plan_id=plan_id)
+    cargo_list = []
+    for pc in sorted(packed_cargos, key=lambda x: (x.x, x.y, x.z)):
+        cargo_list.append({
+            "cargo_id": pc.cargo_id,
+            "cargo_name": pc.cargo_name,
+            "x": pc.x, "y": pc.y, "z": pc.z,
+            "length": pc.length, "width": pc.width, "height": pc.height,
+            "weight": pc.weight, "orientation": pc.orientation
+        })
+    content = {
+        "container_id": plan.container_id,
+        "total_cargos": plan.total_cargos,
+        "placed_count": plan.placed_count,
+        "cargos": cargo_list,
+    }
+    return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
+
+
+def bump_plan_version(db: Session, plan_id: int) -> models.PackingPlan:
+    plan = get_packing_plan(db, plan_id=plan_id)
+    if plan:
+        old_version = plan.version or 0
+        plan.version = old_version + 1
+        plan.content_hash = compute_plan_content_hash(db, plan_id)
+        invalidate_docs_for_outdated_plan(db, plan_id, plan.content_hash, current_version=plan.version)
+        db.commit()
+        db.refresh(plan)
+    return plan
+
+
+def update_packing_plan_meta(db: Session, plan_id: int, meta: dict):
+    plan = get_packing_plan(db, plan_id=plan_id)
+    if not plan:
+        return None
+    changed = False
+    for k in ["container_no", "seal_no", "declared_weight"]:
+        if k in meta and meta[k] is not None and getattr(plan, k) != meta[k]:
+            setattr(plan, k, meta[k])
+            changed = True
+    if changed:
+        bump_plan_version(db, plan_id)
+        db.refresh(plan)
+    return plan
+
+
+def get_hazard_matrix(db: Session, class_a: int, class_b: int):
+    if class_a == class_b:
+        return db.query(models.HazardSegregationMatrix).filter(
+            models.HazardSegregationMatrix.class_a == class_a,
+            models.HazardSegregationMatrix.class_b == class_b,
+            models.HazardSegregationMatrix.is_active == True
+        ).first()
+    return db.query(models.HazardSegregationMatrix).filter(
+        ((models.HazardSegregationMatrix.class_a == class_a) & (models.HazardSegregationMatrix.class_b == class_b)) |
+        ((models.HazardSegregationMatrix.class_a == class_b) & (models.HazardSegregationMatrix.class_b == class_a)),
+        models.HazardSegregationMatrix.is_active == True
+    ).first()
+
+
+def get_all_hazard_matrix(db: Session):
+    return db.query(models.HazardSegregationMatrix).filter(
+        models.HazardSegregationMatrix.is_active == True
+    ).order_by(models.HazardSegregationMatrix.class_a, models.HazardSegregationMatrix.class_b).all()
+
+
+def create_hazard_matrix(db: Session, matrix_data: dict):
+    db_matrix = models.HazardSegregationMatrix(**matrix_data)
+    db.add(db_matrix)
+    db.commit()
+    db.refresh(db_matrix)
+    return db_matrix
+
+
+def generate_audit_no() -> str:
+    return f"AUDIT-{uuid.uuid4().hex[:8].upper()}"
+
+
+def create_compliance_audit(db: Session, audit_data: dict) -> models.ComplianceAudit:
+    db_audit = models.ComplianceAudit(**audit_data)
+    db.add(db_audit)
+    db.commit()
+    db.refresh(db_audit)
+    return db_audit
+
+
+def get_compliance_audit(db: Session, audit_id: int = None, audit_no: str = None):
+    if audit_id:
+        return db.query(models.ComplianceAudit).filter(models.ComplianceAudit.id == audit_id).first()
+    if audit_no:
+        return db.query(models.ComplianceAudit).filter(models.ComplianceAudit.audit_no == audit_no).first()
+    return None
+
+
+def get_audits_by_plan(db: Session, plan_id: int):
+    return db.query(models.ComplianceAudit).filter(
+        models.ComplianceAudit.plan_id == plan_id
+    ).order_by(models.ComplianceAudit.audited_at.desc()).all()
+
+
+def get_latest_passed_audit(db: Session, plan_id: int):
+    return db.query(models.ComplianceAudit).filter(
+        models.ComplianceAudit.plan_id == plan_id,
+        models.ComplianceAudit.is_passed == True
+    ).order_by(models.ComplianceAudit.audited_at.desc()).first()
+
+
+def generate_document_no(doc_type: str) -> str:
+    prefix = "PL" if doc_type == "PACKING_LIST" else ("CLC" if doc_type == "CLC" else "DOC")
+    return f"{prefix}-{uuid.uuid4().hex[:8].upper()}"
+
+
+def create_customs_document(
+    db: Session,
+    doc_type: str,
+    plan_id: int,
+    plan_version: int,
+    plan_content_hash: str,
+    audit_id: int,
+    doc_header: dict,
+    doc_summary: dict,
+    document_content: dict,
+    document_items: list
+) -> models.CustomsDocument:
+    document_no = generate_document_no(doc_type)
+    db_doc = models.CustomsDocument(
+        document_no=document_no,
+        document_type=doc_type,
+        plan_id=plan_id,
+        plan_version=plan_version,
+        plan_content_hash=plan_content_hash,
+        audit_id=audit_id,
+        status="valid",
+        container_no=doc_header.get("container_no"),
+        seal_no=doc_header.get("seal_no"),
+        total_packages=doc_summary.get("total_packages", 0),
+        total_weight_kg=doc_summary.get("total_weight_kg", 0.0),
+        total_volume_cbm=doc_summary.get("total_volume_cbm", 0.0),
+        cog_offset_ratio=doc_summary.get("cog_offset_ratio"),
+        volume_utilization=doc_summary.get("volume_utilization"),
+        weight_utilization=doc_summary.get("weight_utilization"),
+        document_content=document_content,
+        issued_by=doc_header.get("issued_by"),
+        original_customs_declaration_no=doc_header.get("original_customs_declaration_no")
+    )
+    db.add(db_doc)
+    db.flush()
+
+    for item in document_items:
+        db_item = models.CustomsDocumentItem(
+            document_id=db_doc.id,
+            **item
+        )
+        db.add(db_item)
+
+    db.commit()
+    db.refresh(db_doc)
+    return db_doc
+
+
+def get_customs_document(db: Session, doc_id: int = None, document_no: str = None):
+    if doc_id:
+        return db.query(models.CustomsDocument).filter(models.CustomsDocument.id == doc_id).first()
+    if document_no:
+        return db.query(models.CustomsDocument).filter(models.CustomsDocument.document_no == document_no).first()
+    return None
+
+
+def get_documents_by_plan(db: Session, plan_id: int, doc_type: str = None):
+    q = db.query(models.CustomsDocument).filter(models.CustomsDocument.plan_id == plan_id)
+    if doc_type:
+        q = q.filter(models.CustomsDocument.document_type == doc_type)
+    return q.order_by(models.CustomsDocument.issued_at.desc()).all()
+
+
+def list_customs_documents(db: Session, skip: int = 0, limit: int = 100,
+                           doc_type: str = None, status: str = None):
+    q = db.query(models.CustomsDocument)
+    if doc_type:
+        q = q.filter(models.CustomsDocument.document_type == doc_type)
+    if status:
+        q = q.filter(models.CustomsDocument.status == status)
+    return q.order_by(models.CustomsDocument.issued_at.desc()).offset(skip).limit(limit).all()
+
+
+def get_document_items(db: Session, document_id: int):
+    return db.query(models.CustomsDocumentItem).filter(
+        models.CustomsDocumentItem.document_id == document_id
+    ).order_by(models.CustomsDocumentItem.item_no).all()
+
+
+def void_customs_document(db: Session, doc_id: int, reason: str):
+    from datetime import datetime
+    doc = get_customs_document(db, doc_id=doc_id)
+    if doc:
+        doc.status = "void"
+        doc.voided_at = datetime.utcnow()
+        doc.void_reason = reason
+        db.commit()
+        db.refresh(doc)
+    return doc
+
+
+def invalidate_docs_for_outdated_plan(db: Session, plan_id: int, current_hash: str, current_version: int = None):
+    plan = get_packing_plan(db, plan_id=plan_id)
+    if plan is None:
+        return
+    eff_version = current_version if current_version is not None else plan.version
+    docs = db.query(models.CustomsDocument).filter(
+        models.CustomsDocument.plan_id == plan_id,
+        models.CustomsDocument.status == "valid"
+    ).all()
+    for doc in docs:
+        hash_mismatch = bool(doc.plan_content_hash) and doc.plan_content_hash != current_hash
+        version_outdated = (eff_version is not None) and doc.plan_version < eff_version
+        if hash_mismatch or version_outdated:
+            doc.status = "outdated"
+            reasons = []
+            if hash_mismatch:
+                reasons.append(f"内容哈希不一致")
+            if version_outdated:
+                reasons.append(f"方案版本从v{doc.plan_version}升级到v{eff_version}")
+            doc.void_reason = f"原始装载方案已变更({'，'.join(reasons)})，单据自动失效"
+    db.commit()
+
+
+def reissue_customs_document(
+    db: Session,
+    old_doc_id: int,
+    reason: str,
+    audit_id: int,
+    doc_header: dict,
+    doc_summary: dict,
+    document_content: dict,
+    document_items: list,
+    new_plan_version: int,
+    new_plan_hash: str
+):
+    from datetime import datetime
+    old_doc = get_customs_document(db, doc_id=old_doc_id)
+    if not old_doc:
+        return None
+    new_doc = create_customs_document(
+        db=db,
+        doc_type=old_doc.document_type,
+        plan_id=old_doc.plan_id,
+        plan_version=new_plan_version,
+        plan_content_hash=new_plan_hash,
+        audit_id=audit_id,
+        doc_header=doc_header,
+        doc_summary=doc_summary,
+        document_content=document_content,
+        document_items=document_items
+    )
+    old_doc.status = "superseded"
+    old_doc.voided_at = datetime.utcnow()
+    old_doc.void_reason = f"作废重开: {reason}。新单据编号: {new_doc.document_no}"
+    old_doc.superseded_by = new_doc.id
+    db.commit()
+    db.refresh(old_doc)
+    db.refresh(new_doc)
+    return new_doc
+
+
+def create_default_hazard_matrix(db: Session):
+    existing = db.query(models.HazardSegregationMatrix).filter(
+        models.HazardSegregationMatrix.is_active == True
+    ).all()
+    if existing:
+        return
+    matrix_data = [
+        {"class_a": 1, "class_b": 1, "min_distance_mm": 0, "segregation_level": "group", "description": "同类爆炸品可混装"},
+        {"class_a": 1, "class_b": 2, "min_distance_mm": 3000, "segregation_level": "isolated", "description": "爆炸品与气体需隔离3米"},
+        {"class_a": 1, "class_b": 3, "min_distance_mm": 3000, "segregation_level": "isolated", "description": "爆炸品与易燃液体需隔离3米"},
+        {"class_a": 1, "class_b": 4, "min_distance_mm": 3000, "segregation_level": "isolated", "description": "爆炸品与易燃固体需隔离3米"},
+        {"class_a": 1, "class_b": 5, "min_distance_mm": 4000, "segregation_level": "away_from", "description": "爆炸品与氧化剂需远离4米"},
+        {"class_a": 1, "class_b": 6, "min_distance_mm": 3000, "segregation_level": "isolated", "description": "爆炸品与毒害品需隔离3米"},
+
+        {"class_a": 2, "class_b": 2, "min_distance_mm": 0, "segregation_level": "group", "description": "同类气体可混装"},
+        {"class_a": 2, "class_b": 3, "min_distance_mm": 1500, "segregation_level": "separated", "description": "气体与易燃液体分离1.5米"},
+        {"class_a": 2, "class_b": 4, "min_distance_mm": 2000, "segregation_level": "separated", "description": "气体与易燃固体分离2米"},
+        {"class_a": 2, "class_b": 5, "min_distance_mm": 3000, "segregation_level": "isolated", "description": "气体与氧化剂隔离3米"},
+        {"class_a": 2, "class_b": 6, "min_distance_mm": 1500, "segregation_level": "separated", "description": "气体与毒害品分离1.5米"},
+
+        {"class_a": 3, "class_b": 3, "min_distance_mm": 0, "segregation_level": "group", "description": "同类易燃液体可混装"},
+        {"class_a": 3, "class_b": 4, "min_distance_mm": 2000, "segregation_level": "separated", "description": "易燃液体与易燃固体分离2米"},
+        {"class_a": 3, "class_b": 5, "min_distance_mm": 3000, "segregation_level": "isolated", "description": "易燃液体与氧化剂隔离3米"},
+        {"class_a": 3, "class_b": 6, "min_distance_mm": 1000, "segregation_level": "separated", "description": "易燃液体与毒害品分离1米"},
+
+        {"class_a": 4, "class_b": 4, "min_distance_mm": 0, "segregation_level": "group", "description": "同类易燃固体可混装"},
+        {"class_a": 4, "class_b": 5, "min_distance_mm": 3000, "segregation_level": "isolated", "description": "易燃固体与氧化剂隔离3米"},
+        {"class_a": 4, "class_b": 6, "min_distance_mm": 1000, "segregation_level": "separated", "description": "易燃固体与毒害品分离1米"},
+
+        {"class_a": 5, "class_b": 5, "min_distance_mm": 500, "segregation_level": "separated", "description": "氧化剂之间保持0.5米分离"},
+        {"class_a": 5, "class_b": 6, "min_distance_mm": 2000, "segregation_level": "separated", "description": "氧化剂与毒害品分离2米"},
+
+        {"class_a": 6, "class_b": 6, "min_distance_mm": 0, "segregation_level": "group", "description": "同类毒害品可混装"},
+    ]
+    for data in matrix_data:
+        db.add(models.HazardSegregationMatrix(**data, is_active=True))
+    db.commit()
+
+
+def create_demo_hazard_cargos(db: Session):
+    existing = db.query(models.Cargo).filter(models.Cargo.hazard_class.isnot(None)).all()
+    if existing:
+        return
+    demo_cargos = [
+        models.Cargo(
+            name="烟花爆竹箱-Class1", length=600, width=400, height=400, weight=25,
+            can_rotate_horizontal=True, can_flip=False, max_top_load=50, quantity=20,
+            hazard_class=1, declared_name="Fireworks Class 1.4G", declared_weight=25.0
+        ),
+        models.Cargo(
+            name="丙烷气瓶-Class2", length=350, width=350, height=1000, weight=45,
+            can_rotate_horizontal=False, can_flip=False, max_top_load=0, quantity=12,
+            hazard_class=2, declared_name="LPG Cylinders UN1075", declared_weight=45.0
+        ),
+        models.Cargo(
+            name="油漆桶-Class3", length=300, width=300, height=350, weight=20,
+            can_rotate_horizontal=True, can_flip=False, max_top_load=40, quantity=30,
+            hazard_class=3, declared_name="Paints Class 3 UN1263", declared_weight=20.0
+        ),
+        models.Cargo(
+            name="火柴箱-Class4", length=500, width=350, height=250, weight=15,
+            can_rotate_horizontal=True, can_flip=True, max_top_load=30, quantity=25,
+            hazard_class=4, declared_name="Safety Matches Class 4.1 UN1944", declared_weight=15.0
+        ),
+        models.Cargo(
+            name="过氧化氢箱-Class5", length=450, width=350, height=300, weight=30,
+            can_rotate_horizontal=True, can_flip=False, max_top_load=25, quantity=10,
+            hazard_class=5, declared_name="Hydrogen Peroxide UN2984", declared_weight=30.0
+        ),
+        models.Cargo(
+            name="农药箱-Class6", length=400, width=300, height=350, weight=18,
+            can_rotate_horizontal=True, can_flip=False, max_top_load=35, quantity=15,
+            hazard_class=6, declared_name="Pesticides Class 6.1 UN2757", declared_weight=18.0
+        ),
+        models.Cargo(
+            name="普通家电箱", length=800, width=600, height=500, weight=35,
+            can_rotate_horizontal=True, can_flip=True, max_top_load=50, quantity=40,
+            hazard_class=None, declared_name="Home Appliances", declared_weight=35.0
+        ),
+        models.Cargo(
+            name="普通服装箱", length=600, width=400, height=300, weight=12,
+            can_rotate_horizontal=True, can_flip=True, max_top_load=80, quantity=50,
+            hazard_class=None, declared_name="Garments in Cartons", declared_weight=12.0
+        ),
+    ]
+    db.add_all(demo_cargos)
+    db.commit()
+
+
+def init_plan_hash_and_version(db: Session):
+    plans = db.query(models.PackingPlan).filter(
+        (models.PackingPlan.content_hash == None) | (models.PackingPlan.version == None)
+    ).all()
+    for plan in plans:
+        if plan.version is None:
+            plan.version = 1
+        if plan.content_hash is None:
+            plan.content_hash = compute_plan_content_hash(db, plan.id)
+    if plans:
+        db.commit()
+

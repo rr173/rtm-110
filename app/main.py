@@ -14,10 +14,17 @@ from app.packing.trailer_cog_engine import (
     TrailerSpec, BoxSpec, PlacedBox,
     optimize_box_positions, generate_unload_sequence
 )
+from app.compliance_engine import (
+    run_full_compliance_audit,
+    generate_customs_documents,
+    build_document_items,
+    generate_packing_list_content,
+    generate_clc_content,
+)
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="集装箱三维配载计算服务", version="1.2.0")
+app = FastAPI(title="集装箱三维配载计算服务", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,6 +41,9 @@ def startup_event():
     crud.create_default_containers(db)
     crud.create_default_trailers(db)
     crud.create_demo_trailer_scenarios(db)
+    crud.create_default_hazard_matrix(db)
+    crud.create_demo_hazard_cargos(db)
+    crud.init_plan_hash_and_version(db)
 
 
 @app.get("/")
@@ -819,3 +829,426 @@ def delete_trailer_plan(plan_identifier: str, db: Session = Depends(get_db)):
     if plan is None:
         raise HTTPException(status_code=404, detail="方案不存在")
     return {"message": "删除成功", "plan_no": plan.plan_no}
+
+
+def _resolve_packing_plan(plan_identifier: str, db: Session):
+    plan = None
+    if plan_identifier.isdigit():
+        plan = crud.get_packing_plan(db, plan_id=int(plan_identifier))
+    if plan is None:
+        plan = crud.get_packing_plan(db, plan_no=plan_identifier)
+    return plan
+
+
+@app.get("/hazard/matrix", response_model=List[schemas.HazardSegregationMatrix])
+def list_hazard_matrix(db: Session = Depends(get_db)):
+    items = crud.get_all_hazard_matrix(db)
+    result = []
+    for m in items:
+        result.append({
+            "id": m.id,
+            "class_a": m.class_a,
+            "class_b": m.class_b,
+            "min_distance_mm": m.min_distance_mm,
+            "segregation_level": m.segregation_level,
+            "description": m.description,
+            "is_active": m.is_active,
+            "created_at": m.created_at.isoformat() if m.created_at else "",
+        })
+    return result
+
+
+@app.post("/hazard/matrix", response_model=schemas.HazardSegregationMatrix)
+def add_hazard_matrix_entry(entry: schemas.HazardSegregationMatrixCreate, db: Session = Depends(get_db)):
+    existing = crud.get_hazard_matrix(db, entry.class_a, entry.class_b)
+    if existing:
+        raise HTTPException(status_code=400, detail=f"{entry.class_a}类与{entry.class_b}类的隔离规则已存在(id={existing.id})")
+    db_entry = crud.create_hazard_matrix(db, entry.model_dump())
+    return {
+        "id": db_entry.id,
+        "class_a": db_entry.class_a,
+        "class_b": db_entry.class_b,
+        "min_distance_mm": db_entry.min_distance_mm,
+        "segregation_level": db_entry.segregation_level,
+        "description": db_entry.description,
+        "is_active": db_entry.is_active,
+        "created_at": db_entry.created_at.isoformat() if db_entry.created_at else "",
+    }
+
+
+@app.put("/plans/{plan_identifier}/meta")
+def update_plan_metadata(
+    plan_identifier: str,
+    meta: schemas.PackingPlanMetaUpdate,
+    db: Session = Depends(get_db)
+):
+    plan = _resolve_packing_plan(plan_identifier, db)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+    updated = crud.update_packing_plan_meta(db, plan.id, meta.model_dump())
+    return {
+        "message": "更新成功",
+        "plan_id": updated.id,
+        "plan_no": updated.plan_no,
+        "new_version": updated.version,
+        "container_no": updated.container_no,
+        "seal_no": updated.seal_no,
+        "declared_weight": updated.declared_weight,
+        "content_hash": updated.content_hash,
+    }
+
+
+@app.post("/compliance/audit", response_model=schemas.ComplianceAuditDetail)
+def run_compliance_audit(request: schemas.ComplianceAuditRequest, db: Session = Depends(get_db)):
+    plan = _resolve_packing_plan(request.plan_identifier, db)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+    result = run_full_compliance_audit(db, plan.id)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    audit = crud.get_compliance_audit(db, audit_id=result["audit_id"])
+    return {
+        "id": audit.id,
+        "audit_no": audit.audit_no,
+        "plan_id": audit.plan_id,
+        "plan_no": plan.plan_no,
+        "container_name": plan.container_name,
+        "plan_version": audit.plan_version,
+        "plan_content_hash": audit.plan_content_hash,
+        "is_passed": audit.is_passed,
+        "hazard_check_passed": audit.hazard_check_passed,
+        "weight_check_passed": audit.weight_check_passed,
+        "name_check_passed": audit.name_check_passed,
+        "hazard_violations": audit.hazard_violations,
+        "weight_violations": audit.weight_violations,
+        "name_violations": audit.name_violations,
+        "audit_details": audit.audit_details,
+        "auditor": audit.auditor,
+        "remarks": audit.remarks,
+        "audited_at": audit.audited_at.isoformat() if audit.audited_at else "",
+    }
+
+
+@app.get("/compliance/audits")
+def list_audits(plan_identifier: Optional[str] = None, skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    if plan_identifier:
+        plan = _resolve_packing_plan(plan_identifier, db)
+        if plan is None:
+            raise HTTPException(status_code=404, detail="方案不存在")
+        audits = crud.get_audits_by_plan(db, plan.id)
+    else:
+        audits = []
+    result = []
+    for a in audits:
+        plan = crud.get_packing_plan(db, plan_id=a.plan_id)
+        result.append({
+            "id": a.id,
+            "audit_no": a.audit_no,
+            "plan_id": a.plan_id,
+            "plan_no": plan.plan_no if plan else "",
+            "plan_version": a.plan_version,
+            "is_passed": a.is_passed,
+            "hazard_violations_count": len(a.hazard_violations) if a.hazard_violations else 0,
+            "weight_violations_count": len(a.weight_violations) if a.weight_violations else 0,
+            "name_violations_count": len(a.name_violations) if a.name_violations else 0,
+            "remarks": a.remarks,
+            "audited_at": a.audited_at.isoformat() if a.audited_at else "",
+        })
+    return result
+
+
+@app.get("/compliance/audits/{audit_identifier}")
+def get_audit_detail(audit_identifier: str, db: Session = Depends(get_db)):
+    audit = None
+    if audit_identifier.isdigit():
+        audit = crud.get_compliance_audit(db, audit_id=int(audit_identifier))
+    if audit is None:
+        audit = crud.get_compliance_audit(db, audit_no=audit_identifier)
+    if audit is None:
+        raise HTTPException(status_code=404, detail="审计记录不存在")
+    plan = crud.get_packing_plan(db, plan_id=audit.plan_id)
+    return {
+        "id": audit.id,
+        "audit_no": audit.audit_no,
+        "plan_id": audit.plan_id,
+        "plan_no": plan.plan_no if plan else "",
+        "container_name": plan.container_name if plan else "",
+        "plan_version": audit.plan_version,
+        "plan_content_hash": audit.plan_content_hash,
+        "is_passed": audit.is_passed,
+        "hazard_check_passed": audit.hazard_check_passed,
+        "weight_check_passed": audit.weight_check_passed,
+        "name_check_passed": audit.name_check_passed,
+        "hazard_violations": audit.hazard_violations,
+        "weight_violations": audit.weight_violations,
+        "name_violations": audit.name_violations,
+        "audit_details": audit.audit_details,
+        "auditor": audit.auditor,
+        "remarks": audit.remarks,
+        "audited_at": audit.audited_at.isoformat() if audit.audited_at else "",
+    }
+
+
+@app.post("/customs/documents/generate")
+def generate_documents(request: schemas.CustomsDocumentGenerateRequest, db: Session = Depends(get_db)):
+    plan = _resolve_packing_plan(request.plan_identifier, db)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+    result = generate_customs_documents(
+        db=db,
+        plan_id=plan.id,
+        document_type=request.document_type,
+        issued_by=request.issued_by,
+    )
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result)
+    return result
+
+
+@app.get("/customs/documents")
+def list_documents(
+    document_no: Optional[str] = None,
+    document_type: Optional[str] = None,
+    plan_identifier: Optional[str] = None,
+    status: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    if document_no:
+        doc = crud.get_customs_document(db, document_no=document_no)
+        if not doc:
+            return []
+        plan = crud.get_packing_plan(db, plan_id=doc.plan_id)
+        return [{
+            "id": doc.id,
+            "document_no": doc.document_no,
+            "document_type": doc.document_type,
+            "plan_id": doc.plan_id,
+            "plan_no": plan.plan_no if plan else "",
+            "plan_version": doc.plan_version,
+            "container_no": doc.container_no,
+            "seal_no": doc.seal_no,
+            "status": doc.status,
+            "total_packages": doc.total_packages,
+            "total_weight_kg": doc.total_weight_kg,
+            "total_volume_cbm": doc.total_volume_cbm,
+            "issued_by": doc.issued_by,
+            "issued_at": doc.issued_at.isoformat() if doc.issued_at else "",
+            "void_reason": doc.void_reason,
+        }]
+
+    if plan_identifier:
+        plan = _resolve_packing_plan(plan_identifier, db)
+        if plan is None:
+            raise HTTPException(status_code=404, detail="方案不存在")
+        docs = crud.get_documents_by_plan(db, plan.id, document_type)
+    else:
+        docs = crud.list_customs_documents(db, skip, limit, document_type, status)
+
+    result = []
+    for doc in docs:
+        plan = crud.get_packing_plan(db, plan_id=doc.plan_id)
+        result.append({
+            "id": doc.id,
+            "document_no": doc.document_no,
+            "document_type": doc.document_type,
+            "plan_id": doc.plan_id,
+            "plan_no": plan.plan_no if plan else "",
+            "plan_version": doc.plan_version,
+            "container_no": doc.container_no,
+            "seal_no": doc.seal_no,
+            "status": doc.status,
+            "total_packages": doc.total_packages,
+            "total_weight_kg": doc.total_weight_kg,
+            "total_volume_cbm": doc.total_volume_cbm,
+            "issued_by": doc.issued_by,
+            "issued_at": doc.issued_at.isoformat() if doc.issued_at else "",
+            "void_reason": doc.void_reason,
+        })
+    return result
+
+
+@app.get("/customs/documents/{doc_identifier}", response_model=schemas.CustomsDocumentDetail)
+def get_document_detail(doc_identifier: str, db: Session = Depends(get_db)):
+    doc = None
+    if doc_identifier.isdigit():
+        doc = crud.get_customs_document(db, doc_id=int(doc_identifier))
+    if doc is None:
+        doc = crud.get_customs_document(db, document_no=doc_identifier)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="单据不存在")
+    plan = crud.get_packing_plan(db, plan_id=doc.plan_id)
+    items = crud.get_document_items(db, doc.id)
+    items_list = []
+    for it in items:
+        items_list.append({
+            "id": it.id,
+            "document_id": it.document_id,
+            "item_no": it.item_no,
+            "cargo_id": it.cargo_id,
+            "cargo_name": it.cargo_name,
+            "declared_name": it.declared_name,
+            "package_count": it.package_count,
+            "package_type": it.package_type,
+            "weight_kg": it.weight_kg,
+            "declared_weight_kg": it.declared_weight_kg,
+            "length_mm": it.length_mm,
+            "width_mm": it.width_mm,
+            "height_mm": it.height_mm,
+            "volume_cbm": it.volume_cbm,
+            "x_mm": it.x_mm,
+            "y_mm": it.y_mm,
+            "z_mm": it.z_mm,
+            "stack_layer": it.stack_layer,
+            "hazard_class": it.hazard_class,
+            "marks_and_numbers": it.marks_and_numbers,
+            "hs_code": it.hs_code,
+        })
+    return {
+        "id": doc.id,
+        "document_no": doc.document_no,
+        "document_type": doc.document_type,
+        "plan_id": doc.plan_id,
+        "plan_no": plan.plan_no if plan else "",
+        "container_name": plan.container_name if plan else "",
+        "plan_version": doc.plan_version,
+        "plan_content_hash": doc.plan_content_hash,
+        "audit_id": doc.audit_id,
+        "status": doc.status,
+        "superseded_by": doc.superseded_by,
+        "container_no": doc.container_no,
+        "seal_no": doc.seal_no,
+        "total_packages": doc.total_packages,
+        "total_weight_kg": doc.total_weight_kg,
+        "total_volume_cbm": doc.total_volume_cbm,
+        "cog_offset_ratio": doc.cog_offset_ratio,
+        "volume_utilization": doc.volume_utilization,
+        "weight_utilization": doc.weight_utilization,
+        "document_content": doc.document_content,
+        "issued_by": doc.issued_by,
+        "original_customs_declaration_no": doc.original_customs_declaration_no,
+        "issued_at": doc.issued_at.isoformat() if doc.issued_at else "",
+        "voided_at": doc.voided_at.isoformat() if doc.voided_at else "",
+        "void_reason": doc.void_reason,
+        "original_hauler_signature": doc.original_hauler_signature,
+        "document_items": items_list,
+    }
+
+
+@app.post("/customs/documents/{doc_identifier}/void")
+def void_document(doc_identifier: str, request: schemas.CustomsDocumentVoidRequest, db: Session = Depends(get_db)):
+    doc = None
+    if doc_identifier.isdigit():
+        doc = crud.get_customs_document(db, doc_id=int(doc_identifier))
+    if doc is None:
+        doc = crud.get_customs_document(db, document_no=doc_identifier)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="单据不存在")
+    if doc.status not in ("valid", "outdated"):
+        raise HTTPException(status_code=400, detail=f"当前单据状态({doc.status})不允许作废操作")
+    voided = crud.void_customs_document(db, doc.id, request.reason)
+    return {
+        "message": "单据已作废",
+        "document_id": voided.id,
+        "document_no": voided.document_no,
+        "status": voided.status,
+        "void_reason": voided.void_reason,
+        "voided_at": voided.voided_at.isoformat() if voided.voided_at else "",
+    }
+
+
+@app.post("/customs/documents/{doc_identifier}/reissue")
+def reissue_document(doc_identifier: str, request: schemas.CustomsDocumentReissueRequest, db: Session = Depends(get_db)):
+    doc = None
+    if doc_identifier.isdigit():
+        doc = crud.get_customs_document(db, doc_id=int(doc_identifier))
+    if doc is None:
+        doc = crud.get_customs_document(db, document_no=doc_identifier)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="单据不存在")
+    if doc.status == "superseded":
+        raise HTTPException(status_code=400, detail="该单据已被重开过，不允许再次重开")
+
+    plan = crud.get_packing_plan(db, plan_id=doc.plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="关联方案不存在")
+
+    current_hash = crud.compute_plan_content_hash(db, plan.id)
+    hash_changed = doc.plan_content_hash != current_hash
+    if hash_changed:
+        plan.version = (plan.version or 1) + 1
+        plan.content_hash = current_hash
+        db.commit()
+        db.refresh(plan)
+
+    latest_audit = crud.get_latest_passed_audit(db, plan.id)
+    need_new_audit = (
+        latest_audit is None
+        or latest_audit.plan_version != plan.version
+        or latest_audit.plan_content_hash != plan.content_hash
+    )
+    if need_new_audit:
+        audit_result = run_full_compliance_audit(db, plan.id, auditor=request.issued_by)
+        if not audit_result.get("is_passed", False):
+            raise HTTPException(status_code=400, detail={
+                "error": "合规校验未通过，无法重开发单",
+                "audit_result": audit_result
+            })
+        latest_audit = crud.get_compliance_audit(db, audit_id=audit_result["audit_id"])
+
+    container = crud.get_container(db, container_id=plan.container_id)
+    items, summary = build_document_items(db, plan.id)
+    container_no = plan.container_no
+    seal_no = plan.seal_no
+    doc_header = {
+        "container_no": container_no,
+        "seal_no": seal_no,
+        "issued_by": request.issued_by,
+    }
+
+    if doc.document_type == "PACKING_LIST":
+        content = generate_packing_list_content(plan, container, items, summary, container_no, seal_no, request.issued_by)
+    else:
+        content = generate_clc_content(plan, container, items, summary, container_no, seal_no, request.issued_by)
+
+    new_doc = crud.reissue_customs_document(
+        db=db,
+        old_doc_id=doc.id,
+        reason=request.reason,
+        audit_id=latest_audit.id,
+        doc_header=doc_header,
+        doc_summary=summary,
+        document_content=content,
+        document_items=items,
+        new_plan_version=plan.version,
+        new_plan_hash=plan.content_hash,
+    )
+    if new_doc is None:
+        raise HTTPException(status_code=500, detail="重开失败")
+    content["document_no_ref"] = new_doc.document_no
+    db.query(models.CustomsDocument).filter(models.CustomsDocument.id == new_doc.id).update(
+        {"document_content": content}
+    )
+    db.commit()
+    db.refresh(new_doc)
+
+    return {
+        "message": "单据重开成功",
+        "old_document": {
+            "document_no": doc.document_no,
+            "status": doc.status,
+            "void_reason": doc.void_reason,
+        },
+        "new_document": {
+            "document_id": new_doc.id,
+            "document_no": new_doc.document_no,
+            "document_type": new_doc.document_type,
+            "plan_version": new_doc.plan_version,
+            "status": new_doc.status,
+            "total_packages": new_doc.total_packages,
+            "total_weight_kg": new_doc.total_weight_kg,
+            "issued_at": new_doc.issued_at.isoformat() if new_doc.issued_at else "",
+        }
+    }
+

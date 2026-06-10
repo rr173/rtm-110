@@ -1,5 +1,6 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Any, Dict
+from datetime import datetime
 
 
 class ContainerBase(BaseModel):
@@ -32,6 +33,9 @@ class CargoBase(BaseModel):
     can_flip: bool = Field(default=True, description="是否允许翻转（立着放/倒着放）")
     max_top_load: float = Field(default=0.0, ge=0, description="顶面最大承压 kg")
     quantity: int = Field(default=1, ge=1, description="数量")
+    hazard_class: Optional[int] = Field(default=None, ge=1, le=6, description="危险品等级 1-6类，None为普通货物")
+    declared_name: Optional[str] = Field(default=None, description="海关申报品名")
+    declared_weight: Optional[float] = Field(default=None, ge=0, description="海关申报重量 kg")
 
 
 class CargoCreate(CargoBase):
@@ -48,6 +52,9 @@ class CargoUpdate(BaseModel):
     can_flip: Optional[bool] = None
     max_top_load: Optional[float] = None
     quantity: Optional[int] = None
+    hazard_class: Optional[int] = None
+    declared_name: Optional[str] = None
+    declared_weight: Optional[float] = None
 
 
 class Cargo(CargoBase):
@@ -382,3 +389,189 @@ class TrailerLoadOptimizationResult(BaseModel):
     unload_sequence: List[TrailerUnloadStep]
     all_steps_valid: bool
     invalid_steps_count: int
+
+
+class HazardSegregationMatrixBase(BaseModel):
+    class_a: int = Field(ge=1, le=6, description="危险品等级A")
+    class_b: int = Field(ge=1, le=6, description="危险品等级B")
+    min_distance_mm: float = Field(ge=0, description="最小隔离距离 mm")
+    segregation_level: str = Field(default="separated", description="隔离等级")
+    description: Optional[str] = None
+
+
+class HazardSegregationMatrixCreate(HazardSegregationMatrixBase):
+    pass
+
+
+class HazardSegregationMatrix(HazardSegregationMatrixBase):
+    id: int
+    is_active: bool
+    created_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class PackingPlanMetaUpdate(BaseModel):
+    container_no: Optional[str] = Field(default=None, description="实际集装箱箱号")
+    seal_no: Optional[str] = Field(default=None, description="铅封号")
+    declared_weight: Optional[float] = Field(default=None, ge=0, description="整箱申报重量 kg")
+
+
+class HazardViolation(BaseModel):
+    cargo_a_id: int
+    cargo_a_name: str
+    hazard_class_a: int
+    cargo_b_id: int
+    cargo_b_name: str
+    hazard_class_b: int
+    actual_distance_mm: float
+    required_distance_mm: float
+    position_a: dict
+    position_b: dict
+
+
+class WeightViolation(BaseModel):
+    cargo_id: Optional[int] = None
+    cargo_name: str
+    declared_weight_kg: Optional[float] = None
+    actual_weight_kg: float
+    deviation_ratio: float
+    is_total: bool = False
+
+
+class NameViolation(BaseModel):
+    cargo_id: int
+    cargo_name: str
+    declared_name: Optional[str] = None
+    issue: str
+
+
+class ComplianceAuditRequest(BaseModel):
+    plan_identifier: str = Field(description="方案ID或方案编号")
+
+
+class ComplianceAuditBase(BaseModel):
+    plan_id: int
+    plan_version: int
+    is_passed: bool = False
+    hazard_check_passed: bool = True
+    weight_check_passed: bool = True
+    name_check_passed: bool = True
+    hazard_violations: List[Any] = []
+    weight_violations: List[Any] = []
+    name_violations: List[Any] = []
+    audit_details: Dict[str, Any] = {}
+    auditor: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+class ComplianceAuditCreate(ComplianceAuditBase):
+    audit_no: str
+    plan_content_hash: Optional[str] = None
+
+
+class ComplianceAudit(ComplianceAuditBase):
+    id: int
+    audit_no: str
+    plan_content_hash: Optional[str] = None
+    audited_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ComplianceAuditDetail(ComplianceAudit):
+    plan_no: Optional[str] = None
+    container_name: Optional[str] = None
+
+
+class CustomsDocumentItemBase(BaseModel):
+    item_no: int
+    cargo_id: Optional[int] = None
+    cargo_name: str
+    declared_name: Optional[str] = None
+    package_count: int = 1
+    package_type: str = "CTN"
+    weight_kg: float = 0.0
+    declared_weight_kg: Optional[float] = None
+    length_mm: Optional[float] = None
+    width_mm: Optional[float] = None
+    height_mm: Optional[float] = None
+    volume_cbm: Optional[float] = None
+    x_mm: float
+    y_mm: float
+    z_mm: float
+    stack_layer: int = 1
+    hazard_class: Optional[int] = None
+    marks_and_numbers: Optional[str] = None
+    hs_code: Optional[str] = None
+
+
+class CustomsDocumentItem(CustomsDocumentItemBase):
+    id: int
+    document_id: int
+
+    class Config:
+        from_attributes = True
+
+
+class CustomsDocumentBase(BaseModel):
+    document_type: str = Field(description="PACKING_LIST 或 CLC")
+    container_no: Optional[str] = None
+    seal_no: Optional[str] = None
+    issued_by: Optional[str] = None
+    original_customs_declaration_no: Optional[str] = None
+
+
+class CustomsDocumentGenerateRequest(BaseModel):
+    plan_identifier: str = Field(description="方案ID或方案编号")
+    document_type: str = Field(default="BOTH", description="PACKING_LIST / CLC / BOTH")
+    issued_by: Optional[str] = None
+
+
+class CustomsDocumentQueryRequest(BaseModel):
+    document_no: Optional[str] = None
+    document_type: Optional[str] = None
+    plan_identifier: Optional[str] = None
+    status: Optional[str] = None
+
+
+class CustomsDocumentVoidRequest(BaseModel):
+    reason: str = Field(description="作废原因")
+
+
+class CustomsDocumentReissueRequest(BaseModel):
+    reason: str = Field(description="重开原因")
+    issued_by: Optional[str] = None
+
+
+class CustomsDocument(CustomsDocumentBase):
+    id: int
+    document_no: str
+    plan_id: int
+    plan_version: int
+    plan_content_hash: Optional[str] = None
+    audit_id: Optional[int] = None
+    status: str
+    superseded_by: Optional[int] = None
+    total_packages: int = 0
+    total_weight_kg: float = 0.0
+    total_volume_cbm: float = 0.0
+    cog_offset_ratio: Optional[float] = None
+    volume_utilization: Optional[float] = None
+    weight_utilization: Optional[float] = None
+    document_content: Dict[str, Any] = {}
+    issued_at: Optional[str] = None
+    voided_at: Optional[str] = None
+    void_reason: Optional[str] = None
+    original_hauler_signature: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class CustomsDocumentDetail(CustomsDocument):
+    plan_no: Optional[str] = None
+    container_name: Optional[str] = None
+    document_items: List[CustomsDocumentItem] = []
