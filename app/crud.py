@@ -642,10 +642,12 @@ def get_customs_document(db: Session, doc_id: int = None, document_no: str = Non
     return None
 
 
-def get_documents_by_plan(db: Session, plan_id: int, doc_type: str = None):
+def get_documents_by_plan(db: Session, plan_id: int, doc_type: str = None, status: str = None):
     q = db.query(models.CustomsDocument).filter(models.CustomsDocument.plan_id == plan_id)
     if doc_type:
         q = q.filter(models.CustomsDocument.document_type == doc_type)
+    if status:
+        q = q.filter(models.CustomsDocument.status == status)
     return q.order_by(models.CustomsDocument.issued_at.desc()).all()
 
 
@@ -785,42 +787,42 @@ def create_demo_hazard_cargos(db: Session):
         models.Cargo(
             name="烟花爆竹箱-Class1", length=600, width=400, height=400, weight=25,
             can_rotate_horizontal=True, can_flip=False, max_top_load=50, quantity=20,
-            hazard_class=1, declared_name="Fireworks Class 1.4G", declared_weight=25.0
+            hazard_class=1, declared_name="烟花爆竹箱-Class1", declared_weight=25.0
         ),
         models.Cargo(
             name="丙烷气瓶-Class2", length=350, width=350, height=1000, weight=45,
             can_rotate_horizontal=False, can_flip=False, max_top_load=0, quantity=12,
-            hazard_class=2, declared_name="LPG Cylinders UN1075", declared_weight=45.0
+            hazard_class=2, declared_name="丙烷气瓶-Class2", declared_weight=45.0
         ),
         models.Cargo(
             name="油漆桶-Class3", length=300, width=300, height=350, weight=20,
             can_rotate_horizontal=True, can_flip=False, max_top_load=40, quantity=30,
-            hazard_class=3, declared_name="Paints Class 3 UN1263", declared_weight=20.0
+            hazard_class=3, declared_name="油漆桶-Class3", declared_weight=20.0
         ),
         models.Cargo(
             name="火柴箱-Class4", length=500, width=350, height=250, weight=15,
             can_rotate_horizontal=True, can_flip=True, max_top_load=30, quantity=25,
-            hazard_class=4, declared_name="Safety Matches Class 4.1 UN1944", declared_weight=15.0
+            hazard_class=4, declared_name="火柴箱-Class4", declared_weight=15.0
         ),
         models.Cargo(
             name="过氧化氢箱-Class5", length=450, width=350, height=300, weight=30,
             can_rotate_horizontal=True, can_flip=False, max_top_load=25, quantity=10,
-            hazard_class=5, declared_name="Hydrogen Peroxide UN2984", declared_weight=30.0
+            hazard_class=5, declared_name="过氧化氢箱-Class5", declared_weight=30.0
         ),
         models.Cargo(
             name="农药箱-Class6", length=400, width=300, height=350, weight=18,
             can_rotate_horizontal=True, can_flip=False, max_top_load=35, quantity=15,
-            hazard_class=6, declared_name="Pesticides Class 6.1 UN2757", declared_weight=18.0
+            hazard_class=6, declared_name="农药箱-Class6", declared_weight=18.0
         ),
         models.Cargo(
             name="普通家电箱", length=800, width=600, height=500, weight=35,
             can_rotate_horizontal=True, can_flip=True, max_top_load=50, quantity=40,
-            hazard_class=None, declared_name="Home Appliances", declared_weight=35.0
+            hazard_class=None, declared_name="普通家电箱", declared_weight=35.0
         ),
         models.Cargo(
             name="普通服装箱", length=600, width=400, height=300, weight=12,
             can_rotate_horizontal=True, can_flip=True, max_top_load=80, quantity=50,
-            hazard_class=None, declared_name="Garments in Cartons", declared_weight=12.0
+            hazard_class=None, declared_name="普通服装箱", declared_weight=12.0
         ),
     ]
     db.add_all(demo_cargos)

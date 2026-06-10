@@ -1,6 +1,6 @@
 import urllib.request, json
 
-BASE = "http://localhost:8001"
+BASE = "http://localhost:8002"
 
 def req(method, path, data=None):
     url = BASE + path

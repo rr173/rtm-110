@@ -937,7 +937,9 @@ def list_audits(plan_identifier: Optional[str] = None, skip: int = 0, limit: int
             raise HTTPException(status_code=404, detail="方案不存在")
         audits = crud.get_audits_by_plan(db, plan.id)
     else:
-        audits = []
+        audits = db.query(models.ComplianceAudit).order_by(
+            models.ComplianceAudit.audited_at.desc()
+        ).offset(skip).limit(limit).all()
     result = []
     for a in audits:
         plan = crud.get_packing_plan(db, plan_id=a.plan_id)
@@ -1042,7 +1044,7 @@ def list_documents(
         plan = _resolve_packing_plan(plan_identifier, db)
         if plan is None:
             raise HTTPException(status_code=404, detail="方案不存在")
-        docs = crud.get_documents_by_plan(db, plan.id, document_type)
+        docs = crud.get_documents_by_plan(db, plan.id, document_type, status)
     else:
         docs = crud.list_customs_documents(db, skip, limit, document_type, status)
 

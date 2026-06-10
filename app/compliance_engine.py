@@ -140,7 +140,6 @@ def run_declared_name_match_check(db: Session, plan_id: int) -> Tuple[bool, List
         return False, [{"error": "方案不存在"}]
 
     violations = []
-    warnings = []
     packed_cargos = crud.get_packed_cargos(db, plan_id=plan_id)
 
     for pc in packed_cargos:
@@ -166,34 +165,24 @@ def run_declared_name_match_check(db: Session, plan_id: int) -> Tuple[bool, List
         normalized_actual = (cargo.name or "").strip().lower()
         normalized_declared = (cargo.declared_name or "").strip().lower()
         if not normalized_actual or not normalized_declared:
-            warnings.append({
+            violations.append({
                 "cargo_id": pc.cargo_id,
                 "cargo_name": pc.cargo_name,
                 "declared_name": cargo.declared_name,
                 "issue": "品名或申报品名为空字符串",
-                "severity": "warn"
+                "severity": "error"
             })
             continue
-        is_match = (
-            normalized_actual == normalized_declared
-            or normalized_declared in normalized_actual
-            or normalized_actual in normalized_declared
-            or (normalized_actual[:2] == normalized_declared[:2] and len(normalized_actual) > 2)
-        )
-        if not is_match:
-            warnings.append({
+        if normalized_actual != normalized_declared:
+            violations.append({
                 "cargo_id": pc.cargo_id,
                 "cargo_name": pc.cargo_name,
                 "declared_name": cargo.declared_name,
-                "issue": f"录入品名({cargo.name})与申报品名({cargo.declared_name})非同一语言/字面不一致，已人工留痕备查",
-                "severity": "warn"
+                "issue": f"录入品名({cargo.name})与申报品名({cargo.declared_name})不一致",
+                "severity": "error"
             })
-            continue
 
-    for w in warnings:
-        violations.append(w)
-    real_errors = [v for v in violations if v.get("severity") == "error"]
-    return len(real_errors) == 0, violations
+    return len(violations) == 0, violations
 
 
 def run_full_compliance_audit(db: Session, plan_id: int, auditor: str = None) -> Dict[str, Any]:

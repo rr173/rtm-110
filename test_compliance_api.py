@@ -1,6 +1,6 @@
 import urllib.request, json
 
-BASE = "http://localhost:8001"
+BASE = "http://localhost:8002"
 
 def req(method, path, data=None):
     url = BASE + path
@@ -11,8 +11,7 @@ def req(method, path, data=None):
         with urllib.request.urlopen(r) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        body = e.read()[:500]
-        print(f"HTTP {e.code} on {method} {path}: {body}")
+        print(f"HTTP {e.code} on {method} {path}: {e.read()[:500]}")
         raise
 
 plans = req("GET", "/plans?limit=5")
@@ -102,4 +101,4 @@ print(f"\n[单据总览] 共{len(all_docs)}份")
 for d in all_docs:
     print(f"  {d['document_no']:20s} {d['document_type']:15s} {d['status']:12s} plan={d['plan_no']}v{d['plan_version']}")
 
-print("\n✅ 测试完成")
+print("\n✅ 主流程测试完成")
