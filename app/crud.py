@@ -1,7 +1,10 @@
 from sqlalchemy.orm import Session
 from app import models, schemas
+from app.schemas import TemperatureClassEnum
 from datetime import datetime
 import uuid
+
+VALID_TEMPERATURE_CLASSES = {tc.value for tc in TemperatureClassEnum}
 
 
 def get_container(db: Session, container_id: int):
@@ -36,8 +39,25 @@ def get_cargos(db: Session, skip: int = 0, limit: int = 100):
     return db.query(models.Cargo).offset(skip).limit(limit).all()
 
 
+def _normalize_temperature_class(value):
+    if value is None:
+        return "AMBIENT"
+    if isinstance(value, TemperatureClassEnum):
+        return value.value
+    if isinstance(value, str):
+        if value not in VALID_TEMPERATURE_CLASSES:
+            raise ValueError(
+                f"无效的温控等级 '{value}'，仅允许: {', '.join(sorted(VALID_TEMPERATURE_CLASSES))}"
+            )
+        return value
+    raise ValueError(f"temperature_class 类型错误: {type(value)}")
+
+
 def create_cargo(db: Session, cargo: schemas.CargoCreate):
-    db_cargo = models.Cargo(**cargo.model_dump())
+    data = cargo.model_dump()
+    if "temperature_class" in data:
+        data["temperature_class"] = _normalize_temperature_class(data["temperature_class"])
+    db_cargo = models.Cargo(**data)
     db.add(db_cargo)
     db.commit()
     db.refresh(db_cargo)
@@ -50,6 +70,8 @@ def update_cargo(db: Session, cargo_id: int, cargo_update: schemas.CargoUpdate):
         return None
     update_data = cargo_update.model_dump(exclude_unset=True)
     for key, value in update_data.items():
+        if key == "temperature_class":
+            value = _normalize_temperature_class(value)
         setattr(db_cargo, key, value)
     db.commit()
     db.refresh(db_cargo)

@@ -1,6 +1,13 @@
 from pydantic import BaseModel, Field
 from typing import Optional, List, Any, Dict
 from datetime import datetime
+from enum import Enum
+
+
+class TemperatureClassEnum(str, Enum):
+    FROZEN = "FROZEN"
+    REFRIGERATED = "REFRIGERATED"
+    AMBIENT = "AMBIENT"
 
 
 class ContainerBase(BaseModel):
@@ -36,7 +43,10 @@ class CargoBase(BaseModel):
     hazard_class: Optional[int] = Field(default=None, ge=1, le=6, description="危险品等级 1-6类，None为普通货物")
     declared_name: Optional[str] = Field(default=None, description="海关申报品名")
     declared_weight: Optional[float] = Field(default=None, ge=0, description="海关申报重量 kg")
-    temperature_class: Optional[str] = Field(default="AMBIENT", description="温控等级: FROZEN冷冻(-18℃以下)/REFRIGERATED冷藏(0-5℃)/AMBIENT常温")
+    temperature_class: Optional[TemperatureClassEnum] = Field(
+        default=TemperatureClassEnum.AMBIENT,
+        description="温控等级: FROZEN冷冻(-18℃以下)/REFRIGERATED冷藏(0-5℃)/AMBIENT常温"
+    )
 
 
 class CargoCreate(CargoBase):
@@ -56,7 +66,7 @@ class CargoUpdate(BaseModel):
     hazard_class: Optional[int] = None
     declared_name: Optional[str] = None
     declared_weight: Optional[float] = None
-    temperature_class: Optional[str] = None
+    temperature_class: Optional[TemperatureClassEnum] = None
 
 
 class Cargo(CargoBase):
@@ -77,7 +87,7 @@ class PlacedCargo(BaseModel):
     height: float
     weight: float
     orientation: str
-    temperature_class: Optional[str] = "AMBIENT"
+    temperature_class: Optional[TemperatureClassEnum] = TemperatureClassEnum.AMBIENT
 
 
 class PackingResult(BaseModel):
@@ -106,7 +116,7 @@ class PackedCargoSchema(BaseModel):
     height: float
     weight: float
     orientation: str
-    temperature_class: Optional[str] = "AMBIENT"
+    temperature_class: Optional[TemperatureClassEnum] = TemperatureClassEnum.AMBIENT
 
     class Config:
         from_attributes = True

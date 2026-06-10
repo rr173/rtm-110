@@ -95,12 +95,18 @@ def get_cargo(cargo_id: int, db: Session = Depends(get_db)):
 
 @app.post("/cargos", response_model=schemas.Cargo)
 def create_cargo(cargo: schemas.CargoCreate, db: Session = Depends(get_db)):
-    return crud.create_cargo(db=db, cargo=cargo)
+    try:
+        return crud.create_cargo(db=db, cargo=cargo)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.put("/cargos/{cargo_id}", response_model=schemas.Cargo)
 def update_cargo(cargo_id: int, cargo_update: schemas.CargoUpdate, db: Session = Depends(get_db)):
-    cargo = crud.update_cargo(db, cargo_id=cargo_id, cargo_update=cargo_update)
+    try:
+        cargo = crud.update_cargo(db, cargo_id=cargo_id, cargo_update=cargo_update)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     if cargo is None:
         raise HTTPException(status_code=404, detail="货物不存在")
     return cargo
@@ -131,7 +137,8 @@ def compare_packing(request: schemas.PackingCompareRequest, save: bool = True, d
         if cargo is None:
             raise HTTPException(status_code=404, detail=f"货物 ID {cargo_id} 不存在")
         total_cargos += cargo.quantity
-        temp_class = getattr(cargo, 'temperature_class', 'AMBIENT') or 'AMBIENT'
+        raw_temp = getattr(cargo, 'temperature_class', 'AMBIENT') or 'AMBIENT'
+        temp_class = raw_temp.value if hasattr(raw_temp, 'value') else raw_temp
         for i in range(cargo.quantity):
             boxes.append(Box(
                 cargo_id=cargo.id,
@@ -290,7 +297,8 @@ def calculate_packing(container_id: int, cargo_ids: List[int], save: bool = Fals
         if cargo is None:
             raise HTTPException(status_code=404, detail=f"货物 ID {cargo_id} 不存在")
         total_cargos += cargo.quantity
-        temp_class = getattr(cargo, 'temperature_class', 'AMBIENT') or 'AMBIENT'
+        raw_temp = getattr(cargo, 'temperature_class', 'AMBIENT') or 'AMBIENT'
+        temp_class = raw_temp.value if hasattr(raw_temp, 'value') else raw_temp
         for i in range(cargo.quantity):
             boxes.append(Box(
                 cargo_id=cargo.id,

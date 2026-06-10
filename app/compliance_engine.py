@@ -309,6 +309,8 @@ def run_full_compliance_audit(db: Session, plan_id: int, auditor: str = None) ->
     }
 
 
+VALID_TEMPERATURE_CLASSES = {"FROZEN", "REFRIGERATED", "AMBIENT"}
+
 TEMPERATURE_PRIORITY = {
     "FROZEN": 3,
     "REFRIGERATED": 2,
@@ -322,8 +324,12 @@ TEMPERATURE_LABELS = {
 }
 
 
+def _is_valid_temperature_class(tc: str) -> bool:
+    return tc in VALID_TEMPERATURE_CLASSES
+
+
 def _get_temperature_priority(tc: str) -> int:
-    return TEMPERATURE_PRIORITY.get(tc, 1)
+    return TEMPERATURE_PRIORITY.get(tc, 0)
 
 
 def _boxes_are_adjacent(box_a, box_b) -> bool:
@@ -350,13 +356,17 @@ def _boxes_are_adjacent(box_a, box_b) -> bool:
     return False
 
 
-def _get_cargo_temperature_class(db: Session, cargo_id: int, packed_cargo) -> str:
+def _get_cargo_temperature_class(db: Session, cargo_id: int, packed_cargo):
+    tc = None
     if hasattr(packed_cargo, 'temperature_class') and packed_cargo.temperature_class:
-        return packed_cargo.temperature_class
-    cargo = crud.get_cargo(db, cargo_id=cargo_id)
-    if cargo and hasattr(cargo, 'temperature_class') and cargo.temperature_class:
-        return cargo.temperature_class
-    return "AMBIENT"
+        tc = packed_cargo.temperature_class
+    else:
+        cargo = crud.get_cargo(db, cargo_id=cargo_id)
+        if cargo and hasattr(cargo, 'temperature_class') and cargo.temperature_class:
+            tc = cargo.temperature_class
+    if tc and _is_valid_temperature_class(tc):
+        return tc
+    return None
 
 
 def run_temperature_zone_check(
@@ -377,6 +387,27 @@ def run_temperature_zone_check(
     temp_info = []
     for pc in packed_cargos:
         tc = _get_cargo_temperature_class(db, pc.cargo_id, pc)
+        if tc is None:
+            raw_tc = None
+            if hasattr(pc, 'temperature_class') and pc.temperature_class:
+                raw_tc = pc.temperature_class
+            else:
+                cargo = crud.get_cargo(db, cargo_id=pc.cargo_id)
+                if cargo and hasattr(cargo, 'temperature_class'):
+                    raw_tc = cargo.temperature_class
+            violations.append({
+                "violation_type": "invalid_temperature_class",
+                "cargo_id": pc.cargo_id,
+                "cargo_name": pc.cargo_name,
+                "raw_temperature_class": raw_tc,
+                "valid_values": sorted(list(VALID_TEMPERATURE_CLASSES)),
+                "position": {"x": pc.x, "y": pc.y, "z": pc.z},
+                "description": (
+                    f"货物({pc.cargo_name})的温控等级"
+                    f"('{raw_tc}' 无效，仅允许: {', '.join(sorted(VALID_TEMPERATURE_CLASSES))}"
+                ),
+            })
+            tc = "AMBIENT"
         volume = (pc.length * pc.width * pc.height) / 1e9
         temp_info.append({
             "packed": pc,
@@ -425,13 +456,27 @@ def run_temperature_zone_check(
         prio_a = info_a["priority"]
         prio_b = info_b["priority"]
 
-        if prio_a == prio_b:
+        if prio_a == prio_b or prio_a == 0 or prio_b == 0:
             continue
 
         prio_diff = abs(prio_a - prio_b)
-        if prio_diff >= 2:
+        if prio_diff >= 1:
             pc_a = info_a["packed"]
             pc_b = info_b["packed"]
+            between_class = None
+            if prio_diff >= 2:
+                all_prios = sorted({prio_a, prio_b})
+                for p in range(all_prios[0] + 1, all_prios[1]):
+                    for cls_name, cls_prio in TEMPERATURE_PRIORITY.items():
+                        if cls_prio == p:
+                            between_class = TEMPERATURE_LABELS.get(cls_name, cls_name)
+                            break
+                    if between_class:
+                        break
+            if between_class:
+                buffer_desc = f"{between_class}缓冲层"
+            else:
+                buffer_desc = "同等级缓冲层"
             violations.append({
                 "violation_type": "direct_adjacency",
                 "cargo_a_id": pc_a.cargo_id,
@@ -447,8 +492,7 @@ def run_temperature_zone_check(
                 "description": (
                     f"{TEMPERATURE_LABELS.get(tc_a, tc_a)}货物({pc_a.cargo_name})与"
                     f"{TEMPERATURE_LABELS.get(tc_b, tc_b)}货物({pc_b.cargo_name})直接相邻，"
-                    f"中间缺少{'' if prio_a > prio_b else TEMPERATURE_LABELS.get('REFRIGERATED', '冷藏')}"
-                    f"缓冲层或隔热隔板"
+                    f"不同温控等级货物之间必须有{buffer_desc}或隔热隔板"
                 ),
             })
 
