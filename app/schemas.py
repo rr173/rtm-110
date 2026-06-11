@@ -609,3 +609,63 @@ class CustomsDocumentDetail(CustomsDocument):
     plan_no: Optional[str] = None
     container_name: Optional[str] = None
     document_items: List[CustomsDocumentItem] = []
+
+
+class StowageReportCargoItem(BaseModel):
+    packed_cargo_id: int
+    cargo_id: int
+    cargo_name: str
+    x: float
+    y: float
+    z: float
+    length: float
+    width: float
+    height: float
+    weight: float
+    orientation: str
+    original_orientation: str
+    is_flipped: bool
+    max_top_load: float
+    top_load_weight: float
+    pressure_utilization: float
+    pressure_status: str
+
+
+class StowageReportLayer(BaseModel):
+    layer_index: int
+    z_start: float
+    z_end: float
+    cargos: List[StowageReportCargoItem]
+
+
+class StowageReportBase(BaseModel):
+    plan_id: int
+    plan_no: str
+    plan_version: int
+    total_cargos: int
+    flipped_count: int
+    warning_count: int
+    danger_count: int
+    health_score: float
+
+
+class StowageReportCreate(StowageReportBase):
+    report_no: str
+    report_data: dict
+    summary: dict
+
+
+class StowageReport(StowageReportBase):
+    id: int
+    report_no: str
+    summary: dict
+    created_at: str
+
+    class Config:
+        from_attributes = True
+
+
+class StowageReportDetail(StowageReport):
+    layers: List[StowageReportLayer]
+    overall_health: dict
+    statistics: dict

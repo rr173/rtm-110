@@ -279,3 +279,23 @@ class CustomsDocumentItem(Base):
     hs_code = Column(String, nullable=True, comment="HS编码")
 
     document = relationship("CustomsDocument", back_populates="document_items")
+
+
+class StowageReport(Base):
+    __tablename__ = "stowage_reports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    report_no = Column(String, unique=True, index=True, comment="报告编号")
+    plan_id = Column(Integer, ForeignKey("packing_plans.id"))
+    plan_no = Column(String, index=True, comment="关联方案编号")
+    plan_version = Column(Integer, comment="关联方案版本")
+    total_cargos = Column(Integer, comment="货物总数")
+    flipped_count = Column(Integer, default=0, comment="被翻转的货物数量")
+    warning_count = Column(Integer, default=0, comment="承压预警货物数量")
+    danger_count = Column(Integer, default=0, comment="承压危险货物数量")
+    health_score = Column(Float, default=0.0, comment="堆码健康度评分(0-100)")
+    report_data = Column(JSON, default=dict, comment="完整报告数据(JSON)")
+    summary = Column(JSON, default=dict, comment="摘要数据")
+    created_at = Column(DateTime, server_default=func.now())
+
+    plan = relationship("PackingPlan")

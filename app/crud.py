@@ -948,3 +948,39 @@ def create_demo_temperature_cargos(db: Session):
     db.add_all(demo_cargos)
     db.commit()
 
+
+def generate_stowage_report_no() -> str:
+    return f"STOW-{uuid.uuid4().hex[:8].upper()}"
+
+
+def create_stowage_report(db: Session, report_data: dict) -> models.StowageReport:
+    db_report = models.StowageReport(**report_data)
+    db.add(db_report)
+    db.commit()
+    db.refresh(db_report)
+    return db_report
+
+
+def get_stowage_report(db: Session, report_id: int = None, report_no: str = None):
+    if report_id:
+        return db.query(models.StowageReport).filter(models.StowageReport.id == report_id).first()
+    if report_no:
+        return db.query(models.StowageReport).filter(models.StowageReport.report_no == report_no).first()
+    return None
+
+
+def get_stowage_reports_by_plan(db: Session, plan_id: int):
+    return db.query(models.StowageReport).filter(
+        models.StowageReport.plan_id == plan_id
+    ).order_by(models.StowageReport.created_at.desc()).all()
+
+
+def list_stowage_reports(db: Session, skip: int = 0, limit: int = 100, plan_identifier: str = None):
+    q = db.query(models.StowageReport)
+    if plan_identifier:
+        if plan_identifier.isdigit():
+            q = q.filter(models.StowageReport.plan_id == int(plan_identifier))
+        else:
+            q = q.filter(models.StowageReport.plan_no == plan_identifier)
+    return q.order_by(models.StowageReport.created_at.desc()).offset(skip).limit(limit).all()
+

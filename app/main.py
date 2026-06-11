@@ -10,6 +10,7 @@ from app.packing.algorithm import pack_boxes, Box, rank_plans
 from app.packing.visualizer import render_three_views, CARGO_COLORS
 from app.packing.sequence_engine import generate_packing_sequence, get_step_snapshot
 from app.packing.split_engine import split_cargos_into_boxes, ContainerSpec
+from app.packing.stowage_report_engine import generate_stowage_report
 from app.packing.trailer_cog_engine import (
     TrailerSpec, BoxSpec, PlacedBox,
     optimize_box_positions, generate_unload_sequence
@@ -1276,5 +1277,158 @@ def reissue_document(doc_identifier: str, request: schemas.CustomsDocumentReissu
             "total_weight_kg": new_doc.total_weight_kg,
             "issued_at": new_doc.issued_at.isoformat() if new_doc.issued_at else "",
         }
+    }
+
+
+@app.post("/stowage/report/generate", response_model=schemas.StowageReportDetail)
+def generate_stowage_report_api(
+    plan_identifier: str,
+    db: Session = Depends(get_db)
+):
+    plan = None
+    if plan_identifier.isdigit():
+        plan = crud.get_packing_plan(db, plan_id=int(plan_identifier))
+    if plan is None:
+        plan = crud.get_packing_plan(db, plan_no=plan_identifier)
+
+    if plan is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+
+    packed_cargos_db = crud.get_packed_cargos(db, plan_id=plan.id)
+    if not packed_cargos_db:
+        raise HTTPException(status_code=400, detail="方案中没有已摆放的货物")
+
+    packed_cargos_list = []
+    cargo_ids = set()
+    for pc in packed_cargos_db:
+        packed_cargos_list.append({
+            "id": pc.id,
+            "cargo_id": pc.cargo_id,
+            "cargo_name": pc.cargo_name,
+            "x": pc.x,
+            "y": pc.y,
+            "z": pc.z,
+            "length": pc.length,
+            "width": pc.width,
+            "height": pc.height,
+            "weight": pc.weight,
+            "orientation": pc.orientation
+        })
+        cargo_ids.add(pc.cargo_id)
+
+    cargo_info_map = {}
+    for cid in cargo_ids:
+        cargo = crud.get_cargo(db, cargo_id=cid)
+        if cargo:
+            cargo_info_map[cid] = {
+                "max_top_load": cargo.max_top_load,
+                "length": cargo.length,
+                "width": cargo.width,
+                "height": cargo.height
+            }
+
+    report_result = generate_stowage_report(
+        plan_id=plan.id,
+        plan_no=plan.plan_no,
+        plan_version=plan.version or 1,
+        packed_cargos=packed_cargos_list,
+        cargo_info_map=cargo_info_map
+    )
+
+    summary = report_result["summary"]
+    report_no = crud.generate_stowage_report_no()
+
+    db_report = crud.create_stowage_report(db, {
+        "report_no": report_no,
+        "plan_id": plan.id,
+        "plan_no": plan.plan_no,
+        "plan_version": plan.version or 1,
+        "total_cargos": summary["total_cargos"],
+        "flipped_count": summary["flipped_count"],
+        "warning_count": summary["warning_count"],
+        "danger_count": summary["danger_count"],
+        "health_score": summary["health_score"],
+        "report_data": report_result,
+        "summary": summary
+    })
+
+    return {
+        "id": db_report.id,
+        "report_no": db_report.report_no,
+        "plan_id": db_report.plan_id,
+        "plan_no": db_report.plan_no,
+        "plan_version": db_report.plan_version,
+        "total_cargos": db_report.total_cargos,
+        "flipped_count": db_report.flipped_count,
+        "warning_count": db_report.warning_count,
+        "danger_count": db_report.danger_count,
+        "health_score": db_report.health_score,
+        "summary": summary,
+        "created_at": db_report.created_at.isoformat() if db_report.created_at else "",
+        "layers": report_result["layers"],
+        "overall_health": report_result["overall_health"],
+        "statistics": report_result["statistics"]
+    }
+
+
+@app.get("/stowage/reports")
+def list_stowage_reports(
+    plan_identifier: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    reports = crud.list_stowage_reports(db, skip=skip, limit=limit, plan_identifier=plan_identifier)
+    result = []
+    for r in reports:
+        result.append({
+            "id": r.id,
+            "report_no": r.report_no,
+            "plan_id": r.plan_id,
+            "plan_no": r.plan_no,
+            "plan_version": r.plan_version,
+            "total_cargos": r.total_cargos,
+            "flipped_count": r.flipped_count,
+            "warning_count": r.warning_count,
+            "danger_count": r.danger_count,
+            "health_score": r.health_score,
+            "summary": r.summary,
+            "created_at": r.created_at.isoformat() if r.created_at else ""
+        })
+    return result
+
+
+@app.get("/stowage/reports/{report_identifier}", response_model=schemas.StowageReportDetail)
+def get_stowage_report_detail(
+    report_identifier: str,
+    db: Session = Depends(get_db)
+):
+    report = None
+    if report_identifier.isdigit():
+        report = crud.get_stowage_report(db, report_id=int(report_identifier))
+    if report is None:
+        report = crud.get_stowage_report(db, report_no=report_identifier)
+
+    if report is None:
+        raise HTTPException(status_code=404, detail="堆码报告不存在")
+
+    report_data = report.report_data or {}
+
+    return {
+        "id": report.id,
+        "report_no": report.report_no,
+        "plan_id": report.plan_id,
+        "plan_no": report.plan_no,
+        "plan_version": report.plan_version,
+        "total_cargos": report.total_cargos,
+        "flipped_count": report.flipped_count,
+        "warning_count": report.warning_count,
+        "danger_count": report.danger_count,
+        "health_score": report.health_score,
+        "summary": report.summary or {},
+        "created_at": report.created_at.isoformat() if report.created_at else "",
+        "layers": report_data.get("layers", []),
+        "overall_health": report_data.get("overall_health", {}),
+        "statistics": report_data.get("statistics", {})
     }
 
