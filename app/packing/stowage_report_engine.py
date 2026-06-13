@@ -131,16 +131,21 @@ def generate_stowage_report(
     cargos = []
     for pc in packed_cargos:
         cargo_id = pc["cargo_id"]
+        has_snapshot = (
+            pc.get("original_length") is not None
+            and pc.get("original_width") is not None
+            and pc.get("original_height") is not None
+        )
 
         max_top_load = pc.get("max_top_load")
-        if max_top_load is None or max_top_load <= 0:
+        if not has_snapshot:
             fallback = cargo_info_map.get(cargo_id, {})
             max_top_load = fallback.get("max_top_load", 0.0)
 
         original_length = pc.get("original_length")
         original_width = pc.get("original_width")
         original_height = pc.get("original_height")
-        if original_length is None or original_width is None or original_height is None:
+        if not has_snapshot:
             fallback = cargo_info_map.get(cargo_id, {})
             original_length = fallback.get("length", pc["length"])
             original_width = fallback.get("width", pc["width"])

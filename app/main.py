@@ -1301,12 +1301,12 @@ def generate_stowage_report_api(
     packed_cargos_list = []
     cargo_ids_needing_fallback = set()
     for pc in packed_cargos_db:
-        has_max_top_load = pc.max_top_load is not None and pc.max_top_load > 0
         has_original_dims = (
             pc.original_length is not None
             and pc.original_width is not None
             and pc.original_height is not None
         )
+        has_snapshot = has_original_dims
 
         packed_cargos_list.append({
             "id": pc.id,
@@ -1320,13 +1320,13 @@ def generate_stowage_report_api(
             "height": pc.height,
             "weight": pc.weight,
             "orientation": pc.orientation,
-            "max_top_load": pc.max_top_load if has_max_top_load else None,
+            "max_top_load": pc.max_top_load if has_snapshot else None,
             "original_length": pc.original_length if has_original_dims else None,
             "original_width": pc.original_width if has_original_dims else None,
             "original_height": pc.original_height if has_original_dims else None,
         })
 
-        if not has_max_top_load or not has_original_dims:
+        if not has_snapshot:
             cargo_ids_needing_fallback.add(pc.cargo_id)
 
     cargo_info_map = {}
@@ -1453,4 +1453,3 @@ def get_stowage_report_detail(
         "overall_health": report_data.get("overall_health", {}),
         "statistics": report_data.get("statistics", {})
     }
-
