@@ -29,6 +29,9 @@ class PlacedBox:
     weight: float
     max_top_load: float
     orientation: str
+    original_length: float = 0.0
+    original_width: float = 0.0
+    original_height: float = 0.0
     temperature_class: str = "AMBIENT"
 
 
@@ -385,6 +388,9 @@ def pack_boxes(container_length: float, container_width: float, container_height
                 weight=box.weight,
                 max_top_load=box.max_top_load,
                 orientation=orientation,
+                original_length=box.length,
+                original_width=box.width,
+                original_height=box.height,
                 temperature_class=box.temperature_class
             )
 
@@ -434,6 +440,10 @@ def pack_boxes(container_length: float, container_width: float, container_height
             "height": pb.height,
             "weight": pb.weight,
             "orientation": pb.orientation,
+            "max_top_load": pb.max_top_load,
+            "original_length": pb.original_length,
+            "original_width": pb.original_width,
+            "original_height": pb.original_height,
             "temperature_class": pb.temperature_class
         })
 

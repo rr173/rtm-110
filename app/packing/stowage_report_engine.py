@@ -17,11 +17,18 @@ class CargoInfo:
     weight: float
     orientation: str
     max_top_load: float
+    original_length: float = 0.0
+    original_width: float = 0.0
+    original_height: float = 0.0
     cumulative_load: float = 0.0
 
 
-def _is_flipped_orientation(orientation: str) -> bool:
-    return orientation.startswith("flipped")
+def _is_flipped(cargo: CargoInfo) -> bool:
+    if cargo.original_height > 0 and abs(cargo.height - cargo.original_height) > 0.1:
+        return True
+    if cargo.orientation and cargo.orientation.startswith("flipped"):
+        return True
+    return False
 
 
 def _get_pressure_status(utilization: float) -> str:
@@ -116,13 +123,28 @@ def generate_stowage_report(
     plan_no: str,
     plan_version: int,
     packed_cargos: List[Dict[str, Any]],
-    cargo_info_map: Dict[int, Dict[str, Any]]
+    cargo_info_map: Dict[int, Dict[str, Any]] = None
 ) -> Dict[str, Any]:
+    if cargo_info_map is None:
+        cargo_info_map = {}
+
     cargos = []
     for pc in packed_cargos:
         cargo_id = pc["cargo_id"]
-        original_cargo = cargo_info_map.get(cargo_id, {})
-        max_top_load = original_cargo.get("max_top_load", 0.0)
+
+        max_top_load = pc.get("max_top_load")
+        if max_top_load is None or max_top_load <= 0:
+            fallback = cargo_info_map.get(cargo_id, {})
+            max_top_load = fallback.get("max_top_load", 0.0)
+
+        original_length = pc.get("original_length")
+        original_width = pc.get("original_width")
+        original_height = pc.get("original_height")
+        if original_length is None or original_width is None or original_height is None:
+            fallback = cargo_info_map.get(cargo_id, {})
+            original_length = fallback.get("length", pc["length"])
+            original_width = fallback.get("width", pc["width"])
+            original_height = fallback.get("height", pc["height"])
 
         cargos.append(CargoInfo(
             packed_cargo_id=pc["id"],
@@ -137,6 +159,9 @@ def generate_stowage_report(
             weight=pc["weight"],
             orientation=pc["orientation"],
             max_top_load=max_top_load,
+            original_length=original_length,
+            original_width=original_width,
+            original_height=original_height,
             cumulative_load=0.0
         ))
 
@@ -159,7 +184,7 @@ def generate_stowage_report(
         layer_items = []
         for c in layer_cargos:
             top_load = c.cumulative_load
-            is_flipped = _is_flipped_orientation(c.orientation)
+            is_flipped = _is_flipped(c)
 
             if c.max_top_load > 0.001:
                 utilization = top_load / c.max_top_load
@@ -191,6 +216,9 @@ def generate_stowage_report(
                 "weight": c.weight,
                 "orientation": c.orientation,
                 "original_orientation": "original",
+                "original_length": c.original_length,
+                "original_width": c.original_width,
+                "original_height": c.original_height,
                 "is_flipped": is_flipped,
                 "max_top_load": c.max_top_load,
                 "top_load_weight": round(top_load, 2),

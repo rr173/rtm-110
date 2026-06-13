@@ -154,6 +154,10 @@ def create_packing_plan(db: Session, plan_data: dict, placed_cargos: list, unpla
             height=pc["height"],
             weight=pc["weight"],
             orientation=pc["orientation"],
+            max_top_load=pc.get("max_top_load", 0.0),
+            original_length=pc.get("original_length"),
+            original_width=pc.get("original_width"),
+            original_height=pc.get("original_height"),
             temperature_class=pc.get("temperature_class", "AMBIENT")
         )
         db.add(db_packed)

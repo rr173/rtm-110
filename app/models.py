@@ -84,6 +84,10 @@ class PackedCargo(Base):
     height = Column(Float)
     weight = Column(Float)
     orientation = Column(String)
+    max_top_load = Column(Float, default=0.0, comment="顶面最大承压 kg（方案生成时快照")
+    original_length = Column(Float, nullable=True, comment="原始长度 mm")
+    original_width = Column(Float, nullable=True, comment="原始宽度 mm")
+    original_height = Column(Float, nullable=True, comment="原始高度 mm")
     temperature_class = Column(String, nullable=True, default="AMBIENT", comment="温控等级: FROZEN/REFRIGERATED/AMBIENT")
 
     plan = relationship("PackingPlan", back_populates="placed_cargos")

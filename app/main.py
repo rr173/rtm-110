@@ -1299,8 +1299,15 @@ def generate_stowage_report_api(
         raise HTTPException(status_code=400, detail="方案中没有已摆放的货物")
 
     packed_cargos_list = []
-    cargo_ids = set()
+    cargo_ids_needing_fallback = set()
     for pc in packed_cargos_db:
+        has_max_top_load = pc.max_top_load is not None and pc.max_top_load > 0
+        has_original_dims = (
+            pc.original_length is not None
+            and pc.original_width is not None
+            and pc.original_height is not None
+        )
+
         packed_cargos_list.append({
             "id": pc.id,
             "cargo_id": pc.cargo_id,
@@ -1312,12 +1319,18 @@ def generate_stowage_report_api(
             "width": pc.width,
             "height": pc.height,
             "weight": pc.weight,
-            "orientation": pc.orientation
+            "orientation": pc.orientation,
+            "max_top_load": pc.max_top_load if has_max_top_load else None,
+            "original_length": pc.original_length if has_original_dims else None,
+            "original_width": pc.original_width if has_original_dims else None,
+            "original_height": pc.original_height if has_original_dims else None,
         })
-        cargo_ids.add(pc.cargo_id)
+
+        if not has_max_top_load or not has_original_dims:
+            cargo_ids_needing_fallback.add(pc.cargo_id)
 
     cargo_info_map = {}
-    for cid in cargo_ids:
+    for cid in cargo_ids_needing_fallback:
         cargo = crud.get_cargo(db, cargo_id=cid)
         if cargo:
             cargo_info_map[cid] = {
@@ -1326,6 +1339,15 @@ def generate_stowage_report_api(
                 "width": cargo.width,
                 "height": cargo.height
             }
+
+    for pc in packed_cargos_list:
+        cid = pc["cargo_id"]
+        if pc["max_top_load"] is None and cid in cargo_info_map:
+            pc["max_top_load"] = cargo_info_map[cid]["max_top_load"]
+        if pc["original_length"] is None and cid in cargo_info_map:
+            pc["original_length"] = cargo_info_map[cid]["length"]
+            pc["original_width"] = cargo_info_map[cid]["width"]
+            pc["original_height"] = cargo_info_map[cid]["height"]
 
     report_result = generate_stowage_report(
         plan_id=plan.id,
