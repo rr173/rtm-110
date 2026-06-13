@@ -669,3 +669,205 @@ class StowageReportDetail(StowageReport):
     layers: List[StowageReportLayer]
     overall_health: dict
     statistics: dict
+
+
+class ReviewTaskBase(BaseModel):
+    plan_id: Optional[int] = None
+    plan_no: Optional[str] = None
+    created_by: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+class ReviewTaskCreate(ReviewTaskBase):
+    pass
+
+
+class ReviewTaskUpdate(BaseModel):
+    status: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+class ReviewTask(BaseModel):
+    id: int
+    task_no: str
+    plan_id: int
+    plan_no: str
+    plan_version: int
+    plan_content_hash: Optional[str] = None
+    status: str
+    is_valid: bool
+    invalid_reason: Optional[str] = None
+    created_by: Optional[str] = None
+    created_at: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    remarks: Optional[str] = None
+    total_cargos: Optional[int] = 0
+    reviewed_count: Optional[int] = 0
+    discrepancy_count: Optional[int] = 0
+    blocking_count: Optional[int] = 0
+
+    class Config:
+        from_attributes = True
+
+
+class ReviewCargoRecordBase(BaseModel):
+    pass
+
+
+class ReviewCargoRecordCreate(BaseModel):
+    plan_cargo_id: Optional[int] = None
+    cargo_id: int
+    cargo_name: str
+    actual_x: Optional[float] = None
+    actual_y: Optional[float] = None
+    actual_z: Optional[float] = None
+    actual_orientation: Optional[str] = None
+    actual_load_order: Optional[int] = None
+    loaded_at: Optional[str] = None
+    review_status: str = "confirmed"
+    reviewed_by: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+class ReviewCargoRecordUpdate(BaseModel):
+    actual_x: Optional[float] = None
+    actual_y: Optional[float] = None
+    actual_z: Optional[float] = None
+    actual_orientation: Optional[str] = None
+    actual_load_order: Optional[int] = None
+    loaded_at: Optional[str] = None
+    review_status: Optional[str] = None
+    reviewed_by: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+class ReviewCargoRecord(BaseModel):
+    id: int
+    task_id: int
+    plan_cargo_id: Optional[int] = None
+    cargo_id: int
+    cargo_name: str
+    review_status: str
+    plan_x: Optional[float] = None
+    plan_y: Optional[float] = None
+    plan_z: Optional[float] = None
+    plan_orientation: Optional[str] = None
+    plan_load_order: Optional[int] = None
+    actual_x: Optional[float] = None
+    actual_y: Optional[float] = None
+    actual_z: Optional[float] = None
+    actual_orientation: Optional[str] = None
+    actual_load_order: Optional[int] = None
+    loaded_at: Optional[str] = None
+    reviewed_by: Optional[str] = None
+    reviewed_at: Optional[str] = None
+    remarks: Optional[str] = None
+    discrepancies: Optional[List[dict]] = []
+
+    class Config:
+        from_attributes = True
+
+
+class ReviewDiscrepancyBase(BaseModel):
+    pass
+
+
+class ReviewDiscrepancyCreate(BaseModel):
+    cargo_record_id: Optional[int] = None
+    discrepancy_type: str
+    severity: str = "releasable"
+    description: str
+    details: Optional[dict] = {}
+
+
+class ReviewDiscrepancyWaive(BaseModel):
+    waive_reason: str
+    waived_by: Optional[str] = None
+
+
+class ReviewDiscrepancyResolve(BaseModel):
+    resolution_note: str
+    resolved_by: Optional[str] = None
+
+
+class ReviewDiscrepancy(BaseModel):
+    id: int
+    task_id: int
+    cargo_record_id: Optional[int] = None
+    discrepancy_type: str
+    severity: str
+    description: str
+    details: Optional[dict] = {}
+    is_resolved: bool
+    resolved_by: Optional[str] = None
+    resolved_at: Optional[str] = None
+    resolution_note: Optional[str] = None
+    is_waived: bool
+    waived_by: Optional[str] = None
+    waived_at: Optional[str] = None
+    waive_reason: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class LoadingConfirmationBase(BaseModel):
+    pass
+
+
+class LoadingConfirmation(BaseModel):
+    id: int
+    confirmation_no: str
+    task_id: int
+    plan_id: int
+    plan_no: str
+    plan_version: int
+    plan_content_hash: Optional[str] = None
+    status: str
+    is_valid: bool
+    total_planned: int
+    total_actual: int
+    total_discrepancies: int
+    blocking_count: int
+    releasable_count: int
+    is_released: bool
+    released_by: Optional[str] = None
+    released_at: Optional[str] = None
+    release_reason: Optional[str] = None
+    summary_data: Optional[dict] = {}
+    created_at: Optional[str] = None
+    confirmed_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class LoadingConfirmationDetail(LoadingConfirmation):
+    cargo_comparison: Optional[List[dict]] = []
+    discrepancies: Optional[List[ReviewDiscrepancy]] = []
+
+
+class ReviewTaskDetail(ReviewTask):
+    cargo_records: Optional[List[ReviewCargoRecord]] = []
+    discrepancies: Optional[List[ReviewDiscrepancy]] = []
+    confirmations: Optional[List[LoadingConfirmation]] = []
+
+
+class ReviewTaskQuery(BaseModel):
+    plan_no: Optional[str] = None
+    status: Optional[str] = None
+    only_pending: Optional[bool] = False
+    skip: int = 0
+    limit: int = 100
+
+
+class CargoReviewSubmit(BaseModel):
+    cargo_records: List[ReviewCargoRecordCreate]
+    reviewed_by: Optional[str] = None
+
+
+class ReleaseConfirmationRequest(BaseModel):
+    released_by: str
+    release_reason: str
+

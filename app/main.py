@@ -46,6 +46,7 @@ def startup_event():
     crud.create_demo_hazard_cargos(db)
     crud.create_demo_temperature_cargos(db)
     crud.init_plan_hash_and_version(db)
+    crud.create_demo_review_record(db)
 
 
 @app.get("/")
@@ -1453,3 +1454,617 @@ def get_stowage_report_detail(
         "overall_health": report_data.get("overall_health", {}),
         "statistics": report_data.get("statistics", {})
     }
+
+
+@app.post("/review/tasks", response_model=schemas.ReviewTask)
+def create_review_task(
+    request: schemas.ReviewTaskCreate,
+    db: Session = Depends(get_db)
+):
+    plan_id = request.plan_id
+    plan_no = request.plan_no
+    if not plan_id and not plan_no:
+        raise HTTPException(status_code=400, detail="必须提供 plan_id 或 plan_no")
+
+    plan = None
+    if plan_id:
+        plan = crud.get_packing_plan(db, plan_id=plan_id)
+    if not plan and plan_no:
+        plan = crud.get_packing_plan(db, plan_no=plan_no)
+
+    if not plan:
+        raise HTTPException(status_code=404, detail="方案不存在")
+
+    task = crud.create_review_task(
+        db,
+        plan_id=plan.id,
+        created_by=request.created_by,
+        remarks=request.remarks,
+    )
+    if not task:
+        raise HTTPException(status_code=500, detail="创建复核任务失败")
+
+    stats = crud.get_review_task_stats(db, task.id)
+    return {
+        "id": task.id,
+        "task_no": task.task_no,
+        "plan_id": task.plan_id,
+        "plan_no": task.plan_no,
+        "plan_version": task.plan_version,
+        "plan_content_hash": task.plan_content_hash,
+        "status": task.status,
+        "is_valid": task.is_valid,
+        "invalid_reason": task.invalid_reason,
+        "created_by": task.created_by,
+        "created_at": task.created_at.isoformat() if task.created_at else "",
+        "started_at": task.started_at.isoformat() if task.started_at else None,
+        "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+        "remarks": task.remarks,
+        "total_cargos": stats["total_cargos"],
+        "reviewed_count": stats["reviewed_count"],
+        "discrepancy_count": stats["discrepancy_count"],
+        "blocking_count": stats["blocking_count"],
+    }
+
+
+@app.get("/review/tasks", response_model=List[schemas.ReviewTask])
+def list_review_tasks(
+    plan_no: Optional[str] = None,
+    status: Optional[str] = None,
+    only_pending: bool = False,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    tasks = crud.list_review_tasks(
+        db,
+        skip=skip,
+        limit=limit,
+        plan_no=plan_no,
+        status=status,
+        only_pending=only_pending,
+        only_valid=False,
+    )
+    result = []
+    for task in tasks:
+        stats = crud.get_review_task_stats(db, task.id)
+        result.append({
+            "id": task.id,
+            "task_no": task.task_no,
+            "plan_id": task.plan_id,
+            "plan_no": task.plan_no,
+            "plan_version": task.plan_version,
+            "plan_content_hash": task.plan_content_hash,
+            "status": task.status,
+            "is_valid": task.is_valid,
+            "invalid_reason": task.invalid_reason,
+            "created_by": task.created_by,
+            "created_at": task.created_at.isoformat() if task.created_at else "",
+            "started_at": task.started_at.isoformat() if task.started_at else None,
+            "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+            "remarks": task.remarks,
+            "total_cargos": stats["total_cargos"],
+            "reviewed_count": stats["reviewed_count"],
+            "discrepancy_count": stats["discrepancy_count"],
+            "blocking_count": stats["blocking_count"],
+        })
+    return result
+
+
+@app.get("/review/tasks/{task_identifier}", response_model=schemas.ReviewTaskDetail)
+def get_review_task_detail(
+    task_identifier: str,
+    db: Session = Depends(get_db)
+):
+    task = None
+    if task_identifier.isdigit():
+        task = crud.get_review_task(db, task_id=int(task_identifier))
+    if not task:
+        task = crud.get_review_task(db, task_no=task_identifier)
+
+    if not task:
+        raise HTTPException(status_code=404, detail="复核任务不存在")
+
+    cargo_records = crud.get_review_cargo_records(db, task.id)
+    discrepancies = crud.get_review_discrepancies(db, task.id)
+    confirmations = task.confirmations or []
+
+    stats = crud.get_review_task_stats(db, task.id)
+
+    cargo_records_list = []
+    for rec in cargo_records:
+        rec_discs = [d for d in discrepancies if d.cargo_record_id == rec.id]
+        discs_list = []
+        for d in rec_discs:
+            discs_list.append({
+                "id": d.id,
+                "discrepancy_type": d.discrepancy_type,
+                "severity": d.severity,
+                "description": d.description,
+                "details": d.details or {},
+                "is_resolved": d.is_resolved,
+                "is_waived": d.is_waived,
+            })
+        cargo_records_list.append({
+            "id": rec.id,
+            "task_id": rec.task_id,
+            "plan_cargo_id": rec.plan_cargo_id,
+            "cargo_id": rec.cargo_id,
+            "cargo_name": rec.cargo_name,
+            "review_status": rec.review_status,
+            "plan_x": rec.plan_x,
+            "plan_y": rec.plan_y,
+            "plan_z": rec.plan_z,
+            "plan_orientation": rec.plan_orientation,
+            "plan_load_order": rec.plan_load_order,
+            "actual_x": rec.actual_x,
+            "actual_y": rec.actual_y,
+            "actual_z": rec.actual_z,
+            "actual_orientation": rec.actual_orientation,
+            "actual_load_order": rec.actual_load_order,
+            "loaded_at": rec.loaded_at.isoformat() if rec.loaded_at else None,
+            "reviewed_by": rec.reviewed_by,
+            "reviewed_at": rec.reviewed_at.isoformat() if rec.reviewed_at else None,
+            "remarks": rec.remarks,
+            "discrepancies": discs_list,
+        })
+
+    disc_list = []
+    for d in discrepancies:
+        disc_list.append({
+            "id": d.id,
+            "task_id": d.task_id,
+            "cargo_record_id": d.cargo_record_id,
+            "discrepancy_type": d.discrepancy_type,
+            "severity": d.severity,
+            "description": d.description,
+            "details": d.details or {},
+            "is_resolved": d.is_resolved,
+            "resolved_by": d.resolved_by,
+            "resolved_at": d.resolved_at.isoformat() if d.resolved_at else None,
+            "resolution_note": d.resolution_note,
+            "is_waived": d.is_waived,
+            "waived_by": d.waived_by,
+            "waived_at": d.waived_at.isoformat() if d.waived_at else None,
+            "waive_reason": d.waive_reason,
+        })
+
+    conf_list = []
+    for conf in confirmations:
+        conf_list.append({
+            "id": conf.id,
+            "confirmation_no": conf.confirmation_no,
+            "task_id": conf.task_id,
+            "plan_id": conf.plan_id,
+            "plan_no": conf.plan_no,
+            "plan_version": conf.plan_version,
+            "plan_content_hash": conf.plan_content_hash,
+            "status": conf.status,
+            "is_valid": conf.is_valid,
+            "total_planned": conf.total_planned,
+            "total_actual": conf.total_actual,
+            "total_discrepancies": conf.total_discrepancies,
+            "blocking_count": conf.blocking_count,
+            "releasable_count": conf.releasable_count,
+            "is_released": conf.is_released,
+            "released_by": conf.released_by,
+            "released_at": conf.released_at.isoformat() if conf.released_at else None,
+            "release_reason": conf.release_reason,
+            "summary_data": conf.summary_data or {},
+            "created_at": conf.created_at.isoformat() if conf.created_at else None,
+            "confirmed_at": conf.confirmed_at.isoformat() if conf.confirmed_at else None,
+        })
+
+    return {
+        "id": task.id,
+        "task_no": task.task_no,
+        "plan_id": task.plan_id,
+        "plan_no": task.plan_no,
+        "plan_version": task.plan_version,
+        "plan_content_hash": task.plan_content_hash,
+        "status": task.status,
+        "is_valid": task.is_valid,
+        "invalid_reason": task.invalid_reason,
+        "created_by": task.created_by,
+        "created_at": task.created_at.isoformat() if task.created_at else "",
+        "started_at": task.started_at.isoformat() if task.started_at else None,
+        "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+        "remarks": task.remarks,
+        "total_cargos": stats["total_cargos"],
+        "reviewed_count": stats["reviewed_count"],
+        "discrepancy_count": stats["discrepancy_count"],
+        "blocking_count": stats["blocking_count"],
+        "cargo_records": cargo_records_list,
+        "discrepancies": disc_list,
+        "confirmations": conf_list,
+    }
+
+
+@app.post("/review/tasks/{task_identifier}/cargos", response_model=schemas.ReviewCargoRecord)
+def submit_cargo_review(
+    task_identifier: str,
+    record: schemas.ReviewCargoRecordCreate,
+    db: Session = Depends(get_db)
+):
+    task = None
+    if task_identifier.isdigit():
+        task = crud.get_review_task(db, task_id=int(task_identifier))
+    if not task:
+        task = crud.get_review_task(db, task_no=task_identifier)
+
+    if not task:
+        raise HTTPException(status_code=404, detail="复核任务不存在")
+    if not task.is_valid:
+        raise HTTPException(status_code=400, detail=f"复核任务已失效: {task.invalid_reason}")
+    if task.status == "completed":
+        raise HTTPException(status_code=400, detail="复核任务已完成，无法修改")
+
+    result = crud.update_cargo_review_record(
+        db,
+        task_id=task.id,
+        record_data=record.model_dump(),
+        reviewed_by=record.reviewed_by,
+    )
+    if not result:
+        raise HTTPException(status_code=400, detail="复核记录更新失败")
+
+    return {
+        "id": result.id,
+        "task_id": result.task_id,
+        "plan_cargo_id": result.plan_cargo_id,
+        "cargo_id": result.cargo_id,
+        "cargo_name": result.cargo_name,
+        "review_status": result.review_status,
+        "plan_x": result.plan_x,
+        "plan_y": result.plan_y,
+        "plan_z": result.plan_z,
+        "plan_orientation": result.plan_orientation,
+        "plan_load_order": result.plan_load_order,
+        "actual_x": result.actual_x,
+        "actual_y": result.actual_y,
+        "actual_z": result.actual_z,
+        "actual_orientation": result.actual_orientation,
+        "actual_load_order": result.actual_load_order,
+        "loaded_at": result.loaded_at.isoformat() if result.loaded_at else None,
+        "reviewed_by": result.reviewed_by,
+        "reviewed_at": result.reviewed_at.isoformat() if result.reviewed_at else None,
+        "remarks": result.remarks,
+        "discrepancies": [],
+    }
+
+
+@app.post("/review/tasks/{task_identifier}/cargos/batch")
+def batch_submit_cargo_review(
+    task_identifier: str,
+    request: schemas.CargoReviewSubmit,
+    db: Session = Depends(get_db)
+):
+    task = None
+    if task_identifier.isdigit():
+        task = crud.get_review_task(db, task_id=int(task_identifier))
+    if not task:
+        task = crud.get_review_task(db, task_no=task_identifier)
+
+    if not task:
+        raise HTTPException(status_code=404, detail="复核任务不存在")
+    if not task.is_valid:
+        raise HTTPException(status_code=400, detail=f"复核任务已失效: {task.invalid_reason}")
+    if task.status == "completed":
+        raise HTTPException(status_code=400, detail="复核任务已完成，无法修改")
+
+    results = []
+    for record in request.cargo_records:
+        result = crud.update_cargo_review_record(
+            db,
+            task_id=task.id,
+            record_data=record.model_dump(),
+            reviewed_by=request.reviewed_by or record.reviewed_by,
+        )
+        if result:
+            results.append({
+                "id": result.id,
+                "cargo_id": result.cargo_id,
+                "cargo_name": result.cargo_name,
+                "review_status": result.review_status,
+            })
+
+    stats = crud.get_review_task_stats(db, task.id)
+    return {
+        "task_id": task.id,
+        "task_no": task.task_no,
+        "submitted_count": len(results),
+        "results": results,
+        "stats": stats,
+    }
+
+
+@app.put("/review/discrepancies/{disc_id}/waive", response_model=schemas.ReviewDiscrepancy)
+def waive_discrepancy(
+    disc_id: int,
+    request: schemas.ReviewDiscrepancyWaive,
+    db: Session = Depends(get_db)
+):
+    try:
+        disc = crud.waive_discrepancy(
+            db,
+            disc_id=disc_id,
+            waive_reason=request.waive_reason,
+            waived_by=request.waived_by,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not disc:
+        raise HTTPException(status_code=404, detail="差异记录不存在")
+
+    return {
+        "id": disc.id,
+        "task_id": disc.task_id,
+        "cargo_record_id": disc.cargo_record_id,
+        "discrepancy_type": disc.discrepancy_type,
+        "severity": disc.severity,
+        "description": disc.description,
+        "details": disc.details or {},
+        "is_resolved": disc.is_resolved,
+        "resolved_by": disc.resolved_by,
+        "resolved_at": disc.resolved_at.isoformat() if disc.resolved_at else None,
+        "resolution_note": disc.resolution_note,
+        "is_waived": disc.is_waived,
+        "waived_by": disc.waived_by,
+        "waived_at": disc.waived_at.isoformat() if disc.waived_at else None,
+        "waive_reason": disc.waive_reason,
+    }
+
+
+@app.put("/review/discrepancies/{disc_id}/resolve", response_model=schemas.ReviewDiscrepancy)
+def resolve_discrepancy(
+    disc_id: int,
+    request: schemas.ReviewDiscrepancyResolve,
+    db: Session = Depends(get_db)
+):
+    disc = crud.resolve_discrepancy(
+        db,
+        disc_id=disc_id,
+        resolution_note=request.resolution_note,
+        resolved_by=request.resolved_by,
+    )
+    if not disc:
+        raise HTTPException(status_code=404, detail="差异记录不存在")
+
+    return {
+        "id": disc.id,
+        "task_id": disc.task_id,
+        "cargo_record_id": disc.cargo_record_id,
+        "discrepancy_type": disc.discrepancy_type,
+        "severity": disc.severity,
+        "description": disc.description,
+        "details": disc.details or {},
+        "is_resolved": disc.is_resolved,
+        "resolved_by": disc.resolved_by,
+        "resolved_at": disc.resolved_at.isoformat() if disc.resolved_at else None,
+        "resolution_note": disc.resolution_note,
+        "is_waived": disc.is_waived,
+        "waived_by": disc.waived_by,
+        "waived_at": disc.waived_at.isoformat() if disc.waived_at else None,
+        "waive_reason": disc.waive_reason,
+    }
+
+
+@app.post("/review/tasks/{task_identifier}/complete", response_model=schemas.ReviewTaskDetail)
+def complete_review_task(
+    task_identifier: str,
+    db: Session = Depends(get_db)
+):
+    task = None
+    if task_identifier.isdigit():
+        task = crud.get_review_task(db, task_id=int(task_identifier))
+    if not task:
+        task = crud.get_review_task(db, task_no=task_identifier)
+
+    if not task:
+        raise HTTPException(status_code=404, detail="复核任务不存在")
+
+    try:
+        task = crud.complete_review_task(db, task_id=task.id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return get_review_task_detail(task_identifier=str(task.id), db=db)
+
+
+@app.post("/review/tasks/{task_identifier}/release", response_model=schemas.LoadingConfirmationDetail)
+def release_confirmation(
+    task_identifier: str,
+    request: schemas.ReleaseConfirmationRequest,
+    db: Session = Depends(get_db)
+):
+    task = None
+    if task_identifier.isdigit():
+        task = crud.get_review_task(db, task_id=int(task_identifier))
+    if not task:
+        task = crud.get_review_task(db, task_no=task_identifier)
+
+    if not task:
+        raise HTTPException(status_code=404, detail="复核任务不存在")
+
+    try:
+        conf = crud.release_confirmation(
+            db,
+            task_id=task.id,
+            released_by=request.released_by,
+            release_reason=request.release_reason,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return get_loading_confirmation_detail(conf_identifier=str(conf.id), db=db)
+
+
+@app.get("/loading-confirmations", response_model=List[schemas.LoadingConfirmation])
+def list_loading_confirmations(
+    plan_no: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    confs = crud.list_loading_confirmations(db, skip=skip, limit=limit, plan_no=plan_no)
+    result = []
+    for conf in confs:
+        result.append({
+            "id": conf.id,
+            "confirmation_no": conf.confirmation_no,
+            "task_id": conf.task_id,
+            "plan_id": conf.plan_id,
+            "plan_no": conf.plan_no,
+            "plan_version": conf.plan_version,
+            "plan_content_hash": conf.plan_content_hash,
+            "status": conf.status,
+            "is_valid": conf.is_valid,
+            "total_planned": conf.total_planned,
+            "total_actual": conf.total_actual,
+            "total_discrepancies": conf.total_discrepancies,
+            "blocking_count": conf.blocking_count,
+            "releasable_count": conf.releasable_count,
+            "is_released": conf.is_released,
+            "released_by": conf.released_by,
+            "released_at": conf.released_at.isoformat() if conf.released_at else None,
+            "release_reason": conf.release_reason,
+            "summary_data": conf.summary_data or {},
+            "created_at": conf.created_at.isoformat() if conf.created_at else None,
+            "confirmed_at": conf.confirmed_at.isoformat() if conf.confirmed_at else None,
+        })
+    return result
+
+
+@app.get("/loading-confirmations/{conf_identifier}", response_model=schemas.LoadingConfirmationDetail)
+def get_loading_confirmation_detail(
+    conf_identifier: str,
+    db: Session = Depends(get_db)
+):
+    conf = None
+    if conf_identifier.isdigit():
+        conf = crud.get_loading_confirmation(db, conf_id=int(conf_identifier))
+    if not conf:
+        conf = crud.get_loading_confirmation(db, confirmation_no=conf_identifier)
+
+    if not conf:
+        raise HTTPException(status_code=404, detail="实装确认单不存在")
+
+    task = crud.get_review_task(db, task_id=conf.task_id)
+    cargo_records = crud.get_review_cargo_records(db, conf.task_id) if task else []
+    discrepancies = crud.get_review_discrepancies(db, conf.task_id) if task else []
+
+    cargo_comparison = []
+    for rec in cargo_records:
+        cargo_comparison.append({
+            "record_id": rec.id,
+            "plan_cargo_id": rec.plan_cargo_id,
+            "cargo_id": rec.cargo_id,
+            "cargo_name": rec.cargo_name,
+            "review_status": rec.review_status,
+            "plan_position": {
+                "x": rec.plan_x,
+                "y": rec.plan_y,
+                "z": rec.plan_z,
+            },
+            "actual_position": {
+                "x": rec.actual_x,
+                "y": rec.actual_y,
+                "z": rec.actual_z,
+            },
+            "plan_orientation": rec.plan_orientation,
+            "actual_orientation": rec.actual_orientation,
+            "plan_load_order": rec.plan_load_order,
+            "actual_load_order": rec.actual_load_order,
+            "loaded_at": rec.loaded_at.isoformat() if rec.loaded_at else None,
+        })
+
+    disc_list = []
+    for d in discrepancies:
+        disc_list.append({
+            "id": d.id,
+            "task_id": d.task_id,
+            "cargo_record_id": d.cargo_record_id,
+            "discrepancy_type": d.discrepancy_type,
+            "severity": d.severity,
+            "description": d.description,
+            "details": d.details or {},
+            "is_resolved": d.is_resolved,
+            "resolved_by": d.resolved_by,
+            "resolved_at": d.resolved_at.isoformat() if d.resolved_at else None,
+            "resolution_note": d.resolution_note,
+            "is_waived": d.is_waived,
+            "waived_by": d.waived_by,
+            "waived_at": d.waived_at.isoformat() if d.waived_at else None,
+            "waive_reason": d.waive_reason,
+        })
+
+    return {
+        "id": conf.id,
+        "confirmation_no": conf.confirmation_no,
+        "task_id": conf.task_id,
+        "plan_id": conf.plan_id,
+        "plan_no": conf.plan_no,
+        "plan_version": conf.plan_version,
+        "plan_content_hash": conf.plan_content_hash,
+        "status": conf.status,
+        "is_valid": conf.is_valid,
+        "total_planned": conf.total_planned,
+        "total_actual": conf.total_actual,
+        "total_discrepancies": conf.total_discrepancies,
+        "blocking_count": conf.blocking_count,
+        "releasable_count": conf.releasable_count,
+        "is_released": conf.is_released,
+        "released_by": conf.released_by,
+        "released_at": conf.released_at.isoformat() if conf.released_at else None,
+        "release_reason": conf.release_reason,
+        "summary_data": conf.summary_data or {},
+        "created_at": conf.created_at.isoformat() if conf.created_at else None,
+        "confirmed_at": conf.confirmed_at.isoformat() if conf.confirmed_at else None,
+        "cargo_comparison": cargo_comparison,
+        "discrepancies": disc_list,
+    }
+
+
+@app.get("/plans/{plan_identifier}/latest-release")
+def get_plan_latest_release(
+    plan_identifier: str,
+    db: Session = Depends(get_db)
+):
+    plan = None
+    if plan_identifier.isdigit():
+        plan = crud.get_packing_plan(db, plan_id=int(plan_identifier))
+    if plan is None:
+        plan = crud.get_packing_plan(db, plan_no=plan_identifier)
+
+    if not plan:
+        raise HTTPException(status_code=404, detail="方案不存在")
+
+    conf = crud.get_latest_confirmation_by_plan(db, plan.id)
+    task = crud.get_latest_review_task(db, plan.id)
+
+    return {
+        "plan_id": plan.id,
+        "plan_no": plan.plan_no,
+        "plan_version": plan.version,
+        "latest_confirmation": {
+            "id": conf.id,
+            "confirmation_no": conf.confirmation_no,
+            "is_valid": conf.is_valid,
+            "is_released": conf.is_released,
+            "released_by": conf.released_by,
+            "released_at": conf.released_at.isoformat() if conf.released_at else None,
+            "release_reason": conf.release_reason,
+            "total_discrepancies": conf.total_discrepancies,
+            "blocking_count": conf.blocking_count,
+            "releasable_count": conf.releasable_count,
+        } if conf else None,
+        "latest_review_task": {
+            "id": task.id,
+            "task_no": task.task_no,
+            "is_valid": task.is_valid,
+            "status": task.status,
+            "created_at": task.created_at.isoformat() if task.created_at else None,
+        } if task else None,
+    }
+

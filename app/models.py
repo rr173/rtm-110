@@ -303,3 +303,107 @@ class StowageReport(Base):
     created_at = Column(DateTime, server_default=func.now())
 
     plan = relationship("PackingPlan")
+
+
+class ReviewTask(Base):
+    __tablename__ = "review_tasks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_no = Column(String, unique=True, index=True, comment="复核任务编号")
+    plan_id = Column(Integer, ForeignKey("packing_plans.id"))
+    plan_no = Column(String, index=True, comment="关联方案编号")
+    plan_version = Column(Integer, comment="复核时的方案版本")
+    plan_content_hash = Column(String, nullable=True, comment="复核时的方案内容哈希")
+    status = Column(String, default="pending", comment="状态: pending待开始/in_progress进行中/completed已完成/cancelled已取消")
+    is_valid = Column(Boolean, default=True, comment="是否有效，方案变更后自动失效")
+    invalid_reason = Column(String, nullable=True, comment="失效原因")
+    created_by = Column(String, nullable=True, comment="创建人")
+    created_at = Column(DateTime, server_default=func.now())
+    started_at = Column(DateTime, nullable=True, comment="开始时间")
+    completed_at = Column(DateTime, nullable=True, comment="完成时间")
+    remarks = Column(Text, nullable=True)
+
+    plan = relationship("PackingPlan")
+    cargo_records = relationship("ReviewCargoRecord", back_populates="task", cascade="all, delete-orphan")
+    discrepancies = relationship("ReviewDiscrepancy", back_populates="task", cascade="all, delete-orphan")
+    confirmations = relationship("LoadingConfirmation", back_populates="task", cascade="all, delete-orphan")
+
+
+class ReviewCargoRecord(Base):
+    __tablename__ = "review_cargo_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("review_tasks.id"))
+    plan_cargo_id = Column(Integer, nullable=True, comment="对应计划中的PackedCargo ID，None表示多装")
+    cargo_id = Column(Integer)
+    cargo_name = Column(String)
+    review_status = Column(String, default="pending", comment="复核状态: pending待复核/confirmed已确认/missing漏装/extra多装")
+    plan_x = Column(Float, nullable=True)
+    plan_y = Column(Float, nullable=True)
+    plan_z = Column(Float, nullable=True)
+    plan_orientation = Column(String, nullable=True)
+    plan_load_order = Column(Integer, nullable=True, comment="计划装入顺序")
+    actual_x = Column(Float, nullable=True)
+    actual_y = Column(Float, nullable=True)
+    actual_z = Column(Float, nullable=True)
+    actual_orientation = Column(String, nullable=True)
+    actual_load_order = Column(Integer, nullable=True, comment="实际装入顺序")
+    loaded_at = Column(DateTime, nullable=True, comment="实际装入时间")
+    reviewed_by = Column(String, nullable=True)
+    reviewed_at = Column(DateTime, nullable=True)
+    remarks = Column(Text, nullable=True)
+
+    task = relationship("ReviewTask", back_populates="cargo_records")
+    discrepancies = relationship("ReviewDiscrepancy", back_populates="cargo_record")
+
+
+class ReviewDiscrepancy(Base):
+    __tablename__ = "review_discrepancies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("review_tasks.id"))
+    cargo_record_id = Column(Integer, ForeignKey("review_cargo_records.id"), nullable=True)
+    discrepancy_type = Column(String, comment="差异类型: missing漏装/extra多装/position位置偏差/orientation朝向偏差/pressure_risk承压风险/temperature_violation温控失效")
+    severity = Column(String, default="releasable", comment="严重等级: blocking阻断/releasable可放行")
+    description = Column(String, comment="差异描述")
+    details = Column(JSON, default=dict, comment="详细信息")
+    is_resolved = Column(Boolean, default=False, comment="是否已处理")
+    resolved_by = Column(String, nullable=True)
+    resolved_at = Column(DateTime, nullable=True)
+    resolution_note = Column(Text, nullable=True)
+    is_waived = Column(Boolean, default=False, comment="是否已放行")
+    waived_by = Column(String, nullable=True)
+    waived_at = Column(DateTime, nullable=True)
+    waive_reason = Column(Text, nullable=True)
+
+    task = relationship("ReviewTask", back_populates="discrepancies")
+    cargo_record = relationship("ReviewCargoRecord", back_populates="discrepancies")
+
+
+class LoadingConfirmation(Base):
+    __tablename__ = "loading_confirmations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    confirmation_no = Column(String, unique=True, index=True, comment="确认单编号")
+    task_id = Column(Integer, ForeignKey("review_tasks.id"))
+    plan_id = Column(Integer, ForeignKey("packing_plans.id"))
+    plan_no = Column(String, index=True)
+    plan_version = Column(Integer)
+    plan_content_hash = Column(String, nullable=True)
+    status = Column(String, default="draft", comment="状态: draft草稿/confirmed已确认/void已失效")
+    is_valid = Column(Boolean, default=True, comment="是否有效，方案变更后自动失效")
+    total_planned = Column(Integer, default=0, comment="计划件数")
+    total_actual = Column(Integer, default=0, comment="实际件数")
+    total_discrepancies = Column(Integer, default=0, comment="总差异数")
+    blocking_count = Column(Integer, default=0, comment="阻断差异数")
+    releasable_count = Column(Integer, default=0, comment="可放行差异数")
+    is_released = Column(Boolean, default=False, comment="是否放行")
+    released_by = Column(String, nullable=True)
+    released_at = Column(DateTime, nullable=True)
+    release_reason = Column(Text, nullable=True)
+    summary_data = Column(JSON, default=dict, comment="汇总数据")
+    created_at = Column(DateTime, server_default=func.now())
+    confirmed_at = Column(DateTime, nullable=True)
+
+    task = relationship("ReviewTask", back_populates="confirmations")
+    plan = relationship("PackingPlan")

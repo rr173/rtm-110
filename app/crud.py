@@ -527,6 +527,7 @@ def bump_plan_version(db: Session, plan_id: int) -> models.PackingPlan:
         plan.version = old_version + 1
         plan.content_hash = compute_plan_content_hash(db, plan_id)
         invalidate_docs_for_outdated_plan(db, plan_id, plan.content_hash, current_version=plan.version)
+        invalidate_reviews_for_outdated_plan(db, plan_id, plan.content_hash, current_version=plan.version)
         db.commit()
         db.refresh(plan)
     return plan
@@ -987,4 +988,703 @@ def list_stowage_reports(db: Session, skip: int = 0, limit: int = 100, plan_iden
         else:
             q = q.filter(models.StowageReport.plan_no == plan_identifier)
     return q.order_by(models.StowageReport.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def generate_review_task_no() -> str:
+    return f"REV-{uuid.uuid4().hex[:8].upper()}"
+
+
+def generate_confirmation_no() -> str:
+    return f"CONF-{uuid.uuid4().hex[:8].upper()}"
+
+
+def create_review_task(db: Session, plan_id: int, created_by: str = None, remarks: str = None) -> models.ReviewTask:
+    plan = get_packing_plan(db, plan_id=plan_id)
+    if not plan:
+        return None
+
+    content_hash = compute_plan_content_hash(db, plan_id)
+    task_no = generate_review_task_no()
+
+    db_task = models.ReviewTask(
+        task_no=task_no,
+        plan_id=plan_id,
+        plan_no=plan.plan_no,
+        plan_version=plan.version or 1,
+        plan_content_hash=content_hash,
+        status="pending",
+        is_valid=True,
+        created_by=created_by,
+        remarks=remarks,
+    )
+    db.add(db_task)
+    db.flush()
+
+    packed_cargos = get_packed_cargos(db, plan_id=plan_id)
+    for idx, pc in enumerate(packed_cargos):
+        db_record = models.ReviewCargoRecord(
+            task_id=db_task.id,
+            plan_cargo_id=pc.id,
+            cargo_id=pc.cargo_id,
+            cargo_name=pc.cargo_name,
+            review_status="pending",
+            plan_x=pc.x,
+            plan_y=pc.y,
+            plan_z=pc.z,
+            plan_orientation=pc.orientation,
+            plan_load_order=idx + 1,
+        )
+        db.add(db_record)
+
+    db.commit()
+    db.refresh(db_task)
+    return db_task
+
+
+def get_review_task(db: Session, task_id: int = None, task_no: str = None):
+    if task_id:
+        return db.query(models.ReviewTask).filter(models.ReviewTask.id == task_id).first()
+    if task_no:
+        return db.query(models.ReviewTask).filter(models.ReviewTask.task_no == task_no).first()
+    return None
+
+
+def list_review_tasks(
+    db: Session,
+    skip: int = 0,
+    limit: int = 100,
+    plan_no: str = None,
+    status: str = None,
+    only_pending: bool = False,
+    only_valid: bool = True,
+):
+    q = db.query(models.ReviewTask)
+    if plan_no:
+        q = q.filter(models.ReviewTask.plan_no == plan_no)
+    if status:
+        q = q.filter(models.ReviewTask.status == status)
+    if only_pending:
+        q = q.filter(models.ReviewTask.status.in_(["pending", "in_progress"]))
+    if only_valid:
+        q = q.filter(models.ReviewTask.is_valid == True)
+    return q.order_by(models.ReviewTask.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def get_review_tasks_by_plan(db: Session, plan_id: int):
+    return db.query(models.ReviewTask).filter(
+        models.ReviewTask.plan_id == plan_id
+    ).order_by(models.ReviewTask.created_at.desc()).all()
+
+
+def get_latest_review_task(db: Session, plan_id: int):
+    return db.query(models.ReviewTask).filter(
+        models.ReviewTask.plan_id == plan_id,
+        models.ReviewTask.is_valid == True,
+    ).order_by(models.ReviewTask.created_at.desc()).first()
+
+
+def get_review_cargo_records(db: Session, task_id: int):
+    return db.query(models.ReviewCargoRecord).filter(
+        models.ReviewCargoRecord.task_id == task_id
+    ).order_by(models.ReviewCargoRecord.id).all()
+
+
+def get_review_cargo_record(db: Session, record_id: int):
+    return db.query(models.ReviewCargoRecord).filter(
+        models.ReviewCargoRecord.id == record_id
+    ).first()
+
+
+def _check_position_deviation(plan_x, plan_y, plan_z, actual_x, actual_y, actual_z, threshold_mm=50):
+    if None in (plan_x, plan_y, plan_z, actual_x, actual_y, actual_z):
+        return False, 0.0
+    import math
+    distance = math.sqrt(
+        (plan_x - actual_x) ** 2 +
+        (plan_y - actual_y) ** 2 +
+        (plan_z - actual_z) ** 2
+    )
+    return distance > threshold_mm, distance
+
+
+def _check_orientation_deviation(plan_orient, actual_orient):
+    if not plan_orient or not actual_orient:
+        return False
+    return plan_orient != actual_orient
+
+
+def _check_pressure_risk(db: Session, task_id: int, cargo_record: models.ReviewCargoRecord):
+    if cargo_record.actual_z is None or cargo_record.actual_z == 0:
+        return False, []
+
+    all_records = get_review_cargo_records(db, task_id)
+    risks = []
+    for other in all_records:
+        if other.id == cargo_record.id or other.review_status in ("pending", "missing"):
+            continue
+        if other.actual_x is None or other.actual_y is None or other.actual_z is None:
+            continue
+
+        x_overlap = (
+            abs(cargo_record.actual_x - other.actual_x) <
+            (cargo_record.plan_x and other.plan_x and 500 or 500)
+        )
+        y_overlap = True
+
+        if other.actual_z > cargo_record.actual_z and x_overlap and y_overlap:
+            plan_cargo = db.query(models.PackedCargo).filter(
+                models.PackedCargo.id == cargo_record.plan_cargo_id
+            ).first()
+            max_top_load = plan_cargo.max_top_load if plan_cargo else 0
+            if max_top_load > 0 and other.actual_x and other.actual_y:
+                risks.append({
+                    "top_cargo_id": other.cargo_id,
+                    "top_cargo_name": other.cargo_name,
+                    "pressure_weight_kg": 0,
+                    "max_top_load_kg": max_top_load,
+                    "is_overload": False,
+                })
+
+    return len(risks) > 0, risks
+
+
+def _check_temperature_violation(db: Session, task_id: int, cargo_record: models.ReviewCargoRecord):
+    plan_cargo = db.query(models.PackedCargo).filter(
+        models.PackedCargo.id == cargo_record.plan_cargo_id
+    ).first()
+    if not plan_cargo:
+        return False, []
+
+    temp_class = getattr(plan_cargo, 'temperature_class', 'AMBIENT') or 'AMBIENT'
+    if temp_class == 'AMBIENT':
+        return False, []
+
+    all_records = get_review_cargo_records(db, task_id)
+    violations = []
+    for other in all_records:
+        if other.id == cargo_record.id or other.review_status in ("pending", "missing"):
+            continue
+        other_plan = db.query(models.PackedCargo).filter(
+            models.PackedCargo.id == other.plan_cargo_id
+        ).first()
+        if not other_plan:
+            continue
+        other_temp = getattr(other_plan, 'temperature_class', 'AMBIENT') or 'AMBIENT'
+
+        if temp_class != other_temp and other_temp != 'AMBIENT':
+            if cargo_record.actual_x is not None and other.actual_x is not None:
+                distance = abs(cargo_record.actual_x - other.actual_x)
+                if distance < 500:
+                    violations.append({
+                        "other_cargo_id": other.cargo_id,
+                        "other_cargo_name": other.cargo_name,
+                        "other_temperature_class": other_temp,
+                        "distance_mm": distance,
+                        "min_required_mm": 500,
+                    })
+
+    return len(violations) > 0, violations
+
+
+def update_cargo_review_record(
+    db: Session,
+    task_id: int,
+    record_data: dict,
+    reviewed_by: str = None,
+) -> models.ReviewCargoRecord:
+    from datetime import datetime
+
+    task = get_review_task(db, task_id=task_id)
+    if not task or not task.is_valid:
+        return None
+
+    plan_cargo_id = record_data.get("plan_cargo_id")
+    if plan_cargo_id:
+        record = db.query(models.ReviewCargoRecord).filter(
+            models.ReviewCargoRecord.task_id == task_id,
+            models.ReviewCargoRecord.plan_cargo_id == plan_cargo_id,
+        ).first()
+    else:
+        record = None
+
+    if record is None and record_data.get("review_status") == "extra":
+        record = models.ReviewCargoRecord(
+            task_id=task_id,
+            cargo_id=record_data["cargo_id"],
+            cargo_name=record_data["cargo_name"],
+            review_status="extra",
+        )
+        db.add(record)
+        db.flush()
+
+    if record is None:
+        return None
+
+    for field in ["actual_x", "actual_y", "actual_z", "actual_orientation", "actual_load_order", "remarks"]:
+        if field in record_data and record_data[field] is not None:
+            setattr(record, field, record_data[field])
+
+    if "loaded_at" in record_data and record_data["loaded_at"]:
+        record.loaded_at = datetime.fromisoformat(record_data["loaded_at"].replace('Z', '+00:00'))
+
+    if "review_status" in record_data:
+        record.review_status = record_data["review_status"]
+
+    record.reviewed_by = reviewed_by or record_data.get("reviewed_by")
+    record.reviewed_at = datetime.utcnow()
+
+    if task.status == "pending":
+        task.status = "in_progress"
+        task.started_at = datetime.utcnow()
+
+    db.query(models.ReviewDiscrepancy).filter(
+        models.ReviewDiscrepancy.cargo_record_id == record.id
+    ).delete()
+
+    discrepancies = []
+
+    if record.review_status == "missing":
+        disc = models.ReviewDiscrepancy(
+            task_id=task_id,
+            cargo_record_id=record.id,
+            discrepancy_type="missing",
+            severity="blocking",
+            description=f"货物 [{record.cargo_name}] 漏装",
+            details={"cargo_id": record.cargo_id, "cargo_name": record.cargo_name},
+        )
+        discrepancies.append(disc)
+
+    elif record.review_status == "extra":
+        disc = models.ReviewDiscrepancy(
+            task_id=task_id,
+            cargo_record_id=record.id,
+            discrepancy_type="extra",
+            severity="blocking",
+            description=f"发现多装货物 [{record.cargo_name}]",
+            details={"cargo_id": record.cargo_id, "cargo_name": record.cargo_name},
+        )
+        discrepancies.append(disc)
+
+    elif record.review_status == "confirmed":
+        has_pos_dev, pos_distance = _check_position_deviation(
+            record.plan_x, record.plan_y, record.plan_z,
+            record.actual_x, record.actual_y, record.actual_z
+        )
+        if has_pos_dev:
+            severity = "blocking" if pos_distance > 200 else "releasable"
+            disc = models.ReviewDiscrepancy(
+                task_id=task_id,
+                cargo_record_id=record.id,
+                discrepancy_type="position",
+                severity=severity,
+                description=f"货物 [{record.cargo_name}] 位置偏差 {pos_distance:.0f}mm",
+                details={
+                    "plan": {"x": record.plan_x, "y": record.plan_y, "z": record.plan_z},
+                    "actual": {"x": record.actual_x, "y": record.actual_y, "z": record.actual_z},
+                    "distance_mm": pos_distance,
+                },
+            )
+            discrepancies.append(disc)
+
+        has_orient_dev = _check_orientation_deviation(record.plan_orientation, record.actual_orientation)
+        if has_orient_dev:
+            disc = models.ReviewDiscrepancy(
+                task_id=task_id,
+                cargo_record_id=record.id,
+                discrepancy_type="orientation",
+                severity="releasable",
+                description=f"货物 [{record.cargo_name}] 朝向不一致",
+                details={
+                    "plan_orientation": record.plan_orientation,
+                    "actual_orientation": record.actual_orientation,
+                },
+            )
+            discrepancies.append(disc)
+
+    for disc in discrepancies:
+        db.add(disc)
+
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def get_review_discrepancies(db: Session, task_id: int, severity: str = None, only_unresolved: bool = False):
+    q = db.query(models.ReviewDiscrepancy).filter(models.ReviewDiscrepancy.task_id == task_id)
+    if severity:
+        q = q.filter(models.ReviewDiscrepancy.severity == severity)
+    if only_unresolved:
+        q = q.filter(
+            (models.ReviewDiscrepancy.is_resolved == False) &
+            (models.ReviewDiscrepancy.is_waived == False)
+        )
+    return q.order_by(models.ReviewDiscrepancy.id).all()
+
+
+def get_discrepancy(db: Session, disc_id: int):
+    return db.query(models.ReviewDiscrepancy).filter(
+        models.ReviewDiscrepancy.id == disc_id
+    ).first()
+
+
+def waive_discrepancy(db: Session, disc_id: int, waive_reason: str, waived_by: str = None):
+    from datetime import datetime
+    disc = get_discrepancy(db, disc_id)
+    if not disc:
+        return None
+    if disc.severity == "blocking":
+        raise ValueError("阻断类差异不允许直接放行")
+    disc.is_waived = True
+    disc.waived_by = waived_by
+    disc.waived_at = datetime.utcnow()
+    disc.waive_reason = waive_reason
+    db.commit()
+    db.refresh(disc)
+    return disc
+
+
+def resolve_discrepancy(db: Session, disc_id: int, resolution_note: str, resolved_by: str = None):
+    from datetime import datetime
+    disc = get_discrepancy(db, disc_id)
+    if not disc:
+        return None
+    disc.is_resolved = True
+    disc.resolved_by = resolved_by
+    disc.resolved_at = datetime.utcnow()
+    disc.resolution_note = resolution_note
+    db.commit()
+    db.refresh(disc)
+    return disc
+
+
+def get_review_task_stats(db: Session, task_id: int) -> dict:
+    records = get_review_cargo_records(db, task_id)
+    discrepancies = get_review_discrepancies(db, task_id)
+
+    total = len(records)
+    reviewed = sum(1 for r in records if r.review_status != "pending")
+    disc_count = len(discrepancies)
+    blocking_count = sum(1 for d in discrepancies if d.severity == "blocking" and not d.is_resolved and not d.is_waived)
+
+    return {
+        "total_cargos": total,
+        "reviewed_count": reviewed,
+        "discrepancy_count": disc_count,
+        "blocking_count": blocking_count,
+    }
+
+
+def can_complete_review(db: Session, task_id: int) -> tuple:
+    discrepancies = get_review_discrepancies(db, task_id, only_unresolved=True)
+    blocking_unresolved = [d for d in discrepancies if d.severity == "blocking"]
+    return len(blocking_unresolved) == 0, blocking_unresolved
+
+
+def complete_review_task(db: Session, task_id: int) -> models.ReviewTask:
+    from datetime import datetime
+    task = get_review_task(db, task_id=task_id)
+    if not task or not task.is_valid:
+        return None
+
+    can_complete, blocking = can_complete_review(db, task_id)
+    if not can_complete:
+        raise ValueError(f"仍有 {len(blocking)} 项阻断差异未处理，无法完成复核")
+
+    task.status = "completed"
+    task.completed_at = datetime.utcnow()
+    db.commit()
+    db.refresh(task)
+
+    generate_loading_confirmation(db, task_id)
+    return task
+
+
+def generate_loading_confirmation(db: Session, task_id: int) -> models.LoadingConfirmation:
+    from datetime import datetime
+    task = get_review_task(db, task_id=task_id)
+    if not task:
+        return None
+
+    records = get_review_cargo_records(db, task_id)
+    discrepancies = get_review_discrepancies(db, task_id)
+
+    planned_count = sum(1 for r in records if r.plan_cargo_id is not None)
+    actual_count = sum(1 for r in records if r.review_status in ("confirmed", "extra"))
+    blocking_count = sum(1 for d in discrepancies if d.severity == "blocking")
+    releasable_count = sum(1 for d in discrepancies if d.severity == "releasable")
+
+    has_blocking_unresolved = any(
+        d.severity == "blocking" and not d.is_resolved and not d.is_waived
+        for d in discrepancies
+    )
+    is_released = not has_blocking_unresolved
+
+    summary = {
+        "planned_count": planned_count,
+        "actual_count": actual_count,
+        "missing_count": sum(1 for r in records if r.review_status == "missing"),
+        "extra_count": sum(1 for r in records if r.review_status == "extra"),
+        "position_deviation_count": sum(1 for d in discrepancies if d.discrepancy_type == "position"),
+        "orientation_deviation_count": sum(1 for d in discrepancies if d.discrepancy_type == "orientation"),
+        "pressure_risk_count": sum(1 for d in discrepancies if d.discrepancy_type == "pressure_risk"),
+        "temperature_violation_count": sum(1 for d in discrepancies if d.discrepancy_type == "temperature_violation"),
+    }
+
+    confirmation_no = generate_confirmation_no()
+    db_conf = models.LoadingConfirmation(
+        confirmation_no=confirmation_no,
+        task_id=task_id,
+        plan_id=task.plan_id,
+        plan_no=task.plan_no,
+        plan_version=task.plan_version,
+        plan_content_hash=task.plan_content_hash,
+        status="confirmed" if is_released else "draft",
+        is_valid=True,
+        total_planned=planned_count,
+        total_actual=actual_count,
+        total_discrepancies=len(discrepancies),
+        blocking_count=blocking_count,
+        releasable_count=releasable_count,
+        is_released=is_released,
+        released_by=task.created_by if is_released else None,
+        released_at=datetime.utcnow() if is_released else None,
+        release_reason="所有阻断差异已处理完毕，复核通过" if is_released else None,
+        summary_data=summary,
+        confirmed_at=datetime.utcnow() if is_released else None,
+    )
+    db.add(db_conf)
+    db.commit()
+    db.refresh(db_conf)
+    return db_conf
+
+
+def release_confirmation(db: Session, task_id: int, released_by: str, release_reason: str) -> models.LoadingConfirmation:
+    from datetime import datetime
+    task = get_review_task(db, task_id=task_id)
+    if not task:
+        return None
+
+    can_complete, blocking = can_complete_review(db, task_id)
+    if not can_complete:
+        raise ValueError(f"仍有 {len(blocking)} 项阻断差异未处理，无法放行")
+
+    conf = db.query(models.LoadingConfirmation).filter(
+        models.LoadingConfirmation.task_id == task_id
+    ).order_by(models.LoadingConfirmation.created_at.desc()).first()
+
+    if not conf:
+        conf = generate_loading_confirmation(db, task_id)
+
+    conf.is_released = True
+    conf.released_by = released_by
+    conf.released_at = datetime.utcnow()
+    conf.release_reason = release_reason
+    conf.status = "confirmed"
+    conf.confirmed_at = datetime.utcnow()
+
+    if task.status != "completed":
+        task.status = "completed"
+        task.completed_at = datetime.utcnow()
+
+    db.commit()
+    db.refresh(conf)
+    return conf
+
+
+def get_loading_confirmation(db: Session, conf_id: int = None, confirmation_no: str = None):
+    if conf_id:
+        return db.query(models.LoadingConfirmation).filter(models.LoadingConfirmation.id == conf_id).first()
+    if confirmation_no:
+        return db.query(models.LoadingConfirmation).filter(models.LoadingConfirmation.confirmation_no == confirmation_no).first()
+    return None
+
+
+def get_latest_confirmation_by_plan(db: Session, plan_id: int):
+    return db.query(models.LoadingConfirmation).filter(
+        models.LoadingConfirmation.plan_id == plan_id,
+        models.LoadingConfirmation.is_valid == True,
+    ).order_by(models.LoadingConfirmation.created_at.desc()).first()
+
+
+def list_loading_confirmations(db: Session, skip: int = 0, limit: int = 100, plan_no: str = None):
+    q = db.query(models.LoadingConfirmation)
+    if plan_no:
+        q = q.filter(models.LoadingConfirmation.plan_no == plan_no)
+    return q.order_by(models.LoadingConfirmation.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def invalidate_reviews_for_outdated_plan(db: Session, plan_id: int, current_hash: str, current_version: int = None):
+    plan = get_packing_plan(db, plan_id=plan_id)
+    if plan is None:
+        return
+
+    eff_version = current_version if current_version is not None else plan.version
+
+    tasks = db.query(models.ReviewTask).filter(
+        models.ReviewTask.plan_id == plan_id,
+        models.ReviewTask.is_valid == True,
+    ).all()
+
+    for task in tasks:
+        hash_mismatch = bool(task.plan_content_hash) and task.plan_content_hash != current_hash
+        version_outdated = (eff_version is not None) and task.plan_version < eff_version
+        if hash_mismatch or version_outdated:
+            task.is_valid = False
+            reasons = []
+            if hash_mismatch:
+                reasons.append("内容哈希不一致")
+            if version_outdated:
+                reasons.append(f"方案版本从v{task.plan_version}升级到v{eff_version}")
+            task.invalid_reason = f"原始装载方案已变更({'，'.join(reasons)})，复核结果自动失效"
+
+            confirmations = db.query(models.LoadingConfirmation).filter(
+                models.LoadingConfirmation.task_id == task.id,
+                models.LoadingConfirmation.is_valid == True,
+            ).all()
+            for conf in confirmations:
+                conf.is_valid = False
+                conf.status = "void"
+
+    db.commit()
+
+
+def create_demo_review_record(db: Session):
+    existing = db.query(models.ReviewTask).filter(
+        models.ReviewTask.is_valid == True
+    ).first()
+    if existing:
+        return
+
+    plans = db.query(models.PackingPlan).all()
+    if not plans:
+        containers = db.query(models.Container).filter(models.Container.is_default == True).all()
+        if not containers:
+            create_default_containers(db)
+            containers = db.query(models.Container).filter(models.Container.is_default == True).all()
+
+        cargos = db.query(models.Cargo).limit(3).all()
+        if len(cargos) < 3:
+            create_demo_temperature_cargos(db)
+            cargos = db.query(models.Cargo).limit(5).all()
+
+        if containers and cargos:
+            from app.packing.algorithm import pack_boxes, Box
+            container = containers[0]
+            boxes = []
+            for cargo in cargos[:3]:
+                raw_temp = getattr(cargo, 'temperature_class', 'AMBIENT') or 'AMBIENT'
+                temp_class = raw_temp.value if hasattr(raw_temp, 'value') else raw_temp
+                qty = min(cargo.quantity, 3)
+                for i in range(qty):
+                    boxes.append(Box(
+                        cargo_id=cargo.id,
+                        cargo_name=cargo.name,
+                        length=cargo.length,
+                        width=cargo.width,
+                        height=cargo.height,
+                        weight=cargo.weight,
+                        can_rotate_horizontal=cargo.can_rotate_horizontal,
+                        can_flip=cargo.can_flip,
+                        max_top_load=cargo.max_top_load,
+                        temperature_class=temp_class
+                    ))
+
+            result = pack_boxes(
+                container_length=container.length,
+                container_width=container.width,
+                container_height=container.height,
+                container_max_weight=container.max_weight,
+                boxes=boxes
+            )
+
+            plan_data = {
+                "container_id": container.id,
+                "container_name": container.name,
+                "total_cargos": len(boxes),
+                "placed_count": len(result["placed_cargos"]),
+                "unplaced_count": len(result["unplaced_cargos"]),
+                "total_weight": result["total_weight"],
+                "volume_utilization": result["volume_utilization"],
+                "cog_x": result["center_of_gravity"]["x"],
+                "cog_y": result["center_of_gravity"]["y"],
+                "cog_z": result["center_of_gravity"]["z"],
+                "cog_within_limit": result["cog_within_limit"],
+                "cog_offset_x_ratio": result["cog_offset_x_ratio"],
+                "cog_offset_y_ratio": result["cog_offset_y_ratio"],
+                "score": 0.0,
+                "rank": 0,
+                "recommendation": "演示方案",
+            }
+            create_packing_plan(db, plan_data, result["placed_cargos"], result["unplaced_cargos"])
+            plans = db.query(models.PackingPlan).all()
+
+    if not plans:
+        return
+
+    plan = plans[0]
+    packed_cargos = get_packed_cargos(db, plan_id=plan.id)
+    if not packed_cargos:
+        return
+
+    from datetime import datetime, timedelta
+
+    task = create_review_task(db, plan.id, created_by="demo_user", remarks="演示复核记录-轻微位置偏差已放行")
+    if not task:
+        return
+
+    task.status = "in_progress"
+    task.started_at = datetime.utcnow() - timedelta(hours=2)
+    db.commit()
+
+    records = get_review_cargo_records(db, task.id)
+    for idx, record in enumerate(records):
+        record.review_status = "confirmed"
+        record.reviewed_by = "demo_reviewer"
+        record.reviewed_at = datetime.utcnow() - timedelta(hours=1, minutes=30) + timedelta(minutes=idx * 5)
+        record.loaded_at = datetime.utcnow() - timedelta(hours=3) + timedelta(minutes=idx * 8)
+        record.actual_load_order = idx + 1
+
+        if idx == 2:
+            offset = 80
+            record.actual_x = record.plan_x + offset
+            record.actual_y = record.plan_y
+            record.actual_z = record.plan_z
+            record.actual_orientation = record.plan_orientation
+            record.remarks = "现场操作时空间不足，轻微偏移"
+        else:
+            record.actual_x = record.plan_x
+            record.actual_y = record.plan_y
+            record.actual_z = record.plan_z
+            record.actual_orientation = record.plan_orientation
+
+    db.commit()
+
+    for record in records:
+        update_cargo_review_record(db, task.id, {
+            "plan_cargo_id": record.plan_cargo_id,
+            "cargo_id": record.cargo_id,
+            "cargo_name": record.cargo_name,
+            "actual_x": record.actual_x,
+            "actual_y": record.actual_y,
+            "actual_z": record.actual_z,
+            "actual_orientation": record.actual_orientation,
+            "actual_load_order": record.actual_load_order,
+            "loaded_at": record.loaded_at.isoformat() if record.loaded_at else None,
+            "review_status": "confirmed",
+            "reviewed_by": "demo_reviewer",
+            "remarks": record.remarks,
+        }, reviewed_by="demo_reviewer")
+
+    discrepancies = get_review_discrepancies(db, task.id)
+    for disc in discrepancies:
+        if disc.severity == "releasable":
+            waive_discrepancy(
+                db, disc.id,
+                waive_reason="偏移量较小，不影响整体装载安全，现场确认可以接受",
+                waived_by="demo_supervisor"
+            )
+
+    complete_review_task(db, task.id)
+    db.refresh(task)
+
 

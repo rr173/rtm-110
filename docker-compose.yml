@@ -6,7 +6,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./stowage.db:/app/stowage.db
+      - .:/app
     environment:
       - DATABASE_URL=sqlite:///./stowage.db
     restart: unless-stopped
