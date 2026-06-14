@@ -1114,74 +1114,169 @@ def _check_orientation_deviation(plan_orient, actual_orient):
 
 
 def _check_pressure_risk(db: Session, task_id: int, cargo_record: models.ReviewCargoRecord):
-    if cargo_record.actual_z is None or cargo_record.actual_z == 0:
+    if cargo_record.actual_z is None or cargo_record.review_status != "confirmed":
         return False, []
 
-    all_records = get_review_cargo_records(db, task_id)
-    risks = []
-    for other in all_records:
-        if other.id == cargo_record.id or other.review_status in ("pending", "missing"):
-            continue
-        if other.actual_x is None or other.actual_y is None or other.actual_z is None:
-            continue
-
-        x_overlap = (
-            abs(cargo_record.actual_x - other.actual_x) <
-            (cargo_record.plan_x and other.plan_x and 500 or 500)
-        )
-        y_overlap = True
-
-        if other.actual_z > cargo_record.actual_z and x_overlap and y_overlap:
-            plan_cargo = db.query(models.PackedCargo).filter(
-                models.PackedCargo.id == cargo_record.plan_cargo_id
-            ).first()
-            max_top_load = plan_cargo.max_top_load if plan_cargo else 0
-            if max_top_load > 0 and other.actual_x and other.actual_y:
-                risks.append({
-                    "top_cargo_id": other.cargo_id,
-                    "top_cargo_name": other.cargo_name,
-                    "pressure_weight_kg": 0,
-                    "max_top_load_kg": max_top_load,
-                    "is_overload": False,
-                })
-
-    return len(risks) > 0, risks
-
-
-def _check_temperature_violation(db: Session, task_id: int, cargo_record: models.ReviewCargoRecord):
     plan_cargo = db.query(models.PackedCargo).filter(
         models.PackedCargo.id == cargo_record.plan_cargo_id
     ).first()
     if not plan_cargo:
         return False, []
 
-    temp_class = getattr(plan_cargo, 'temperature_class', 'AMBIENT') or 'AMBIENT'
-    if temp_class == 'AMBIENT':
-        return False, []
+    my_length = plan_cargo.length or 0
+    my_width = plan_cargo.width or 0
+    my_max_top_load = plan_cargo.max_top_load or 0
+    my_weight = plan_cargo.weight or 0
 
     all_records = get_review_cargo_records(db, task_id)
-    violations = []
+    risks = []
+
     for other in all_records:
-        if other.id == cargo_record.id or other.review_status in ("pending", "missing"):
+        if other.id == cargo_record.id or other.review_status != "confirmed":
             continue
+        if other.actual_z is None or other.actual_x is None or other.actual_y is None:
+            continue
+
         other_plan = db.query(models.PackedCargo).filter(
             models.PackedCargo.id == other.plan_cargo_id
         ).first()
         if not other_plan:
             continue
-        other_temp = getattr(other_plan, 'temperature_class', 'AMBIENT') or 'AMBIENT'
 
-        if temp_class != other_temp and other_temp != 'AMBIENT':
-            if cargo_record.actual_x is not None and other.actual_x is not None:
-                distance = abs(cargo_record.actual_x - other.actual_x)
-                if distance < 500:
-                    violations.append({
-                        "other_cargo_id": other.cargo_id,
-                        "other_cargo_name": other.cargo_name,
-                        "other_temperature_class": other_temp,
-                        "distance_mm": distance,
-                        "min_required_mm": 500,
-                    })
+        other_length = other_plan.length or 0
+        other_width = other_plan.width or 0
+        other_max_top_load = other_plan.max_top_load or 0
+        other_weight = other_plan.weight or 0
+
+        x_overlap = not (cargo_record.actual_x + my_length <= other.actual_x or
+                         other.actual_x + other_length <= cargo_record.actual_x)
+        y_overlap = not (cargo_record.actual_y + my_width <= other.actual_y or
+                         other.actual_y + other_width <= cargo_record.actual_y)
+
+        if not (x_overlap and y_overlap):
+            continue
+
+        i_am_bottom = cargo_record.actual_z < other.actual_z
+        i_am_top = other.actual_z < cargo_record.actual_z
+        same_level = abs(cargo_record.actual_z - other.actual_z) < 10
+
+        if i_am_bottom:
+            if my_max_top_load > 0 and other_weight > my_max_top_load:
+                risks.append({
+                    "bottom_cargo_id": cargo_record.cargo_id,
+                    "bottom_cargo_name": cargo_record.cargo_name,
+                    "top_cargo_id": other.cargo_id,
+                    "top_cargo_name": other.cargo_name,
+                    "top_weight_kg": other_weight,
+                    "max_top_load_kg": my_max_top_load,
+                    "is_overload": True,
+                    "actual_z_bottom": cargo_record.actual_z,
+                    "actual_z_top": other.actual_z,
+                })
+            elif my_max_top_load <= 0 and other_weight > 0:
+                risks.append({
+                    "bottom_cargo_id": cargo_record.cargo_id,
+                    "bottom_cargo_name": cargo_record.cargo_name,
+                    "top_cargo_id": other.cargo_id,
+                    "top_cargo_name": other.cargo_name,
+                    "top_weight_kg": other_weight,
+                    "max_top_load_kg": 0,
+                    "is_overload": True,
+                    "actual_z_bottom": cargo_record.actual_z,
+                    "actual_z_top": other.actual_z,
+                    "note": "底货未设置承压上限，上方有重物压叠",
+                })
+
+        if i_am_top:
+            if other_max_top_load > 0 and my_weight > other_max_top_load:
+                risks.append({
+                    "bottom_cargo_id": other.cargo_id,
+                    "bottom_cargo_name": other.cargo_name,
+                    "top_cargo_id": cargo_record.cargo_id,
+                    "top_cargo_name": cargo_record.cargo_name,
+                    "top_weight_kg": my_weight,
+                    "max_top_load_kg": other_max_top_load,
+                    "is_overload": True,
+                    "actual_z_bottom": other.actual_z,
+                    "actual_z_top": cargo_record.actual_z,
+                })
+            elif other_max_top_load <= 0 and my_weight > 0:
+                risks.append({
+                    "bottom_cargo_id": other.cargo_id,
+                    "bottom_cargo_name": other.cargo_name,
+                    "top_cargo_id": cargo_record.cargo_id,
+                    "top_cargo_name": cargo_record.cargo_name,
+                    "top_weight_kg": my_weight,
+                    "max_top_load_kg": 0,
+                    "is_overload": True,
+                    "actual_z_bottom": other.actual_z,
+                    "actual_z_top": cargo_record.actual_z,
+                    "note": "底货未设置承压上限，上方有重物压叠",
+                })
+
+    return len(risks) > 0, risks
+
+
+def _check_temperature_violation(db: Session, task_id: int, cargo_record: models.ReviewCargoRecord):
+    if cargo_record.review_status != "confirmed":
+        return False, []
+
+    plan_cargo = db.query(models.PackedCargo).filter(
+        models.PackedCargo.id == cargo_record.plan_cargo_id
+    ).first()
+    if not plan_cargo:
+        return False, []
+
+    my_temp = (plan_cargo.temperature_class or "AMBIENT").upper()
+    my_length = plan_cargo.length or 0
+    my_width = plan_cargo.width or 0
+
+    TEMP_PRIORITY = {"FROZEN": 3, "REFRIGERATED": 2, "AMBIENT": 1}
+    my_priority = TEMP_PRIORITY.get(my_temp, 0)
+
+    all_records = get_review_cargo_records(db, task_id)
+    violations = []
+
+    for other in all_records:
+        if other.id == cargo_record.id or other.review_status != "confirmed":
+            continue
+        if other.actual_x is None or other.actual_y is None or other.actual_z is None:
+            continue
+        if cargo_record.actual_x is None or cargo_record.actual_y is None or cargo_record.actual_z is None:
+            continue
+
+        other_plan = db.query(models.PackedCargo).filter(
+            models.PackedCargo.id == other.plan_cargo_id
+        ).first()
+        if not other_plan:
+            continue
+
+        other_temp = (other_plan.temperature_class or "AMBIENT").upper()
+        other_priority = TEMP_PRIORITY.get(other_temp, 0)
+
+        if my_temp == other_temp:
+            continue
+
+        x_overlap = not (cargo_record.actual_x + my_length <= other.actual_x or
+                         other.actual_x + (other_plan.length or 0) <= cargo_record.actual_x)
+        y_overlap = not (cargo_record.actual_y + my_width <= other.actual_y or
+                         other.actual_y + (other_plan.width or 0) <= cargo_record.actual_y)
+        z_close = abs(cargo_record.actual_z - other.actual_z) < max(plan_cargo.height or 0, other_plan.height or 0) + 100
+
+        if x_overlap and y_overlap and z_close:
+            high_temp_name = my_temp if my_priority < other_priority else other_temp
+            low_temp_name = my_temp if my_priority > other_priority else other_temp
+            violations.append({
+                "cargo_id": cargo_record.cargo_id,
+                "cargo_name": cargo_record.cargo_name,
+                "cargo_temperature": my_temp,
+                "other_cargo_id": other.cargo_id,
+                "other_cargo_name": other.cargo_name,
+                "other_temperature": other_temp,
+                "high_temp_class": high_temp_name,
+                "low_temp_class": low_temp_name,
+                "issue": f"{high_temp_name}级货物与{low_temp_name}级货物空间重叠，可能导致温控隔离失效",
+            })
 
     return len(violations) > 0, violations
 
@@ -1301,6 +1396,32 @@ def update_cargo_review_record(
             )
             discrepancies.append(disc)
 
+        has_pressure, pressure_risks = _check_pressure_risk(db, task_id, record)
+        if has_pressure:
+            for risk in pressure_risks:
+                disc = models.ReviewDiscrepancy(
+                    task_id=task_id,
+                    cargo_record_id=record.id,
+                    discrepancy_type="pressure_risk",
+                    severity="blocking",
+                    description=f"承压风险: [{risk['top_cargo_name']}]({risk['top_weight_kg']}kg)压在[{risk['bottom_cargo_name']}]上方(承压上限{risk['max_top_load_kg']}kg)",
+                    details=risk,
+                )
+                discrepancies.append(disc)
+
+        has_temp_violation, temp_violations = _check_temperature_violation(db, task_id, record)
+        if has_temp_violation:
+            for violation in temp_violations:
+                disc = models.ReviewDiscrepancy(
+                    task_id=task_id,
+                    cargo_record_id=record.id,
+                    discrepancy_type="temperature_violation",
+                    severity="blocking",
+                    description=f"温控隔离失效: [{violation['cargo_name']}]({violation['cargo_temperature']})与[{violation['other_cargo_name']}]({violation['other_temperature']})空间重叠",
+                    details=violation,
+                )
+                discrepancies.append(disc)
+
     for disc in discrepancies:
         db.add(disc)
 
@@ -1375,9 +1496,17 @@ def get_review_task_stats(db: Session, task_id: int) -> dict:
 
 
 def can_complete_review(db: Session, task_id: int) -> tuple:
+    records = get_review_cargo_records(db, task_id)
+    pending = [r for r in records if r.review_status == "pending"]
+    if pending:
+        return False, pending
+
     discrepancies = get_review_discrepancies(db, task_id, only_unresolved=True)
     blocking_unresolved = [d for d in discrepancies if d.severity == "blocking"]
-    return len(blocking_unresolved) == 0, blocking_unresolved
+    if blocking_unresolved:
+        return False, blocking_unresolved
+
+    return True, []
 
 
 def complete_review_task(db: Session, task_id: int) -> models.ReviewTask:
@@ -1386,9 +1515,17 @@ def complete_review_task(db: Session, task_id: int) -> models.ReviewTask:
     if not task or not task.is_valid:
         return None
 
-    can_complete, blocking = can_complete_review(db, task_id)
+    records = get_review_cargo_records(db, task_id)
+    pending = [r for r in records if r.review_status == "pending"]
+    if pending:
+        raise ValueError(f"仍有 {len(pending)} 件货物未复核，无法完成复核")
+
+    can_complete, blockers = can_complete_review(db, task_id)
     if not can_complete:
-        raise ValueError(f"仍有 {len(blocking)} 项阻断差异未处理，无法完成复核")
+        blocking_discs = [b for b in blockers if hasattr(b, 'severity') and b.severity == 'blocking']
+        if blocking_discs:
+            raise ValueError(f"仍有 {len(blocking_discs)} 项阻断差异未处理，无法完成复核")
+        raise ValueError(f"存在未处理项，无法完成复核")
 
     task.status = "completed"
     task.completed_at = datetime.utcnow()
