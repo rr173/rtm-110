@@ -291,10 +291,11 @@ def generate_trailer_plan_no() -> str:
     return f"TRAILER-{uuid.uuid4().hex[:8].upper()}"
 
 
-def create_trailer_load_plan(db: Session, plan_data: dict, loaded_boxes: list, unload_sequence: list = None) -> models.TrailerLoadPlan:
+def create_trailer_load_plan(db: Session, plan_data: dict, loaded_boxes: list, unload_sequence: list = None, packing_plan_id: int = None, plan_version: int = None, plan_content_hash: str = None) -> models.TrailerLoadPlan:
     plan_no = generate_trailer_plan_no()
     db_plan = models.TrailerLoadPlan(
         plan_no=plan_no,
+        packing_plan_id=packing_plan_id or plan_data.get("packing_plan_id"),
         trailer_id=plan_data["trailer_id"],
         trailer_name=plan_data["trailer_name"],
         total_boxes=plan_data["total_boxes"],
@@ -309,7 +310,10 @@ def create_trailer_load_plan(db: Session, plan_data: dict, loaded_boxes: list, u
         cog_x=plan_data["cog_x"],
         cog_y=plan_data["cog_y"],
         score=plan_data.get("score", 0.0),
-        recommendation=plan_data.get("recommendation", "")
+        recommendation=plan_data.get("recommendation", ""),
+        plan_version=plan_version or plan_data.get("plan_version"),
+        plan_content_hash=plan_content_hash or plan_data.get("plan_content_hash"),
+        status="valid"
     )
     db.add(db_plan)
     db.flush()
@@ -2566,14 +2570,17 @@ def _collect_downstream_results(db: Session, plan_id: int, plan_version: int) ->
                 "route_id": route.id
             })
 
-    trailer_plans = db.query(models.TrailerLoadPlan).all()
+    trailer_plans = db.query(models.TrailerLoadPlan).filter(
+        models.TrailerLoadPlan.packing_plan_id == plan_id,
+        models.TrailerLoadPlan.status == "valid"
+    ).all()
     for r in trailer_plans:
         results.append({
             "type": "trailer_load",
             "obj": r,
             "id": r.id,
             "no": r.plan_no,
-            "version": plan_version
+            "version": r.plan_version or plan_version
         })
 
     documents = db.query(models.CustomsDocument).filter(
@@ -2911,15 +2918,34 @@ def apply_change(db: Session, draft_id: int, applied_by: str = None, remarks: st
         ).all()
         for route in routes:
             for sc in site_changes:
+                packed_cargo_id = sc.get("packed_cargo_id") or sc.get("cargo_id")
+                new_site_order = sc.get("new_stop_order") or sc.get("new_site_order") or sc.get("site_order")
+                new_unload_sequence = sc.get("new_unload_order") or sc.get("unload_sequence")
+                new_site_code = sc.get("new_site_code") or sc.get("site_code")
+
                 assignments = db.query(models.UnloadingCargoAssignment).filter(
                     models.UnloadingCargoAssignment.route_id == route.id,
-                    models.UnloadingCargoAssignment.packed_cargo_id == sc["packed_cargo_id"]
+                    (models.UnloadingCargoAssignment.packed_cargo_id == packed_cargo_id) |
+                    (models.UnloadingCargoAssignment.cargo_id == packed_cargo_id)
                 ).all()
                 for assign in assignments:
-                    if sc["new_stop_order"] is not None:
-                        assign.stop_order = sc["new_stop_order"]
-                    if sc["new_unload_order"] is not None:
-                        assign.unload_order = sc["new_unload_order"]
+                    if new_site_order is not None:
+                        assign.stop_order = new_site_order
+                    if new_unload_sequence is not None:
+                        assign.unload_order = new_unload_sequence
+
+                packed_cargos = db.query(models.PackedCargo).filter(
+                    models.PackedCargo.plan_id == plan.id,
+                    (models.PackedCargo.id == packed_cargo_id) |
+                    (models.PackedCargo.cargo_id == packed_cargo_id)
+                ).all()
+                for pc in packed_cargos:
+                    if new_site_order is not None:
+                        pc.site_order = new_site_order
+                    if new_unload_sequence is not None:
+                        pc.unload_sequence = new_unload_sequence
+                    if new_site_code is not None:
+                        pc.site_code = new_site_code
 
     bump_plan_version(db, plan.id)
     db.refresh(plan)
@@ -2932,6 +2958,7 @@ def apply_change(db: Session, draft_id: int, applied_by: str = None, remarks: st
         decision = item.impact_decision
         result_type = item.result_type
         result_id = item.result_id
+        version_change_note = f"方案变更(v{current_version}→v{plan.version})：{item.impact_reason}"
 
         if decision == "invalidate":
             if result_type == "review_task":
@@ -2940,7 +2967,7 @@ def apply_change(db: Session, draft_id: int, applied_by: str = None, remarks: st
                 ).first()
                 if task:
                     task.is_valid = False
-                    task.invalid_reason = f"方案变更(v{current_version}→v{plan.version})：{item.impact_reason}"
+                    task.invalid_reason = version_change_note
 
                 confirmations = db.query(models.LoadingConfirmation).filter(
                     models.LoadingConfirmation.task_id == result_id
@@ -2955,18 +2982,77 @@ def apply_change(db: Session, draft_id: int, applied_by: str = None, remarks: st
                 ).first()
                 if doc:
                     doc.status = "outdated"
-                    doc.void_reason = f"方案变更(v{current_version}→v{plan.version})：{item.impact_reason}"
+                    doc.void_reason = version_change_note
                     doc.voided_at = datetime.utcnow()
+
+            elif result_type == "stowage_report":
+                report = db.query(models.StowageReport).filter(
+                    models.StowageReport.id == result_id
+                ).first()
+                if report:
+                    report.status = "void"
+                    report.void_reason = version_change_note
+
+            elif result_type == "compliance_audit":
+                audit = db.query(models.ComplianceAudit).filter(
+                    models.ComplianceAudit.id == result_id
+                ).first()
+                if audit:
+                    audit.status = "void"
+                    audit.void_reason = version_change_note
+
+            elif result_type == "trailer_load":
+                trailer = db.query(models.TrailerLoadPlan).filter(
+                    models.TrailerLoadPlan.id == result_id
+                ).first()
+                if trailer:
+                    trailer.status = "void"
 
         elif decision == "rerun":
             if result_type == "compliance_audit":
-                pass
+                audit = db.query(models.ComplianceAudit).filter(
+                    models.ComplianceAudit.id == result_id
+                ).first()
+                if audit:
+                    audit.status = "outdated"
+                    audit.void_reason = version_change_note
+
+            elif result_type == "stowage_report":
+                report = db.query(models.StowageReport).filter(
+                    models.StowageReport.id == result_id
+                ).first()
+                if report:
+                    report.status = "outdated"
+                    report.void_reason = version_change_note
+
             elif result_type == "unloading_route":
+                route = db.query(models.UnloadingRoute).filter(
+                    models.UnloadingRoute.id == result_id
+                ).first()
+                if route and hasattr(route, 'status'):
+                    route.status = "outdated"
                 simulations = db.query(models.UnloadingSimulation).filter(
                     models.UnloadingSimulation.route_id == result_id
                 ).all()
                 for sim in simulations:
-                    sim.status = "outdated" if hasattr(sim, 'status') else sim.status
+                    if hasattr(sim, 'status'):
+                        sim.status = "outdated"
+
+            elif result_type == "trailer_load":
+                trailer = db.query(models.TrailerLoadPlan).filter(
+                    models.TrailerLoadPlan.id == result_id
+                ).first()
+                if trailer:
+                    trailer.status = "outdated"
+
+            elif result_type == "customs_document":
+                doc = db.query(models.CustomsDocument).filter(
+                    models.CustomsDocument.id == result_id
+                ).first()
+                if doc:
+                    doc.status = "outdated"
+                    doc.void_reason = version_change_note
+                    doc.voided_at = datetime.utcnow()
 
     draft.status = "applied"
     draft.applied_at = datetime.utcnow()

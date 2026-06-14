@@ -131,6 +131,7 @@ class TrailerLoadPlan(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     plan_no = Column(String, unique=True, index=True)
+    packing_plan_id = Column(Integer, ForeignKey("packing_plans.id"), nullable=True, comment="关联的配载方案ID")
     trailer_id = Column(Integer, ForeignKey("trailers.id"))
     trailer_name = Column(String)
     total_boxes = Column(Integer)
@@ -147,9 +148,13 @@ class TrailerLoadPlan(Base):
     score = Column(Float, default=0.0)
     recommendation = Column(Text, default="")
     created_at = Column(DateTime, server_default=func.now())
+    plan_version = Column(Integer, comment="关联的配载方案版本")
+    plan_content_hash = Column(String, nullable=True, comment="关联的配载方案内容哈希")
+    status = Column(String, default="valid", comment="状态: valid有效/outdated已过期/void已作废")
 
     loaded_boxes = relationship("TrailerLoadedBox", back_populates="plan", cascade="all, delete-orphan")
     unload_sequence = relationship("UnloadStep", back_populates="plan", cascade="all, delete-orphan")
+    packing_plan = relationship("PackingPlan")
 
 
 class TrailerLoadedBox(Base):
@@ -223,6 +228,8 @@ class ComplianceAudit(Base):
     audit_details = Column(JSON, default=dict, comment="完整审计报告")
     auditor = Column(String, nullable=True, comment="审计员")
     audited_at = Column(DateTime, server_default=func.now())
+    status = Column(String, default="valid", comment="状态: valid有效/outdated已过期/void已作废")
+    void_reason = Column(String, nullable=True, comment="作废/过期原因")
     remarks = Column(Text, nullable=True)
 
     plan = relationship("PackingPlan", back_populates="compliance_audits")
@@ -298,6 +305,7 @@ class StowageReport(Base):
     plan_id = Column(Integer, ForeignKey("packing_plans.id"))
     plan_no = Column(String, index=True, comment="关联方案编号")
     plan_version = Column(Integer, comment="关联方案版本")
+    plan_content_hash = Column(String, nullable=True, comment="关联的方案内容哈希")
     total_cargos = Column(Integer, comment="货物总数")
     flipped_count = Column(Integer, default=0, comment="被翻转的货物数量")
     warning_count = Column(Integer, default=0, comment="承压预警货物数量")
@@ -305,6 +313,8 @@ class StowageReport(Base):
     health_score = Column(Float, default=0.0, comment="堆码健康度评分(0-100)")
     report_data = Column(JSON, default=dict, comment="完整报告数据(JSON)")
     summary = Column(JSON, default=dict, comment="摘要数据")
+    status = Column(String, default="valid", comment="状态: valid有效/outdated已过期/void已作废")
+    void_reason = Column(String, nullable=True, comment="作废/过期原因")
     created_at = Column(DateTime, server_default=func.now())
 
     plan = relationship("PackingPlan")
