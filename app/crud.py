@@ -1825,3 +1825,413 @@ def create_demo_review_record(db: Session):
     db.refresh(task)
 
 
+def generate_unloading_route_no() -> str:
+    return f"ROUTE-{uuid.uuid4().hex[:8].upper()}"
+
+
+def generate_simulation_no() -> str:
+    return f"SIM-{uuid.uuid4().hex[:8].upper()}"
+
+
+def get_unloading_route(db: Session, route_id: int = None, route_no: str = None):
+    if route_id:
+        return db.query(models.UnloadingRoute).filter(models.UnloadingRoute.id == route_id).first()
+    if route_no:
+        return db.query(models.UnloadingRoute).filter(models.UnloadingRoute.route_no == route_no).first()
+    return None
+
+
+def get_unloading_routes(db: Session, plan_id: int = None, skip: int = 0, limit: int = 100) -> list:
+    q = db.query(models.UnloadingRoute)
+    if plan_id:
+        q = q.filter(models.UnloadingRoute.plan_id == plan_id)
+    return q.order_by(models.UnloadingRoute.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def create_unloading_route(
+    db: Session,
+    plan_id: int,
+    plan_no: str,
+    name: str,
+    description: str = None,
+    created_by: str = None,
+    stops: list = None,
+    cargo_assignments: list = None
+) -> models.UnloadingRoute:
+    route_no = generate_unloading_route_no()
+    db_route = models.UnloadingRoute(
+        route_no=route_no,
+        plan_id=plan_id,
+        plan_no=plan_no,
+        name=name,
+        description=description,
+        created_by=created_by
+    )
+    db.add(db_route)
+    db.flush()
+
+    stop_id_map = {}
+    if stops:
+        sorted_stops = sorted(stops, key=lambda s: s["stop_order"])
+        for stop_data in sorted_stops:
+            db_stop = models.UnloadingRouteStop(
+                route_id=db_route.id,
+                stop_order=stop_data["stop_order"],
+                stop_name=stop_data["stop_name"],
+                stop_code=stop_data.get("stop_code"),
+                contact_person=stop_data.get("contact_person"),
+                contact_phone=stop_data.get("contact_phone"),
+                address=stop_data.get("address")
+            )
+            db.add(db_stop)
+            db.flush()
+            stop_id_map[stop_data["stop_order"]] = db_stop.id
+
+    if cargo_assignments:
+        for assignment_data in cargo_assignments:
+            stop_order = assignment_data["stop_order"]
+            stop_id = stop_id_map.get(stop_order)
+            if stop_id is None:
+                continue
+            db_assignment = models.UnloadingCargoAssignment(
+                route_id=db_route.id,
+                packed_cargo_id=assignment_data["packed_cargo_id"],
+                cargo_id=assignment_data["cargo_id"],
+                cargo_name=assignment_data["cargo_name"],
+                stop_id=stop_id,
+                stop_order=stop_order,
+                unload_order=assignment_data["unload_order"]
+            )
+            db.add(db_assignment)
+
+    db.commit()
+    db.refresh(db_route)
+    return db_route
+
+
+def update_unloading_route(
+    db: Session,
+    route_id: int,
+    name: str = None,
+    description: str = None,
+    stops: list = None,
+    cargo_assignments: list = None
+) -> models.UnloadingRoute:
+    route = get_unloading_route(db, route_id=route_id)
+    if not route:
+        return None
+
+    if name is not None:
+        route.name = name
+    if description is not None:
+        route.description = description
+
+    if stops is not None:
+        db.query(models.UnloadingRouteStop).filter(
+            models.UnloadingRouteStop.route_id == route_id
+        ).delete()
+
+        stop_id_map = {}
+        sorted_stops = sorted(stops, key=lambda s: s["stop_order"])
+        for stop_data in sorted_stops:
+            db_stop = models.UnloadingRouteStop(
+                route_id=route_id,
+                stop_order=stop_data["stop_order"],
+                stop_name=stop_data["stop_name"],
+                stop_code=stop_data.get("stop_code"),
+                contact_person=stop_data.get("contact_person"),
+                contact_phone=stop_data.get("contact_phone"),
+                address=stop_data.get("address")
+            )
+            db.add(db_stop)
+            db.flush()
+            stop_id_map[stop_data["stop_order"]] = db_stop.id
+
+        if cargo_assignments is not None:
+            db.query(models.UnloadingCargoAssignment).filter(
+                models.UnloadingCargoAssignment.route_id == route_id
+            ).delete()
+
+            for assignment_data in cargo_assignments:
+                stop_order = assignment_data["stop_order"]
+                stop_id = stop_id_map.get(stop_order)
+                if stop_id is None:
+                    continue
+                db_assignment = models.UnloadingCargoAssignment(
+                    route_id=route_id,
+                    packed_cargo_id=assignment_data["packed_cargo_id"],
+                    cargo_id=assignment_data["cargo_id"],
+                    cargo_name=assignment_data["cargo_name"],
+                    stop_id=stop_id,
+                    stop_order=stop_order,
+                    unload_order=assignment_data["unload_order"]
+                )
+                db.add(db_assignment)
+
+    db.commit()
+    db.refresh(route)
+    return route
+
+
+def delete_unloading_route(db: Session, route_id: int = None, route_no: str = None):
+    route = get_unloading_route(db, route_id=route_id, route_no=route_no)
+    if route:
+        db.delete(route)
+        db.commit()
+    return route
+
+
+def get_route_stops(db: Session, route_id: int) -> list:
+    return db.query(models.UnloadingRouteStop).filter(
+        models.UnloadingRouteStop.route_id == route_id
+    ).order_by(models.UnloadingRouteStop.stop_order).all()
+
+
+def get_route_cargo_assignments(db: Session, route_id: int) -> list:
+    return db.query(models.UnloadingCargoAssignment).filter(
+        models.UnloadingCargoAssignment.route_id == route_id
+    ).all()
+
+
+def get_unloading_simulation(db: Session, simulation_id: int = None, simulation_no: str = None):
+    if simulation_id:
+        return db.query(models.UnloadingSimulation).filter(models.UnloadingSimulation.id == simulation_id).first()
+    if simulation_no:
+        return db.query(models.UnloadingSimulation).filter(models.UnloadingSimulation.simulation_no == simulation_no).first()
+    return None
+
+
+def get_unloading_simulations(db: Session, route_id: int = None, skip: int = 0, limit: int = 100) -> list:
+    q = db.query(models.UnloadingSimulation)
+    if route_id:
+        q = q.filter(models.UnloadingSimulation.route_id == route_id)
+    return q.order_by(models.UnloadingSimulation.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def get_latest_simulation_by_route(db: Session, route_id: int):
+    return db.query(models.UnloadingSimulation).filter(
+        models.UnloadingSimulation.route_id == route_id
+    ).order_by(models.UnloadingSimulation.created_at.desc()).first()
+
+
+def get_simulation_stop_results(db: Session, simulation_id: int) -> list:
+    return db.query(models.UnloadingStopResult).filter(
+        models.UnloadingStopResult.simulation_id == simulation_id
+    ).order_by(models.UnloadingStopResult.stop_order).all()
+
+
+def create_unloading_simulation(
+    db: Session,
+    route: models.UnloadingRoute,
+    simulation_result
+) -> models.UnloadingSimulation:
+    from app.unloading_simulation_engine import SimulationResult
+
+    simulation_no = generate_simulation_no()
+
+    worst_stop_id = None
+    if simulation_result.worst_stop_order is not None:
+        for stop in route.stops:
+            if stop.stop_order == simulation_result.worst_stop_order:
+                worst_stop_id = stop.id
+                break
+
+    deadlock_stop_id = None
+    if simulation_result.deadlock_stop_order is not None:
+        for stop in route.stops:
+            if stop.stop_order == simulation_result.deadlock_stop_order:
+                deadlock_stop_id = stop.id
+                break
+
+    status = "deadlock" if simulation_result.has_deadlock else "completed"
+
+    db_simulation = models.UnloadingSimulation(
+        simulation_no=simulation_no,
+        route_id=route.id,
+        route_no=route.route_no,
+        status=status,
+        total_stops=simulation_result.total_stops,
+        total_cargos=simulation_result.total_cargos,
+        total_rehandle_count=simulation_result.total_rehandle_count,
+        worst_stop_id=worst_stop_id,
+        worst_stop_order=simulation_result.worst_stop_order,
+        worst_stop_rehandle_count=simulation_result.worst_stop_rehandle_count,
+        has_deadlock=simulation_result.has_deadlock,
+        deadlock_stop_id=deadlock_stop_id,
+        deadlock_stop_order=simulation_result.deadlock_stop_order,
+        deadlock_cargo_ids=simulation_result.deadlock_cargo_ids,
+        poorly_stacked_cargo_ids=simulation_result.poorly_stacked_cargo_ids,
+        simulation_data={}
+    )
+    db.add(db_simulation)
+    db.flush()
+
+    for stop_result in simulation_result.stop_results:
+        moves_data = []
+        for move in stop_result.moves:
+            moves_data.append({
+                "move_type": move.move_type,
+                "packed_cargo_id": move.packed_cargo_id,
+                "cargo_id": move.cargo_id,
+                "cargo_name": move.cargo_name,
+                "stop_order": move.stop_order,
+                "move_sequence": move.move_sequence,
+                "reason": move.reason
+            })
+
+        db_stop_result = models.UnloadingStopResult(
+            simulation_id=db_simulation.id,
+            stop_id=stop_result.stop_id,
+            stop_order=stop_result.stop_order,
+            stop_name=stop_result.stop_name,
+            rehandle_count=stop_result.rehandle_count,
+            unload_count=stop_result.unload_count,
+            remaining_count=stop_result.remaining_count,
+            has_deadlock=stop_result.has_deadlock,
+            deadlock_cargo_ids=stop_result.deadlock_cargo_ids,
+            moves=moves_data,
+            remaining_cargos_state=stop_result.remaining_cargos_state
+        )
+        db.add(db_stop_result)
+
+    db.commit()
+    db.refresh(db_simulation)
+    return db_simulation
+
+
+def create_demo_unloading_routes(db: Session):
+    existing_routes = db.query(models.UnloadingRoute).all()
+    if existing_routes:
+        return
+
+    plans = db.query(models.PackingPlan).all()
+    if not plans:
+        create_demo_review_record(db)
+        plans = db.query(models.PackingPlan).all()
+
+    if not plans:
+        return
+
+    plan = plans[0]
+    packed_cargos = get_packed_cargos(db, plan_id=plan.id)
+    if not packed_cargos or len(packed_cargos) < 3:
+        return
+
+    stops_data = [
+        {"stop_order": 1, "stop_name": "北京配送中心", "stop_code": "BJ-001", "contact_person": "张经理", "contact_phone": "13800138001", "address": "北京市朝阳区建国路88号"},
+        {"stop_order": 2, "stop_name": "天津分拨中心", "stop_code": "TJ-002", "contact_person": "李主管", "contact_phone": "13800138002", "address": "天津市滨海新区天津港"},
+        {"stop_order": 3, "stop_name": "济南仓库", "stop_code": "JN-003", "contact_person": "王组长", "contact_phone": "13800138003", "address": "济南市历城区工业北路"},
+    ]
+
+    import math
+    cargo_count = len(packed_cargos)
+    assignments_data = []
+    for idx, pc in enumerate(packed_cargos):
+        stop_order = (idx % 3) + 1
+        unload_order = (idx // 3) + 1
+        assignments_data.append({
+            "packed_cargo_id": pc.id,
+            "cargo_id": pc.cargo_id,
+            "cargo_name": pc.cargo_name,
+            "stop_order": stop_order,
+            "unload_order": unload_order
+        })
+
+    route1 = create_unloading_route(
+        db,
+        plan_id=plan.id,
+        plan_no=plan.plan_no,
+        name="华北配送路线-A线",
+        description="北京-天津-济南常规配送路线，按城市顺序卸货",
+        created_by="demo_user",
+        stops=stops_data,
+        cargo_assignments=assignments_data
+    )
+
+    stops_data2 = [
+        {"stop_order": 1, "stop_name": "济南仓库", "stop_code": "JN-003", "contact_person": "王组长", "contact_phone": "13800138003", "address": "济南市历城区工业北路"},
+        {"stop_order": 2, "stop_name": "天津分拨中心", "stop_code": "TJ-002", "contact_person": "李主管", "contact_phone": "13800138002", "address": "天津市滨海新区天津港"},
+        {"stop_order": 3, "stop_name": "北京配送中心", "stop_code": "BJ-001", "contact_person": "张经理", "contact_phone": "13800138001", "address": "北京市朝阳区建国路88号"},
+    ]
+
+    assignments_data2 = []
+    for idx, pc in enumerate(packed_cargos):
+        stop_order = 3 - (idx % 3)
+        unload_order = (idx // 3) + 1
+        assignments_data2.append({
+            "packed_cargo_id": pc.id,
+            "cargo_id": pc.cargo_id,
+            "cargo_name": pc.cargo_name,
+            "stop_order": stop_order,
+            "unload_order": unload_order
+        })
+
+    route2 = create_unloading_route(
+        db,
+        plan_id=plan.id,
+        plan_no=plan.plan_no,
+        name="华北配送路线-B线",
+        description="济南-天津-北京反向配送路线，优化行驶里程",
+        created_by="demo_user",
+        stops=stops_data2,
+        cargo_assignments=assignments_data2
+    )
+
+    from app.unloading_simulation_engine import run_unloading_simulation
+
+    stops_list1 = []
+    for s in route1.stops:
+        stops_list1.append({
+            "id": s.id,
+            "stop_order": s.stop_order,
+            "stop_name": s.stop_name,
+            "stop_code": s.stop_code
+        })
+
+    assignments_list1 = []
+    for a in route1.cargo_assignments:
+        assignments_list1.append({
+            "packed_cargo_id": a.packed_cargo_id,
+            "stop_order": a.stop_order,
+            "unload_order": a.unload_order
+        })
+
+    packed_cargos_list = []
+    for pc in packed_cargos:
+        packed_cargos_list.append({
+            "id": pc.id,
+            "cargo_id": pc.cargo_id,
+            "cargo_name": pc.cargo_name,
+            "x": pc.x,
+            "y": pc.y,
+            "z": pc.z,
+            "length": pc.length,
+            "width": pc.width,
+            "height": pc.height,
+            "weight": pc.weight
+        })
+
+    sim_result1 = run_unloading_simulation(packed_cargos_list, stops_list1, assignments_list1)
+    create_unloading_simulation(db, route1, sim_result1)
+
+    stops_list2 = []
+    for s in route2.stops:
+        stops_list2.append({
+            "id": s.id,
+            "stop_order": s.stop_order,
+            "stop_name": s.stop_name,
+            "stop_code": s.stop_code
+        })
+
+    assignments_list2 = []
+    for a in route2.cargo_assignments:
+        assignments_list2.append({
+            "packed_cargo_id": a.packed_cargo_id,
+            "stop_order": a.stop_order,
+            "unload_order": a.unload_order
+        })
+
+    sim_result2 = run_unloading_simulation(packed_cargos_list, stops_list2, assignments_list2)
+    create_unloading_simulation(db, route2, sim_result2)
+
+

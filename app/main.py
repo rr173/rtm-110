@@ -22,6 +22,7 @@ from app.compliance_engine import (
     generate_packing_list_content,
     generate_clc_content,
 )
+from app.unloading_simulation_engine import run_unloading_simulation
 
 Base.metadata.create_all(bind=engine)
 
@@ -47,6 +48,7 @@ def startup_event():
     crud.create_demo_temperature_cargos(db)
     crud.init_plan_hash_and_version(db)
     crud.create_demo_review_record(db)
+    crud.create_demo_unloading_routes(db)
 
 
 @app.get("/")
@@ -2067,4 +2069,516 @@ def get_plan_latest_release(
             "created_at": task.created_at.isoformat() if task.created_at else None,
         } if task else None,
     }
+
+
+def _resolve_unloading_route(route_identifier: str, db: Session):
+    route = None
+    if route_identifier.isdigit():
+        route = crud.get_unloading_route(db, route_id=int(route_identifier))
+    if route is None:
+        route = crud.get_unloading_route(db, route_no=route_identifier)
+    return route
+
+
+def _validate_cargo_assignments(packed_cargos: list, stops: list, cargo_assignments: list):
+    packed_ids = {pc.id for pc in packed_cargos}
+    stop_orders = {s["stop_order"] for s in stops}
+
+    assigned_packed_ids = set()
+    for assignment in cargo_assignments:
+        packed_id = assignment["packed_cargo_id"]
+        if packed_id not in packed_ids:
+            raise ValueError(f"货物分配引用了不存在的 packed_cargo_id: {packed_id}")
+        if packed_id in assigned_packed_ids:
+            raise ValueError(f"packed_cargo_id {packed_id} 被重复分配")
+        assigned_packed_ids.add(packed_id)
+
+        stop_order = assignment["stop_order"]
+        if stop_order not in stop_orders:
+            raise ValueError(f"货物分配引用了不存在的站点顺序: {stop_order}")
+
+    unassigned = packed_ids - assigned_packed_ids
+    if unassigned:
+        raise ValueError(f"有 {len(unassigned)} 件货物未分配站点: {sorted(unassigned)[:5]}...")
+
+
+@app.post("/unloading/routes", response_model=schemas.UnloadingRoute)
+def create_unloading_route(
+    request: schemas.UnloadingRouteCreate,
+    db: Session = Depends(get_db)
+):
+    plan = None
+    if request.plan_identifier.isdigit():
+        plan = crud.get_packing_plan(db, plan_id=int(request.plan_identifier))
+    if plan is None:
+        plan = crud.get_packing_plan(db, plan_no=request.plan_identifier)
+
+    if plan is None:
+        raise HTTPException(status_code=404, detail="配载方案不存在")
+
+    packed_cargos = crud.get_packed_cargos(db, plan_id=plan.id)
+    if not packed_cargos:
+        raise HTTPException(status_code=400, detail="配载方案中没有已装载的货物")
+
+    try:
+        _validate_cargo_assignments(packed_cargos, request.stops, request.cargo_assignments)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    stops_data = [s.model_dump() for s in request.stops]
+    assignments_data = [a.model_dump() for a in request.cargo_assignments]
+
+    route = crud.create_unloading_route(
+        db,
+        plan_id=plan.id,
+        plan_no=plan.plan_no,
+        name=request.name,
+        description=request.description,
+        created_by=request.created_by,
+        stops=stops_data,
+        cargo_assignments=assignments_data
+    )
+
+    return get_unloading_route_detail(route_identifier=str(route.id), db=db)
+
+
+@app.get("/unloading/routes", response_model=List[schemas.UnloadingRouteSummary])
+def list_unloading_routes(
+    plan_identifier: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    plan_id = None
+    if plan_identifier:
+        plan = None
+        if plan_identifier.isdigit():
+            plan = crud.get_packing_plan(db, plan_id=int(plan_identifier))
+        if plan is None:
+            plan = crud.get_packing_plan(db, plan_no=plan_identifier)
+        if plan is None:
+            raise HTTPException(status_code=404, detail="配载方案不存在")
+        plan_id = plan.id
+
+    routes = crud.get_unloading_routes(db, plan_id=plan_id, skip=skip, limit=limit)
+    result = []
+    for route in routes:
+        stops = crud.get_route_stops(db, route_id=route.id)
+        assignments = crud.get_route_cargo_assignments(db, route_id=route.id)
+        simulations = crud.get_unloading_simulations(db, route_id=route.id)
+        result.append({
+            "id": route.id,
+            "route_no": route.route_no,
+            "plan_id": route.plan_id,
+            "plan_no": route.plan_no,
+            "name": route.name,
+            "description": route.description,
+            "created_by": route.created_by,
+            "created_at": route.created_at.isoformat() if route.created_at else "",
+            "total_stops": len(stops),
+            "total_cargos": len(assignments),
+            "simulation_count": len(simulations)
+        })
+    return result
+
+
+@app.get("/unloading/routes/{route_identifier}", response_model=schemas.UnloadingRoute)
+def get_unloading_route_detail(
+    route_identifier: str,
+    db: Session = Depends(get_db)
+):
+    route = _resolve_unloading_route(route_identifier, db)
+    if route is None:
+        raise HTTPException(status_code=404, detail="路线不存在")
+
+    stops = crud.get_route_stops(db, route_id=route.id)
+    assignments = crud.get_route_cargo_assignments(db, route_id=route.id)
+
+    stops_list = []
+    for s in stops:
+        stops_list.append({
+            "id": s.id,
+            "route_id": s.route_id,
+            "stop_order": s.stop_order,
+            "stop_name": s.stop_name,
+            "stop_code": s.stop_code,
+            "contact_person": s.contact_person,
+            "contact_phone": s.contact_phone,
+            "address": s.address
+        })
+
+    assignments_list = []
+    for a in assignments:
+        assignments_list.append({
+            "id": a.id,
+            "route_id": a.route_id,
+            "packed_cargo_id": a.packed_cargo_id,
+            "cargo_id": a.cargo_id,
+            "cargo_name": a.cargo_name,
+            "stop_id": a.stop_id,
+            "stop_order": a.stop_order,
+            "unload_order": a.unload_order
+        })
+
+    return {
+        "id": route.id,
+        "route_no": route.route_no,
+        "plan_id": route.plan_id,
+        "plan_no": route.plan_no,
+        "name": route.name,
+        "description": route.description,
+        "created_by": route.created_by,
+        "created_at": route.created_at.isoformat() if route.created_at else "",
+        "stops": stops_list,
+        "cargo_assignments": assignments_list
+    }
+
+
+@app.put("/unloading/routes/{route_identifier}", response_model=schemas.UnloadingRoute)
+def update_unloading_route(
+    route_identifier: str,
+    request: schemas.UnloadingRouteUpdate,
+    db: Session = Depends(get_db)
+):
+    route = _resolve_unloading_route(route_identifier, db)
+    if route is None:
+        raise HTTPException(status_code=404, detail="路线不存在")
+
+    stops_data = None
+    assignments_data = None
+
+    if request.stops is not None:
+        plan = crud.get_packing_plan(db, plan_id=route.plan_id)
+        packed_cargos = crud.get_packed_cargos(db, plan_id=route.plan_id)
+        if not packed_cargos:
+            raise HTTPException(status_code=400, detail="配载方案中没有已装载的货物")
+
+        assignments_for_validation = request.cargo_assignments if request.cargo_assignments is not None else [
+            {
+                "packed_cargo_id": a.packed_cargo_id,
+                "cargo_id": a.cargo_id,
+                "cargo_name": a.cargo_name,
+                "stop_order": a.stop_order,
+                "unload_order": a.unload_order
+            }
+            for a in route.cargo_assignments
+        ]
+
+        try:
+            _validate_cargo_assignments(
+                packed_cargos,
+                [s.model_dump() for s in request.stops],
+                assignments_for_validation
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        stops_data = [s.model_dump() for s in request.stops]
+
+    if request.cargo_assignments is not None:
+        assignments_data = [a.model_dump() for a in request.cargo_assignments]
+
+    updated_route = crud.update_unloading_route(
+        db,
+        route_id=route.id,
+        name=request.name,
+        description=request.description,
+        stops=stops_data,
+        cargo_assignments=assignments_data
+    )
+
+    return get_unloading_route_detail(route_identifier=str(updated_route.id), db=db)
+
+
+@app.delete("/unloading/routes/{route_identifier}")
+def delete_unloading_route(
+    route_identifier: str,
+    db: Session = Depends(get_db)
+):
+    route = crud.delete_unloading_route(db, route_identifier if not route_identifier.isdigit() else None,
+                                       int(route_identifier) if route_identifier.isdigit() else None)
+    if route is None:
+        raise HTTPException(status_code=404, detail="路线不存在")
+    return {"message": "删除成功", "route_no": route.route_no}
+
+
+@app.post("/unloading/simulations", response_model=schemas.UnloadingSimulationDetail)
+def run_unloading_simulation_api(
+    request: schemas.UnloadingSimulationCreate,
+    db: Session = Depends(get_db)
+):
+    route = _resolve_unloading_route(request.route_identifier, db)
+    if route is None:
+        raise HTTPException(status_code=404, detail="路线不存在")
+
+    plan = crud.get_packing_plan(db, plan_id=route.plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="关联的配载方案不存在")
+
+    packed_cargos_db = crud.get_packed_cargos(db, plan_id=plan.id)
+    if not packed_cargos_db:
+        raise HTTPException(status_code=400, detail="配载方案中没有已装载的货物")
+
+    packed_cargos_list = []
+    for pc in packed_cargos_db:
+        packed_cargos_list.append({
+            "id": pc.id,
+            "cargo_id": pc.cargo_id,
+            "cargo_name": pc.cargo_name,
+            "x": pc.x,
+            "y": pc.y,
+            "z": pc.z,
+            "length": pc.length,
+            "width": pc.width,
+            "height": pc.height,
+            "weight": pc.weight
+        })
+
+    stops_list = []
+    for s in route.stops:
+        stops_list.append({
+            "id": s.id,
+            "stop_order": s.stop_order,
+            "stop_name": s.stop_name,
+            "stop_code": s.stop_code
+        })
+
+    assignments_list = []
+    for a in route.cargo_assignments:
+        assignments_list.append({
+            "packed_cargo_id": a.packed_cargo_id,
+            "stop_order": a.stop_order,
+            "unload_order": a.unload_order
+        })
+
+    sim_result = run_unloading_simulation(
+        packed_cargos_list,
+        stops_list,
+        assignments_list
+    )
+
+    db_simulation = crud.create_unloading_simulation(db, route, sim_result)
+
+    return get_simulation_detail(simulation_identifier=str(db_simulation.id), db=db)
+
+
+@app.get("/unloading/simulations", response_model=List[schemas.UnloadingSimulationSummary])
+def list_unloading_simulations(
+    route_identifier: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    route_id = None
+    if route_identifier:
+        route = _resolve_unloading_route(route_identifier, db)
+        if route is None:
+            raise HTTPException(status_code=404, detail="路线不存在")
+        route_id = route.id
+
+    simulations = crud.get_unloading_simulations(db, route_id=route_id, skip=skip, limit=limit)
+    result = []
+    for sim in simulations:
+        route = crud.get_unloading_route(db, route_id=sim.route_id)
+        worst_stop_name = None
+        deadlock_stop_name = None
+        if sim.worst_stop_id:
+            worst_stop = db.query(models.UnloadingRouteStop).filter(
+                models.UnloadingRouteStop.id == sim.worst_stop_id
+            ).first()
+            if worst_stop:
+                worst_stop_name = worst_stop.stop_name
+        if sim.deadlock_stop_id:
+            deadlock_stop = db.query(models.UnloadingRouteStop).filter(
+                models.UnloadingRouteStop.id == sim.deadlock_stop_id
+            ).first()
+            if deadlock_stop:
+                deadlock_stop_name = deadlock_stop.stop_name
+
+        result.append({
+            "id": sim.id,
+            "simulation_no": sim.simulation_no,
+            "route_id": sim.route_id,
+            "route_no": sim.route_no,
+            "route_name": route.name if route else "",
+            "status": sim.status,
+            "total_stops": sim.total_stops,
+            "total_cargos": sim.total_cargos,
+            "total_rehandle_count": sim.total_rehandle_count,
+            "worst_stop_order": sim.worst_stop_order,
+            "worst_stop_name": worst_stop_name,
+            "worst_stop_rehandle_count": sim.worst_stop_rehandle_count,
+            "has_deadlock": sim.has_deadlock,
+            "deadlock_stop_order": sim.deadlock_stop_order,
+            "deadlock_stop_name": deadlock_stop_name,
+            "created_at": sim.created_at.isoformat() if sim.created_at else ""
+        })
+    return result
+
+
+@app.get("/unloading/simulations/{simulation_identifier}", response_model=schemas.UnloadingSimulationDetail)
+def get_simulation_detail(
+    simulation_identifier: str,
+    db: Session = Depends(get_db)
+):
+    simulation = None
+    if simulation_identifier.isdigit():
+        simulation = crud.get_unloading_simulation(db, simulation_id=int(simulation_identifier))
+    if simulation is None:
+        simulation = crud.get_unloading_simulation(db, simulation_no=simulation_identifier)
+
+    if simulation is None:
+        raise HTTPException(status_code=404, detail="推演记录不存在")
+
+    stop_results = crud.get_simulation_stop_results(db, simulation_id=simulation.id)
+
+    stop_results_list = []
+    for sr in stop_results:
+        moves_list = []
+        for move in (sr.moves or []):
+            moves_list.append({
+                "move_type": move["move_type"],
+                "packed_cargo_id": move["packed_cargo_id"],
+                "cargo_id": move["cargo_id"],
+                "cargo_name": move["cargo_name"],
+                "stop_order": move["stop_order"],
+                "move_sequence": move["move_sequence"],
+                "reason": move.get("reason")
+            })
+
+        stop_results_list.append({
+            "id": sr.id,
+            "simulation_id": sr.simulation_id,
+            "stop_id": sr.stop_id,
+            "stop_order": sr.stop_order,
+            "stop_name": sr.stop_name,
+            "rehandle_count": sr.rehandle_count,
+            "unload_count": sr.unload_count,
+            "remaining_count": sr.remaining_count,
+            "has_deadlock": sr.has_deadlock,
+            "deadlock_cargo_ids": sr.deadlock_cargo_ids or [],
+            "moves": moves_list,
+            "remaining_cargos_state": sr.remaining_cargos_state or []
+        })
+
+    return {
+        "id": simulation.id,
+        "simulation_no": simulation.simulation_no,
+        "route_id": simulation.route_id,
+        "route_no": simulation.route_no,
+        "status": simulation.status,
+        "total_stops": simulation.total_stops,
+        "total_cargos": simulation.total_cargos,
+        "total_rehandle_count": simulation.total_rehandle_count,
+        "worst_stop_id": simulation.worst_stop_id,
+        "worst_stop_order": simulation.worst_stop_order,
+        "worst_stop_rehandle_count": simulation.worst_stop_rehandle_count,
+        "has_deadlock": simulation.has_deadlock,
+        "deadlock_stop_id": simulation.deadlock_stop_id,
+        "deadlock_stop_order": simulation.deadlock_stop_order,
+        "deadlock_cargo_ids": simulation.deadlock_cargo_ids or [],
+        "poorly_stacked_cargo_ids": simulation.poorly_stacked_cargo_ids or [],
+        "created_at": simulation.created_at.isoformat() if simulation.created_at else "",
+        "stop_results": stop_results_list
+    }
+
+
+@app.post("/unloading/routes/compare", response_model=schemas.RouteComparisonResult)
+def compare_routes(
+    request: schemas.RouteComparisonRequest,
+    db: Session = Depends(get_db)
+):
+    plan = None
+    if request.plan_identifier.isdigit():
+        plan = crud.get_packing_plan(db, plan_id=int(request.plan_identifier))
+    if plan is None:
+        plan = crud.get_packing_plan(db, plan_no=request.plan_identifier)
+
+    if plan is None:
+        raise HTTPException(status_code=404, detail="配载方案不存在")
+
+    routes_data = []
+    best_route = None
+    min_rehandle = float('inf')
+
+    for route_identifier in request.route_identifiers:
+        route = _resolve_unloading_route(route_identifier, db)
+        if route is None:
+            raise HTTPException(status_code=404, detail=f"路线 {route_identifier} 不存在")
+
+        stops = crud.get_route_stops(db, route_id=route.id)
+        assignments = crud.get_route_cargo_assignments(db, route_id=route.id)
+        latest_sim = crud.get_latest_simulation_by_route(db, route_id=route.id)
+
+        worst_stop_name = None
+        has_deadlock = False
+        total_rehandle = 0
+        worst_stop_order = None
+        worst_stop_rehandle = 0
+
+        if latest_sim:
+            total_rehandle = latest_sim.total_rehandle_count
+            worst_stop_order = latest_sim.worst_stop_order
+            worst_stop_rehandle = latest_sim.worst_stop_rehandle_count
+            has_deadlock = latest_sim.has_deadlock
+            if latest_sim.worst_stop_id:
+                worst_stop = db.query(models.UnloadingRouteStop).filter(
+                    models.UnloadingRouteStop.id == latest_sim.worst_stop_id
+                ).first()
+                if worst_stop:
+                    worst_stop_name = worst_stop.stop_name
+
+        if not has_deadlock and total_rehandle < min_rehandle:
+            min_rehandle = total_rehandle
+            best_route = route
+
+        routes_data.append({
+            "route_id": route.id,
+            "route_no": route.route_no,
+            "route_name": route.name,
+            "total_stops": len(stops),
+            "total_cargos": len(assignments),
+            "total_rehandle_count": total_rehandle,
+            "worst_stop_order": worst_stop_order,
+            "worst_stop_name": worst_stop_name,
+            "worst_stop_rehandle_count": worst_stop_rehandle,
+            "has_deadlock": has_deadlock,
+            "latest_simulation_no": latest_sim.simulation_no if latest_sim else None
+        })
+
+    if best_route:
+        recommendation = f"推荐使用路线「{best_route.name}」({best_route.route_no})，总返搬次数最少({min_rehandle}次)"
+    else:
+        valid_routes = [r for r in routes_data if not r["has_deadlock"]]
+        if valid_routes:
+            best = min(valid_routes, key=lambda r: r["total_rehandle_count"])
+            recommendation = f"推荐使用路线「{best['route_name']}」({best['route_no']})，总返搬次数最少({best['total_rehandle_count']}次)"
+        else:
+            recommendation = "所有对比路线均存在死局，请重新规划货物分配或站点顺序"
+
+    comparison_id = f"CMP-ROUTE-{uuid.uuid4().hex[:8].upper()}"
+
+    return {
+        "plan_id": plan.id,
+        "plan_no": plan.plan_no,
+        "plan_name": plan.container_name,
+        "comparison_id": comparison_id,
+        "routes": routes_data,
+        "recommendation": recommendation
+    }
+
+
+@app.get("/plans/{plan_identifier}/unloading-routes", response_model=List[schemas.UnloadingRouteSummary])
+def get_plan_unloading_routes(
+    plan_identifier: str,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    return list_unloading_routes(
+        plan_identifier=plan_identifier,
+        skip=skip,
+        limit=limit,
+        db=db
+    )
 

@@ -871,3 +871,201 @@ class ReleaseConfirmationRequest(BaseModel):
     released_by: str
     release_reason: str
 
+
+class UnloadingRouteStopBase(BaseModel):
+    stop_order: int = Field(ge=1, description="站点顺序，从1开始")
+    stop_name: str = Field(description="站点名称")
+    stop_code: Optional[str] = None
+    contact_person: Optional[str] = None
+    contact_phone: Optional[str] = None
+    address: Optional[str] = None
+
+
+class UnloadingRouteStopCreate(UnloadingRouteStopBase):
+    pass
+
+
+class UnloadingRouteStop(UnloadingRouteStopBase):
+    id: int
+    route_id: int
+
+    class Config:
+        from_attributes = True
+
+
+class UnloadingCargoAssignmentBase(BaseModel):
+    packed_cargo_id: int = Field(description="关联已装载货物ID")
+    cargo_id: int = Field(description="货物ID")
+    cargo_name: str = Field(description="货物名称")
+    stop_order: int = Field(ge=1, description="所属站点顺序")
+    unload_order: int = Field(ge=1, description="在本站点的卸货顺序")
+
+
+class UnloadingCargoAssignmentCreate(UnloadingCargoAssignmentBase):
+    pass
+
+
+class UnloadingCargoAssignment(UnloadingCargoAssignmentBase):
+    id: int
+    route_id: int
+    stop_id: int
+
+    class Config:
+        from_attributes = True
+
+
+class UnloadingRouteCreate(BaseModel):
+    plan_identifier: str = Field(description="配载方案ID或方案编号")
+    name: str = Field(description="路线名称")
+    description: Optional[str] = None
+    created_by: Optional[str] = None
+    stops: List[UnloadingRouteStopCreate] = Field(description="站点列表")
+    cargo_assignments: List[UnloadingCargoAssignmentCreate] = Field(description="货物站点分配列表")
+
+
+class UnloadingRouteUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    stops: Optional[List[UnloadingRouteStopCreate]] = None
+    cargo_assignments: Optional[List[UnloadingCargoAssignmentCreate]] = None
+
+
+class UnloadingRouteBase(BaseModel):
+    plan_id: int
+    plan_no: str
+    name: str
+    description: Optional[str] = None
+    created_by: Optional[str] = None
+
+
+class UnloadingRoute(UnloadingRouteBase):
+    id: int
+    route_no: str
+    created_at: str
+    stops: List[UnloadingRouteStop] = []
+    cargo_assignments: List[UnloadingCargoAssignment] = []
+
+    class Config:
+        from_attributes = True
+
+
+class UnloadingRouteSummary(UnloadingRouteBase):
+    id: int
+    route_no: str
+    created_at: str
+    total_stops: int
+    total_cargos: int
+    simulation_count: int
+
+    class Config:
+        from_attributes = True
+
+
+class UnloadingMove(BaseModel):
+    move_type: str = Field(description="动作类型: unload卸货 / rehandle_out搬出 / rehandle_in搬回")
+    packed_cargo_id: int
+    cargo_id: int
+    cargo_name: str
+    stop_order: int
+    move_sequence: int = Field(description="动作序号")
+    reason: Optional[str] = None
+
+
+class UnloadingStopResultDetail(BaseModel):
+    id: int
+    simulation_id: int
+    stop_id: int
+    stop_order: int
+    stop_name: str
+    rehandle_count: int
+    unload_count: int
+    remaining_count: int
+    has_deadlock: bool
+    deadlock_cargo_ids: List[int]
+    moves: List[UnloadingMove]
+    remaining_cargos_state: List[dict]
+
+
+class UnloadingSimulationCreate(BaseModel):
+    route_identifier: str = Field(description="路线ID或路线编号")
+
+
+class UnloadingSimulationBase(BaseModel):
+    route_id: int
+    route_no: str
+    status: str
+    total_stops: int
+    total_cargos: int
+    total_rehandle_count: int
+    worst_stop_id: Optional[int] = None
+    worst_stop_order: Optional[int] = None
+    worst_stop_rehandle_count: int
+    has_deadlock: bool
+    deadlock_stop_id: Optional[int] = None
+    deadlock_stop_order: Optional[int] = None
+    deadlock_cargo_ids: List[int]
+    poorly_stacked_cargo_ids: List[int]
+
+
+class UnloadingSimulation(UnloadingSimulationBase):
+    id: int
+    simulation_no: str
+    created_at: str
+
+    class Config:
+        from_attributes = True
+
+
+class UnloadingSimulationDetail(UnloadingSimulation):
+    stop_results: List[UnloadingStopResultDetail] = []
+
+
+class UnloadingSimulationSummary(BaseModel):
+    id: int
+    simulation_no: str
+    route_id: int
+    route_no: str
+    route_name: str
+    status: str
+    total_stops: int
+    total_cargos: int
+    total_rehandle_count: int
+    worst_stop_order: Optional[int]
+    worst_stop_name: Optional[str]
+    worst_stop_rehandle_count: int
+    has_deadlock: bool
+    deadlock_stop_order: Optional[int]
+    deadlock_stop_name: Optional[str]
+    created_at: str
+
+    class Config:
+        from_attributes = True
+
+
+class RouteComparisonRequest(BaseModel):
+    plan_identifier: str = Field(description="配载方案ID或方案编号")
+    route_identifiers: List[str] = Field(description="要对比的路线ID或编号列表")
+
+
+class RouteComparisonItem(BaseModel):
+    route_id: int
+    route_no: str
+    route_name: str
+    total_stops: int
+    total_cargos: int
+    total_rehandle_count: int
+    worst_stop_order: Optional[int]
+    worst_stop_name: Optional[str]
+    worst_stop_rehandle_count: int
+    has_deadlock: bool
+    latest_simulation_no: Optional[str]
+
+
+class RouteComparisonResult(BaseModel):
+    plan_id: int
+    plan_no: str
+    plan_name: str
+    comparison_id: str
+    routes: List[RouteComparisonItem]
+    recommendation: str
+

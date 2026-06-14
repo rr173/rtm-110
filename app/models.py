@@ -329,6 +329,102 @@ class ReviewTask(Base):
     confirmations = relationship("LoadingConfirmation", back_populates="task", cascade="all, delete-orphan")
 
 
+class UnloadingRoute(Base):
+    __tablename__ = "unloading_routes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    route_no = Column(String, unique=True, index=True, comment="路线编号")
+    plan_id = Column(Integer, ForeignKey("packing_plans.id"), comment="关联配载方案ID")
+    plan_no = Column(String, index=True, comment="关联配载方案编号")
+    name = Column(String, comment="路线名称")
+    description = Column(Text, nullable=True, comment="路线描述")
+    created_at = Column(DateTime, server_default=func.now())
+    created_by = Column(String, nullable=True)
+
+    plan = relationship("PackingPlan")
+    stops = relationship("UnloadingRouteStop", back_populates="route", cascade="all, delete-orphan", order_by="UnloadingRouteStop.stop_order")
+    cargo_assignments = relationship("UnloadingCargoAssignment", back_populates="route", cascade="all, delete-orphan")
+    simulations = relationship("UnloadingSimulation", back_populates="route", cascade="all, delete-orphan")
+
+
+class UnloadingRouteStop(Base):
+    __tablename__ = "unloading_route_stops"
+
+    id = Column(Integer, primary_key=True, index=True)
+    route_id = Column(Integer, ForeignKey("unloading_routes.id"))
+    stop_order = Column(Integer, comment="站点顺序，从1开始")
+    stop_name = Column(String, comment="站点名称")
+    stop_code = Column(String, nullable=True, comment="站点编码")
+    contact_person = Column(String, nullable=True)
+    contact_phone = Column(String, nullable=True)
+    address = Column(Text, nullable=True)
+
+    route = relationship("UnloadingRoute", back_populates="stops")
+
+
+class UnloadingCargoAssignment(Base):
+    __tablename__ = "unloading_cargo_assignments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    route_id = Column(Integer, ForeignKey("unloading_routes.id"))
+    packed_cargo_id = Column(Integer, ForeignKey("packed_cargos.id"), comment="关联已装载货物ID")
+    cargo_id = Column(Integer, comment="货物ID")
+    cargo_name = Column(String, comment="货物名称")
+    stop_id = Column(Integer, ForeignKey("unloading_route_stops.id"), comment="所属站点ID")
+    stop_order = Column(Integer, comment="所属站点顺序")
+    unload_order = Column(Integer, comment="在本站点的卸货顺序")
+
+    route = relationship("UnloadingRoute", back_populates="cargo_assignments")
+    stop = relationship("UnloadingRouteStop")
+    packed_cargo = relationship("PackedCargo")
+
+
+class UnloadingSimulation(Base):
+    __tablename__ = "unloading_simulations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    simulation_no = Column(String, unique=True, index=True, comment="推演编号")
+    route_id = Column(Integer, ForeignKey("unloading_routes.id"))
+    route_no = Column(String, index=True)
+    status = Column(String, default="completed", comment="推演状态: pending/running/completed/failed/deadlock")
+    total_stops = Column(Integer, comment="总站数")
+    total_cargos = Column(Integer, comment="总货物数")
+    total_rehandle_count = Column(Integer, default=0, comment="总返搬次数")
+    worst_stop_id = Column(Integer, nullable=True, comment="最糟糕站点ID")
+    worst_stop_order = Column(Integer, nullable=True, comment="最糟糕站点顺序")
+    worst_stop_rehandle_count = Column(Integer, default=0, comment="最糟糕站点返搬次数")
+    has_deadlock = Column(Boolean, default=False, comment="是否存在死局")
+    deadlock_stop_id = Column(Integer, nullable=True, comment="死局发生站点ID")
+    deadlock_stop_order = Column(Integer, nullable=True, comment="死局发生站点顺序")
+    deadlock_cargo_ids = Column(JSON, default=list, comment="造成死局的货物ID列表")
+    poorly_stacked_cargo_ids = Column(JSON, default=list, comment="从头到尾不该被压在前站货上面的货物ID列表")
+    simulation_data = Column(JSON, default=dict, comment="完整推演数据")
+    created_at = Column(DateTime, server_default=func.now())
+
+    route = relationship("UnloadingRoute", back_populates="simulations")
+    stop_results = relationship("UnloadingStopResult", back_populates="simulation", cascade="all, delete-orphan", order_by="UnloadingStopResult.stop_order")
+
+
+class UnloadingStopResult(Base):
+    __tablename__ = "unloading_stop_results"
+
+    id = Column(Integer, primary_key=True, index=True)
+    simulation_id = Column(Integer, ForeignKey("unloading_simulations.id"))
+    stop_id = Column(Integer, ForeignKey("unloading_route_stops.id"))
+    stop_order = Column(Integer, comment="站点顺序")
+    stop_name = Column(String, comment="站点名称")
+    rehandle_count = Column(Integer, default=0, comment="本站返搬次数")
+    unload_count = Column(Integer, default=0, comment="本站卸货数量")
+    remaining_count = Column(Integer, default=0, comment="本站结束后剩余货物数量")
+    has_deadlock = Column(Boolean, default=False, comment="本站是否发生死局")
+    deadlock_cargo_ids = Column(JSON, default=list, comment="本站造成死局的货物ID列表")
+    moves = Column(JSON, default=list, comment="本站所有动作列表")
+    remaining_cargos_state = Column(JSON, default=list, comment="本站结束后箱内剩余货物状态")
+
+    simulation = relationship("UnloadingSimulation", back_populates="stop_results")
+    stop = relationship("UnloadingRouteStop")
+
+
 class ReviewCargoRecord(Base):
     __tablename__ = "review_cargo_records"
 
