@@ -669,3 +669,56 @@ class DispatchTask(Base):
 
     plan = relationship("PackingPlan")
     publication = relationship("PublicationRecord", back_populates="dispatch_task")
+
+
+class BatchShipment(Base):
+    __tablename__ = "batch_shipments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    batch_no = Column(String, unique=True, index=True, comment="批次编号")
+    transport_direction = Column(String, comment="运输方向")
+    fleet_name = Column(String, nullable=True, comment="车队名称")
+    fleet_contact = Column(String, nullable=True, comment="车队联系人")
+    fleet_phone = Column(String, nullable=True, comment="车队联系电话")
+    tractor_no = Column(String, nullable=True, comment="主车车牌号")
+    trailer_no = Column(String, nullable=True, comment="挂车车牌号")
+    planned_departure_time = Column(DateTime, nullable=True, comment="计划发车时间")
+    assembly_location = Column(String, nullable=True, comment="集合地点")
+    status = Column(String, default="pending_grouping", comment="状态: pending_grouping待编组/grouping编组中/pending_departure待发车/dispatched已发车/cancelled已取消")
+    total_containers = Column(Integer, default=0, comment="总箱数")
+    total_weight = Column(Float, default=0.0, comment="总重量 kg")
+    block_reasons = Column(JSON, default=list, comment="批次级阻断原因列表")
+    status_changed_at = Column(DateTime, nullable=True, comment="状态变更时间")
+    created_by = Column(String, nullable=True, comment="创建人")
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    cancelled_at = Column(DateTime, nullable=True, comment="取消时间")
+    cancel_reason = Column(Text, nullable=True, comment="取消原因")
+
+    task_items = relationship("BatchTaskItem", back_populates="batch", cascade="all, delete-orphan")
+
+
+class BatchTaskItem(Base):
+    __tablename__ = "batch_task_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    batch_id = Column(Integer, ForeignKey("batch_shipments.id"), comment="关联批次ID")
+    dispatch_task_id = Column(Integer, ForeignKey("dispatch_tasks.id"), comment="关联发运任务ID")
+    dispatch_task_no = Column(String, comment="发运任务编号")
+    plan_id = Column(Integer, ForeignKey("packing_plans.id"), comment="关联配载方案ID")
+    plan_no = Column(String, comment="方案编号")
+    container_no = Column(String, nullable=True, comment="冻结箱号")
+    seal_no = Column(String, nullable=True, comment="冻结铅封号")
+    route_no = Column(String, nullable=True, comment="冻结路线编号")
+    frozen_snapshot = Column(JSON, default=dict, comment="任务入批时的快照(方案版本/箱号/铅封/路线/单据)")
+    loading_order = Column(Integer, default=0, comment="装车顺序")
+    vehicle_assignment = Column(String, nullable=True, comment="分配的车辆标识(主车/挂车编号)")
+    is_blocked = Column(Boolean, default=False, comment="是否阻断")
+    block_reason = Column(String, nullable=True, comment="单条任务阻断原因")
+    removed_at = Column(DateTime, nullable=True, comment="移出批次时间")
+    remove_reason = Column(String, nullable=True, comment="移出原因")
+    created_at = Column(DateTime, server_default=func.now())
+
+    batch = relationship("BatchShipment", back_populates="task_items")
+    dispatch_task = relationship("DispatchTask")
+    plan = relationship("PackingPlan")

@@ -3302,3 +3302,301 @@ def validate_all_dispatches(db: Session = Depends(get_db)):
         "results": results,
     }
 
+
+def _serialize_batch_task_item(item) -> dict:
+    return {
+        "id": item.id,
+        "batch_id": item.batch_id,
+        "dispatch_task_id": item.dispatch_task_id,
+        "dispatch_task_no": item.dispatch_task_no,
+        "plan_id": item.plan_id,
+        "plan_no": item.plan_no,
+        "container_no": item.container_no,
+        "seal_no": item.seal_no,
+        "route_no": item.route_no,
+        "frozen_snapshot": item.frozen_snapshot or {},
+        "loading_order": item.loading_order,
+        "vehicle_assignment": item.vehicle_assignment,
+        "is_blocked": item.is_blocked,
+        "block_reason": item.block_reason,
+        "removed_at": item.removed_at.isoformat() if item.removed_at else None,
+        "remove_reason": item.remove_reason,
+    }
+
+
+def _serialize_batch(batch, db: Session = None, include_items: bool = False) -> dict:
+    result = {
+        "id": batch.id,
+        "batch_no": batch.batch_no,
+        "transport_direction": batch.transport_direction,
+        "fleet_name": batch.fleet_name,
+        "fleet_contact": batch.fleet_contact,
+        "fleet_phone": batch.fleet_phone,
+        "tractor_no": batch.tractor_no,
+        "trailer_no": batch.trailer_no,
+        "planned_departure_time": batch.planned_departure_time.isoformat() if batch.planned_departure_time else None,
+        "assembly_location": batch.assembly_location,
+        "status": batch.status,
+        "total_containers": batch.total_containers,
+        "total_weight": batch.total_weight,
+        "block_reasons": batch.block_reasons or [],
+        "status_changed_at": batch.status_changed_at.isoformat() if batch.status_changed_at else None,
+        "created_by": batch.created_by,
+        "created_at": batch.created_at.isoformat() if batch.created_at else None,
+        "updated_at": batch.updated_at.isoformat() if batch.updated_at else None,
+        "cancelled_at": batch.cancelled_at.isoformat() if batch.cancelled_at else None,
+        "cancel_reason": batch.cancel_reason,
+    }
+    if include_items and db:
+        items = db.query(models.BatchTaskItem).filter(
+            models.BatchTaskItem.batch_id == batch.id
+        ).order_by(models.BatchTaskItem.loading_order, models.BatchTaskItem.id).all()
+        result["task_items"] = [_serialize_batch_task_item(it) for it in items]
+    return result
+
+
+def _resolve_batch(batch_identifier: str, db: Session):
+    batch = None
+    if batch_identifier.isdigit():
+        batch = crud.get_batch_shipment(db, batch_id=int(batch_identifier))
+    if batch is None:
+        batch = crud.get_batch_shipment(db, batch_no=batch_identifier)
+    return batch
+
+
+@app.post("/batch", response_model=schemas.BatchShipmentDetail)
+def create_batch_shipment(
+    request: schemas.BatchShipmentCreate,
+    db: Session = Depends(get_db)
+):
+    task_ids = [item.dispatch_task_id for item in request.task_items]
+    direction_errors = crud._validate_batch_direction(db, task_ids, request.transport_direction)
+    if direction_errors:
+        raise HTTPException(status_code=400, detail="; ".join(direction_errors))
+
+    vehicle_errors = crud._validate_vehicle_not_double_booked(
+        db, batch_id=0, dispatch_task_ids=task_ids,
+        tractor_no=request.tractor_no, trailer_no=request.trailer_no
+    )
+    if vehicle_errors:
+        raise HTTPException(status_code=400, detail="; ".join(vehicle_errors))
+
+    batch_data = request.model_dump(exclude={"task_items"})
+    task_items_data = [item.model_dump() for item in request.task_items]
+
+    batch = crud.create_batch_shipment(db, batch_data, task_items_data)
+    return _serialize_batch(batch, db=db, include_items=True)
+
+
+@app.get("/batch", response_model=List[schemas.BatchShipment])
+def list_batch_shipments(
+    transport_direction: Optional[str] = None,
+    status: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    batches = crud.list_batch_shipments(
+        db, transport_direction=transport_direction, status=status, skip=skip, limit=limit
+    )
+    return [_serialize_batch(b) for b in batches]
+
+
+@app.get("/batch/{batch_identifier}", response_model=schemas.BatchShipmentDetail)
+def get_batch_detail(
+    batch_identifier: str,
+    db: Session = Depends(get_db)
+):
+    batch = _resolve_batch(batch_identifier, db)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="发运批次不存在")
+    return _serialize_batch(batch, db=db, include_items=True)
+
+
+@app.put("/batch/{batch_identifier}", response_model=schemas.BatchShipment)
+def update_batch_shipment(
+    batch_identifier: str,
+    request: schemas.BatchShipmentUpdate,
+    db: Session = Depends(get_db)
+):
+    batch = _resolve_batch(batch_identifier, db)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="发运批次不存在")
+
+    update_data = request.model_dump(exclude_unset=True)
+    if update_data.get("tractor_no") or update_data.get("trailer_no"):
+        tractor = update_data.get("tractor_no", batch.tractor_no)
+        trailer = update_data.get("trailer_no", batch.trailer_no)
+        vehicle_errors = crud._validate_vehicle_not_double_booked(
+            db, batch_id=batch.id, dispatch_task_ids=[],
+            tractor_no=tractor, trailer_no=trailer
+        )
+        if vehicle_errors:
+            raise HTTPException(status_code=400, detail="; ".join(vehicle_errors))
+
+    updated = crud.update_batch_shipment(db, batch_id=batch.id, update_data=update_data)
+    return _serialize_batch(updated)
+
+
+@app.post("/batch/{batch_identifier}/tasks", response_model=schemas.BatchShipmentDetail)
+def add_tasks_to_batch(
+    batch_identifier: str,
+    request: schemas.BatchTaskItemsAddRequest,
+    db: Session = Depends(get_db)
+):
+    batch = _resolve_batch(batch_identifier, db)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="发运批次不存在")
+    if batch.status not in ("pending_grouping", "grouping"):
+        raise HTTPException(status_code=400, detail=f"批次状态为 {batch.status}，不允许添加任务")
+
+    task_ids = [item.dispatch_task_id for item in request.task_items]
+    direction_errors = crud._validate_batch_direction(db, task_ids, batch.transport_direction)
+    if direction_errors:
+        raise HTTPException(status_code=400, detail="; ".join(direction_errors))
+
+    vehicle_errors = crud._validate_vehicle_not_double_booked(
+        db, batch_id=batch.id, dispatch_task_ids=task_ids,
+        tractor_no=batch.tractor_no, trailer_no=batch.trailer_no
+    )
+    if vehicle_errors:
+        raise HTTPException(status_code=400, detail="; ".join(vehicle_errors))
+
+    task_items_data = [item.model_dump() for item in request.task_items]
+    updated = crud.add_tasks_to_batch(db, batch_id=batch.id, task_items_data=task_items_data)
+    return _serialize_batch(updated, db=db, include_items=True)
+
+
+@app.delete("/batch/{batch_identifier}/tasks/{task_item_id}", response_model=schemas.BatchShipmentDetail)
+def remove_task_from_batch(
+    batch_identifier: str,
+    task_item_id: int,
+    request: schemas.BatchTaskItemRemoveRequest,
+    db: Session = Depends(get_db)
+):
+    batch = _resolve_batch(batch_identifier, db)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="发运批次不存在")
+
+    updated = crud.remove_task_from_batch(
+        db, batch_id=batch.id, task_item_id=task_item_id, remove_reason=request.remove_reason
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="批次任务项不存在或已移出")
+    return _serialize_batch(updated, db=db, include_items=True)
+
+
+@app.post("/batch/{batch_identifier}/status", response_model=schemas.BatchShipment)
+def transition_batch_status(
+    batch_identifier: str,
+    request: schemas.BatchStatusTransitionRequest,
+    db: Session = Depends(get_db)
+):
+    batch = _resolve_batch(batch_identifier, db)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="发运批次不存在")
+
+    target = request.target_status.value if hasattr(request.target_status, "value") else request.target_status
+
+    if target in ("pending_departure", "dispatched"):
+        validation = crud.validate_batch_blockage(db, batch_id=batch.id)
+        if not validation["is_valid"]:
+            blocked_details = []
+            for item in validation["blocked_items"]:
+                blocked_details.append(f"任务 {item.dispatch_task_no}: {item.block_reason}")
+            raise HTTPException(status_code=400, detail={
+                "error": "批次存在阻断任务，不能变更到目标状态",
+                "blocked_tasks": blocked_details,
+                "block_reasons": validation["block_reasons"],
+            })
+
+    try:
+        updated = crud.transition_batch_status(
+            db, batch_id=batch.id, target_status=target, reason=request.reason
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return _serialize_batch(updated)
+
+
+@app.post("/batch/{batch_identifier}/validate")
+def validate_batch(
+    batch_identifier: str,
+    db: Session = Depends(get_db)
+):
+    batch = _resolve_batch(batch_identifier, db)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="发运批次不存在")
+
+    validation = crud.validate_batch_blockage(db, batch_id=batch.id)
+    return {
+        "batch_id": batch.id,
+        "batch_no": batch.batch_no,
+        "is_valid": validation["is_valid"],
+        "blocked_tasks": [
+            {
+                "task_item_id": item.id,
+                "dispatch_task_no": item.dispatch_task_no,
+                "plan_no": item.plan_no,
+                "block_reason": item.block_reason,
+            }
+            for item in validation["blocked_items"]
+        ],
+        "block_reasons": validation["block_reasons"],
+    }
+
+
+@app.get("/batch/{batch_identifier}/history")
+def get_batch_history(
+    batch_identifier: str,
+    db: Session = Depends(get_db)
+):
+    batch = _resolve_batch(batch_identifier, db)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="发运批次不存在")
+
+    all_items = db.query(models.BatchTaskItem).filter(
+        models.BatchTaskItem.batch_id == batch.id
+    ).order_by(models.BatchTaskItem.loading_order, models.BatchTaskItem.id).all()
+
+    active_items = []
+    removed_items = []
+    vehicle_map = {}
+
+    for item in all_items:
+        entry = _serialize_batch_task_item(item)
+        if item.removed_at:
+            removed_items.append(entry)
+        else:
+            active_items.append(entry)
+            if item.vehicle_assignment:
+                if item.vehicle_assignment not in vehicle_map:
+                    vehicle_map[item.vehicle_assignment] = []
+                vehicle_map[item.vehicle_assignment].append({
+                    "task_item_id": item.id,
+                    "dispatch_task_no": item.dispatch_task_no,
+                    "plan_no": item.plan_no,
+                    "container_no": item.container_no,
+                    "loading_order": item.loading_order,
+                })
+
+    return {
+        "batch_id": batch.id,
+        "batch_no": batch.batch_no,
+        "transport_direction": batch.transport_direction,
+        "status": batch.status,
+        "total_containers": batch.total_containers,
+        "total_weight": batch.total_weight,
+        "fleet_name": batch.fleet_name,
+        "tractor_no": batch.tractor_no,
+        "trailer_no": batch.trailer_no,
+        "planned_departure_time": batch.planned_departure_time.isoformat() if batch.planned_departure_time else None,
+        "assembly_location": batch.assembly_location,
+        "block_reasons": batch.block_reasons or [],
+        "created_at": batch.created_at.isoformat() if batch.created_at else None,
+        "active_items": active_items,
+        "removed_items": removed_items,
+        "vehicle_assignments": vehicle_map,
+    }
+

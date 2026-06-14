@@ -2,6 +2,7 @@ from sqlalchemy.orm import Session
 from app import models, schemas
 from app.schemas import TemperatureClassEnum
 from datetime import datetime
+from typing import List
 import uuid
 
 VALID_TEMPERATURE_CLASSES = {tc.value for tc in TemperatureClassEnum}
@@ -3701,5 +3702,408 @@ def validate_all_active_dispatches(db: Session):
             "new_status": task.status,
         })
     return results
+
+
+def generate_batch_no() -> str:
+    return f"BATCH-{uuid.uuid4().hex[:8].upper()}"
+
+
+def _snapshot_dispatch_task(db: Session, dispatch_task: models.DispatchTask) -> dict:
+    plan = get_packing_plan(db, plan_id=dispatch_task.plan_id)
+    snapshot = {
+        "task_no": dispatch_task.task_no,
+        "plan_no": dispatch_task.plan_no,
+        "plan_id": dispatch_task.plan_id,
+        "frozen_version": dispatch_task.frozen_version,
+        "frozen_content_hash": dispatch_task.frozen_content_hash,
+        "vehicle_no": dispatch_task.vehicle_no,
+        "planned_departure_time": dispatch_task.planned_departure_time.isoformat() if dispatch_task.planned_departure_time else None,
+        "status": dispatch_task.status,
+    }
+    if plan:
+        snapshot["container_no"] = plan.container_no
+        snapshot["seal_no"] = plan.seal_no
+    if dispatch_task.frozen_snapshot:
+        snapshot["frozen_snapshot"] = dispatch_task.frozen_snapshot
+    return snapshot
+
+
+def _validate_batch_direction(db: Session, dispatch_task_ids: List[int], transport_direction: str) -> List[str]:
+    errors = []
+    for dt_id in dispatch_task_ids:
+        dt = get_dispatch_task(db, task_id=dt_id)
+        if not dt:
+            errors.append(f"发运任务ID {dt_id} 不存在")
+            continue
+        if dt.status not in ("pending_dispatch",):
+            errors.append(f"发运任务 {dt.task_no} 状态为 {dt.status}，非待出车状态")
+    return errors
+
+
+def _validate_batch_time_window(db: Session, batch_id: int, dispatch_task_ids: List[int]) -> List[str]:
+    errors = []
+    existing_items = db.query(models.BatchTaskItem).filter(
+        models.BatchTaskItem.batch_id == batch_id,
+        models.BatchTaskItem.removed_at == None,
+    ).all()
+    existing_ids = {item.dispatch_task_id for item in existing_items}
+    all_ids = existing_ids | set(dispatch_task_ids)
+
+    tasks = []
+    for dt_id in all_ids:
+        dt = get_dispatch_task(db, task_id=dt_id)
+        if dt and dt.planned_departure_time:
+            tasks.append({"id": dt.id, "task_no": dt.task_no, "time": dt.planned_departure_time})
+
+    if len(tasks) >= 2:
+        for i in range(len(tasks)):
+            for j in range(i + 1, len(tasks)):
+                if tasks[i]["time"] == tasks[j]["time"]:
+                    errors.append(f"发运任务 {tasks[i]['task_no']} 和 {tasks[j]['task_no']} 计划发车时间完全相同，时间窗冲突")
+    return errors
+
+
+def _validate_vehicle_not_double_booked(db: Session, batch_id: int, dispatch_task_ids: List[int], tractor_no: str = None, trailer_no: str = None) -> List[str]:
+    errors = []
+    vehicles_to_check = []
+    if tractor_no:
+        vehicles_to_check.append(("tractor_no", tractor_no))
+    if trailer_no:
+        vehicles_to_check.append(("trailer_no", trailer_no))
+
+    for field, value in vehicles_to_check:
+        conflict_batch = db.query(models.BatchShipment).filter(
+            models.BatchShipment.id != batch_id,
+            getattr(models.BatchShipment, field) == value,
+            models.BatchShipment.status.in_(["pending_grouping", "grouping", "pending_departure"]),
+        ).first()
+        if conflict_batch:
+            label = "主车" if field == "tractor_no" else "挂车"
+            errors.append(f"{label} {value} 已被批次 {conflict_batch.batch_no} 占用")
+
+    existing_items = db.query(models.BatchTaskItem).filter(
+        models.BatchTaskItem.dispatch_task_id.in_(dispatch_task_ids),
+        models.BatchTaskItem.removed_at == None,
+        models.BatchTaskItem.batch_id != batch_id,
+    ).all()
+    for item in existing_items:
+        conflict_batch = db.query(models.BatchShipment).filter(models.BatchShipment.id == item.batch_id).first()
+        if conflict_batch and conflict_batch.status in ("pending_grouping", "grouping", "pending_departure"):
+            errors.append(f"发运任务 {item.dispatch_task_no} 已在批次 {conflict_batch.batch_no} 中")
+    return errors
+
+
+def create_batch_shipment(db: Session, batch_data: dict, task_items_data: List[dict]) -> models.BatchShipment:
+    batch_no = generate_batch_no()
+    from datetime import datetime as _dt
+
+    planned_departure = None
+    if batch_data.get("planned_departure_time"):
+        pdt_str = batch_data["planned_departure_time"]
+        if isinstance(pdt_str, str):
+            for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d"):
+                try:
+                    planned_departure = _dt.strptime(pdt_str, fmt)
+                    break
+                except ValueError:
+                    continue
+
+    db_batch = models.BatchShipment(
+        batch_no=batch_no,
+        transport_direction=batch_data["transport_direction"],
+        fleet_name=batch_data.get("fleet_name"),
+        fleet_contact=batch_data.get("fleet_contact"),
+        fleet_phone=batch_data.get("fleet_phone"),
+        tractor_no=batch_data.get("tractor_no"),
+        trailer_no=batch_data.get("trailer_no"),
+        planned_departure_time=planned_departure,
+        assembly_location=batch_data.get("assembly_location"),
+        status="pending_grouping",
+        total_containers=0,
+        total_weight=0.0,
+        created_by=batch_data.get("created_by"),
+    )
+    db.add(db_batch)
+    db.flush()
+
+    total_containers = 0
+    total_weight = 0.0
+
+    for item_data in task_items_data:
+        dt_id = item_data["dispatch_task_id"]
+        dt = get_dispatch_task(db, task_id=dt_id)
+        if not dt:
+            continue
+
+        plan = get_packing_plan(db, plan_id=dt.plan_id)
+        snapshot = _snapshot_dispatch_task(db, dt)
+
+        container_no = plan.container_no if plan else None
+        seal_no = plan.seal_no if plan else None
+        route_no = None
+        if dt.frozen_snapshot:
+            route_no = dt.frozen_snapshot.get("route_no")
+
+        db_item = models.BatchTaskItem(
+            batch_id=db_batch.id,
+            dispatch_task_id=dt.id,
+            dispatch_task_no=dt.task_no,
+            plan_id=dt.plan_id,
+            plan_no=dt.plan_no,
+            container_no=container_no,
+            seal_no=seal_no,
+            route_no=route_no,
+            frozen_snapshot=snapshot,
+            loading_order=item_data.get("loading_order", 0),
+            vehicle_assignment=item_data.get("vehicle_assignment"),
+        )
+        db.add(db_item)
+
+        total_containers += 1
+        if plan:
+            total_weight += plan.total_weight or 0.0
+
+    db_batch.total_containers = total_containers
+    db_batch.total_weight = total_weight
+
+    db.commit()
+    db.refresh(db_batch)
+    return db_batch
+
+
+def get_batch_shipment(db: Session, batch_id: int = None, batch_no: str = None):
+    if batch_id:
+        return db.query(models.BatchShipment).filter(models.BatchShipment.id == batch_id).first()
+    if batch_no:
+        return db.query(models.BatchShipment).filter(models.BatchShipment.batch_no == batch_no).first()
+    return None
+
+
+def list_batch_shipments(db: Session, transport_direction: str = None, status: str = None, skip: int = 0, limit: int = 100):
+    q = db.query(models.BatchShipment)
+    if transport_direction:
+        q = q.filter(models.BatchShipment.transport_direction == transport_direction)
+    if status:
+        q = q.filter(models.BatchShipment.status == status)
+    return q.order_by(models.BatchShipment.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def update_batch_shipment(db: Session, batch_id: int, update_data: dict) -> models.BatchShipment:
+    batch = get_batch_shipment(db, batch_id=batch_id)
+    if not batch:
+        return None
+
+    from datetime import datetime as _dt
+    for key, value in update_data.items():
+        if value is None:
+            continue
+        if key == "planned_departure_time" and isinstance(value, str):
+            for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d"):
+                try:
+                    value = _dt.strptime(value, fmt)
+                    break
+                except ValueError:
+                    continue
+        setattr(batch, key, value)
+    db.commit()
+    db.refresh(batch)
+    return batch
+
+
+def add_tasks_to_batch(db: Session, batch_id: int, task_items_data: List[dict]) -> models.BatchShipment:
+    batch = get_batch_shipment(db, batch_id=batch_id)
+    if not batch:
+        return None
+
+    total_containers = batch.total_containers or 0
+    total_weight = batch.total_weight or 0.0
+
+    for item_data in task_items_data:
+        dt_id = item_data["dispatch_task_id"]
+        dt = get_dispatch_task(db, task_id=dt_id)
+        if not dt:
+            continue
+
+        existing = db.query(models.BatchTaskItem).filter(
+            models.BatchTaskItem.batch_id == batch_id,
+            models.BatchTaskItem.dispatch_task_id == dt_id,
+            models.BatchTaskItem.removed_at == None,
+        ).first()
+        if existing:
+            continue
+
+        plan = get_packing_plan(db, plan_id=dt.plan_id)
+        snapshot = _snapshot_dispatch_task(db, dt)
+
+        container_no = plan.container_no if plan else None
+        seal_no = plan.seal_no if plan else None
+        route_no = None
+        if dt.frozen_snapshot:
+            route_no = dt.frozen_snapshot.get("route_no")
+
+        db_item = models.BatchTaskItem(
+            batch_id=batch_id,
+            dispatch_task_id=dt.id,
+            dispatch_task_no=dt.task_no,
+            plan_id=dt.plan_id,
+            plan_no=dt.plan_no,
+            container_no=container_no,
+            seal_no=seal_no,
+            route_no=route_no,
+            frozen_snapshot=snapshot,
+            loading_order=item_data.get("loading_order", 0),
+            vehicle_assignment=item_data.get("vehicle_assignment"),
+        )
+        db.add(db_item)
+        total_containers += 1
+        if plan:
+            total_weight += plan.total_weight or 0.0
+
+    batch.total_containers = total_containers
+    batch.total_weight = total_weight
+    if batch.status == "pending_grouping" and total_containers > 0:
+        batch.status = "grouping"
+
+    db.commit()
+    db.refresh(batch)
+    return batch
+
+
+def remove_task_from_batch(db: Session, batch_id: int, task_item_id: int, remove_reason: str) -> models.BatchShipment:
+    batch = get_batch_shipment(db, batch_id=batch_id)
+    if not batch:
+        return None
+
+    item = db.query(models.BatchTaskItem).filter(
+        models.BatchTaskItem.id == task_item_id,
+        models.BatchTaskItem.batch_id == batch_id,
+        models.BatchTaskItem.removed_at == None,
+    ).first()
+    if not item:
+        return None
+
+    from datetime import datetime as _dt
+    item.removed_at = _dt.utcnow()
+    item.remove_reason = remove_reason
+
+    plan = get_packing_plan(db, plan_id=item.plan_id)
+    batch.total_containers = max(0, (batch.total_containers or 0) - 1)
+    if plan:
+        batch.total_weight = max(0.0, (batch.total_weight or 0.0) - (plan.total_weight or 0.0))
+
+    active_items = db.query(models.BatchTaskItem).filter(
+        models.BatchTaskItem.batch_id == batch_id,
+        models.BatchTaskItem.removed_at == None,
+    ).all()
+
+    if len(active_items) == 0 and batch.status in ("grouping", "pending_departure"):
+        batch.status = "pending_grouping"
+
+    db.commit()
+    db.refresh(batch)
+    return batch
+
+
+def transition_batch_status(db: Session, batch_id: int, target_status: str, reason: str = None) -> models.BatchShipment:
+    batch = get_batch_shipment(db, batch_id=batch_id)
+    if not batch:
+        return None
+
+    from datetime import datetime as _dt
+
+    valid_transitions = {
+        "pending_grouping": ["grouping", "cancelled"],
+        "grouping": ["pending_departure", "pending_grouping", "cancelled"],
+        "pending_departure": ["dispatched", "grouping", "cancelled"],
+        "dispatched": [],
+        "cancelled": [],
+    }
+
+    if target_status not in valid_transitions.get(batch.status, []):
+        raise ValueError(f"批次状态 {batch.status} 不允许转换到 {target_status}")
+
+    if target_status == "cancelled":
+        batch.cancelled_at = _dt.utcnow()
+        batch.cancel_reason = reason or "批次取消"
+
+    batch.status = target_status
+    batch.status_changed_at = _dt.utcnow()
+    db.commit()
+    db.refresh(batch)
+    return batch
+
+
+def validate_batch_blockage(db: Session, batch_id: int) -> dict:
+    batch = get_batch_shipment(db, batch_id=batch_id)
+    if not batch:
+        return {"is_valid": False, "blocked_items": [], "block_reasons": []}
+
+    active_items = db.query(models.BatchTaskItem).filter(
+        models.BatchTaskItem.batch_id == batch_id,
+        models.BatchTaskItem.removed_at == None,
+    ).all()
+
+    blocked_items = []
+    batch_block_reasons = []
+
+    for item in active_items:
+        dt = get_dispatch_task(db, task_id=item.dispatch_task_id)
+        if not dt:
+            item.is_blocked = True
+            item.block_reason = "关联的发运任务不存在"
+            blocked_items.append(item)
+            batch_block_reasons.append({"type": "task_missing", "detail": f"发运任务 {item.dispatch_task_no} 不存在", "task_item_id": item.id})
+            continue
+
+        if dt.status == "pending_re_review":
+            item.is_blocked = True
+            item.block_reason = f"发运任务 {dt.task_no} 状态为待重审"
+            blocked_items.append(item)
+            batch_block_reasons.append({"type": "pending_re_review", "detail": f"发运任务 {dt.task_no} 处于待重审状态，批次不能继续发车", "task_item_id": item.id, "dispatch_task_no": dt.task_no})
+            continue
+
+        validation = validate_dispatch_dependencies(db, dt.id)
+        if not validation["is_valid"]:
+            item.is_blocked = True
+            item.block_reason = f"发运任务 {dt.task_no} 依赖校验未通过: {'; '.join(br['detail'] for br in validation['block_reasons'])}"
+            blocked_items.append(item)
+            for br in validation["block_reasons"]:
+                batch_block_reasons.append({"type": br["type"], "detail": f"任务 {dt.task_no}: {br['detail']}", "task_item_id": item.id, "dispatch_task_no": dt.task_no})
+        else:
+            item.is_blocked = False
+            item.block_reason = None
+
+    batch.block_reasons = batch_block_reasons
+    db.commit()
+
+    return {
+        "is_valid": len(blocked_items) == 0,
+        "blocked_items": blocked_items,
+        "block_reasons": batch_block_reasons,
+    }
+
+
+def recalculate_batch_totals(db: Session, batch_id: int) -> models.BatchShipment:
+    batch = get_batch_shipment(db, batch_id=batch_id)
+    if not batch:
+        return None
+
+    active_items = db.query(models.BatchTaskItem).filter(
+        models.BatchTaskItem.batch_id == batch_id,
+        models.BatchTaskItem.removed_at == None,
+    ).all()
+
+    total_containers = len(active_items)
+    total_weight = 0.0
+    for item in active_items:
+        plan = get_packing_plan(db, plan_id=item.plan_id)
+        if plan:
+            total_weight += plan.total_weight or 0.0
+
+    batch.total_containers = total_containers
+    batch.total_weight = total_weight
+    db.commit()
+    db.refresh(batch)
+    return batch
 
 

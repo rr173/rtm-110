@@ -1393,3 +1393,121 @@ class BlockReasonItem(BaseModel):
     type: str = Field(description="阻断类型: version_change/audit_invalidated/review_not_released/route_outdated/trailer_outdated/document_outdated")
     detail: str = Field(description="阻断详情")
 
+
+class BatchStatusEnum(str, Enum):
+    PENDING_GROUPING = "pending_grouping"
+    GROUPING = "grouping"
+    PENDING_DEPARTURE = "pending_departure"
+    DISPATCHED = "dispatched"
+    CANCELLED = "cancelled"
+
+
+class BatchTaskItemBase(BaseModel):
+    dispatch_task_id: int = Field(description="发运任务ID")
+    loading_order: int = Field(default=0, ge=0, description="装车顺序")
+    vehicle_assignment: Optional[str] = Field(default=None, description="分配的车辆标识")
+
+
+class BatchShipmentCreate(BaseModel):
+    transport_direction: str = Field(description="运输方向")
+    fleet_name: Optional[str] = None
+    fleet_contact: Optional[str] = None
+    fleet_phone: Optional[str] = None
+    tractor_no: Optional[str] = None
+    trailer_no: Optional[str] = None
+    planned_departure_time: Optional[str] = None
+    assembly_location: Optional[str] = None
+    task_items: List[BatchTaskItemBase] = Field(description="编入批次的发运任务列表")
+    created_by: Optional[str] = None
+
+
+class BatchShipmentUpdate(BaseModel):
+    transport_direction: Optional[str] = None
+    fleet_name: Optional[str] = None
+    fleet_contact: Optional[str] = None
+    fleet_phone: Optional[str] = None
+    tractor_no: Optional[str] = None
+    trailer_no: Optional[str] = None
+    planned_departure_time: Optional[str] = None
+    assembly_location: Optional[str] = None
+
+
+class BatchTaskItemSchema(BaseModel):
+    id: int
+    batch_id: int
+    dispatch_task_id: int
+    dispatch_task_no: str
+    plan_id: int
+    plan_no: str
+    container_no: Optional[str] = None
+    seal_no: Optional[str] = None
+    route_no: Optional[str] = None
+    frozen_snapshot: Optional[Dict[str, Any]] = None
+    loading_order: int = 0
+    vehicle_assignment: Optional[str] = None
+    is_blocked: bool = False
+    block_reason: Optional[str] = None
+    removed_at: Optional[str] = None
+    remove_reason: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class BatchShipmentBase(BaseModel):
+    transport_direction: str
+    fleet_name: Optional[str] = None
+    fleet_contact: Optional[str] = None
+    fleet_phone: Optional[str] = None
+    tractor_no: Optional[str] = None
+    trailer_no: Optional[str] = None
+    planned_departure_time: Optional[str] = None
+    assembly_location: Optional[str] = None
+
+
+class BatchShipment(BatchShipmentBase):
+    id: int
+    batch_no: str
+    status: str
+    total_containers: int = 0
+    total_weight: float = 0.0
+    block_reasons: List[Dict[str, Any]] = []
+    created_by: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    cancelled_at: Optional[str] = None
+    cancel_reason: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class BatchShipmentDetail(BatchShipment):
+    task_items: List[BatchTaskItemSchema] = []
+
+
+class BatchTaskItemAddRequest(BaseModel):
+    dispatch_task_id: int = Field(description="要加入的发运任务ID")
+    loading_order: int = Field(default=0, ge=0, description="装车顺序")
+    vehicle_assignment: Optional[str] = Field(default=None, description="分配的车辆标识")
+
+
+class BatchTaskItemsAddRequest(BaseModel):
+    task_items: List[BatchTaskItemAddRequest] = Field(description="要加入的发运任务列表")
+
+
+class BatchTaskItemRemoveRequest(BaseModel):
+    remove_reason: str = Field(description="移出原因")
+
+
+class BatchStatusTransitionRequest(BaseModel):
+    target_status: BatchStatusEnum = Field(description="目标状态")
+    reason: Optional[str] = None
+
+
+class BatchShipmentQuery(BaseModel):
+    transport_direction: Optional[str] = None
+    status: Optional[str] = None
+    skip: int = 0
+    limit: int = 100
+
