@@ -1114,38 +1114,45 @@ def _check_orientation_deviation(plan_orient, actual_orient):
 
 
 def _check_pressure_risk(db: Session, task_id: int, cargo_record: models.ReviewCargoRecord):
-    if cargo_record.actual_z is None or cargo_record.actual_z == 0:
+    if cargo_record.actual_z is None:
         return False, []
 
     all_records = get_review_cargo_records(db, task_id)
     risks = []
+    plan_cargo = db.query(models.PackedCargo).filter(
+        models.PackedCargo.id == cargo_record.plan_cargo_id
+    ).first()
+    max_top_load = plan_cargo.max_top_load if plan_cargo else 0
+    if max_top_load <= 0:
+        return False, []
+
     for other in all_records:
         if other.id == cargo_record.id or other.review_status in ("pending", "missing"):
             continue
         if other.actual_x is None or other.actual_y is None or other.actual_z is None:
             continue
+        if other.actual_z <= cargo_record.actual_z:
+            continue
 
-        x_overlap = (
-            abs(cargo_record.actual_x - other.actual_x) <
-            (cargo_record.plan_x and other.plan_x and 500 or 500)
-        )
-        y_overlap = True
+        x_overlap = abs(cargo_record.actual_x - other.actual_x) < 500
+        y_overlap = abs(cargo_record.actual_y - other.actual_y) < 500
+        if x_overlap and y_overlap:
+            other_plan_cargo = None
+            if other.plan_cargo_id is not None:
+                other_plan_cargo = db.query(models.PackedCargo).filter(
+                    models.PackedCargo.id == other.plan_cargo_id
+                ).first()
+            top_weight = other_plan_cargo.weight if other_plan_cargo else 0
+            is_overload = top_weight > max_top_load
+            risks.append({
+                "top_cargo_id": other.cargo_id,
+                "top_cargo_name": other.cargo_name,
+                "pressure_weight_kg": top_weight,
+                "max_top_load_kg": max_top_load,
+                "is_overload": is_overload,
+            })
 
-        if other.actual_z > cargo_record.actual_z and x_overlap and y_overlap:
-            plan_cargo = db.query(models.PackedCargo).filter(
-                models.PackedCargo.id == cargo_record.plan_cargo_id
-            ).first()
-            max_top_load = plan_cargo.max_top_load if plan_cargo else 0
-            if max_top_load > 0 and other.actual_x and other.actual_y:
-                risks.append({
-                    "top_cargo_id": other.cargo_id,
-                    "top_cargo_name": other.cargo_name,
-                    "pressure_weight_kg": 0,
-                    "max_top_load_kg": max_top_load,
-                    "is_overload": False,
-                })
-
-    return len(risks) > 0, risks
+    return any(r["is_overload"] for r in risks), [r for r in risks if r["is_overload"]]
 
 
 def _check_temperature_violation(db: Session, task_id: int, cargo_record: models.ReviewCargoRecord):
@@ -1171,7 +1178,7 @@ def _check_temperature_violation(db: Session, task_id: int, cargo_record: models
             continue
         other_temp = getattr(other_plan, 'temperature_class', 'AMBIENT') or 'AMBIENT'
 
-        if temp_class != other_temp and other_temp != 'AMBIENT':
+        if temp_class != other_temp:
             if cargo_record.actual_x is not None and other.actual_x is not None:
                 distance = abs(cargo_record.actual_x - other.actual_x)
                 if distance < 500:
@@ -1184,6 +1191,101 @@ def _check_temperature_violation(db: Session, task_id: int, cargo_record: models
                     })
 
     return len(violations) > 0, violations
+
+
+def _build_review_discrepancies_for_record(db: Session, task_id: int, record: models.ReviewCargoRecord):
+    discrepancies = []
+
+    if record.review_status == "missing":
+        discrepancies.append(models.ReviewDiscrepancy(
+            task_id=task_id,
+            cargo_record_id=record.id,
+            discrepancy_type="missing",
+            severity="blocking",
+            description=f"货物 [{record.cargo_name}] 漏装",
+            details={"cargo_id": record.cargo_id, "cargo_name": record.cargo_name},
+        ))
+        return discrepancies
+
+    if record.review_status == "extra":
+        discrepancies.append(models.ReviewDiscrepancy(
+            task_id=task_id,
+            cargo_record_id=record.id,
+            discrepancy_type="extra",
+            severity="blocking",
+            description=f"发现多装货物 [{record.cargo_name}]",
+            details={"cargo_id": record.cargo_id, "cargo_name": record.cargo_name},
+        ))
+        return discrepancies
+
+    if record.review_status != "confirmed":
+        return discrepancies
+
+    has_pos_dev, pos_distance = _check_position_deviation(
+        record.plan_x, record.plan_y, record.plan_z,
+        record.actual_x, record.actual_y, record.actual_z
+    )
+    if has_pos_dev:
+        discrepancies.append(models.ReviewDiscrepancy(
+            task_id=task_id,
+            cargo_record_id=record.id,
+            discrepancy_type="position",
+            severity="blocking" if pos_distance > 200 else "releasable",
+            description=f"货物 [{record.cargo_name}] 位置偏差 {pos_distance:.0f}mm",
+            details={
+                "plan": {"x": record.plan_x, "y": record.plan_y, "z": record.plan_z},
+                "actual": {"x": record.actual_x, "y": record.actual_y, "z": record.actual_z},
+                "distance_mm": pos_distance,
+            },
+        ))
+
+    if _check_orientation_deviation(record.plan_orientation, record.actual_orientation):
+        discrepancies.append(models.ReviewDiscrepancy(
+            task_id=task_id,
+            cargo_record_id=record.id,
+            discrepancy_type="orientation",
+            severity="releasable",
+            description=f"货物 [{record.cargo_name}] 朝向不一致",
+            details={
+                "plan_orientation": record.plan_orientation,
+                "actual_orientation": record.actual_orientation,
+            },
+        ))
+
+    has_pressure_risk, pressure_risks = _check_pressure_risk(db, task_id, record)
+    if has_pressure_risk:
+        discrepancies.append(models.ReviewDiscrepancy(
+            task_id=task_id,
+            cargo_record_id=record.id,
+            discrepancy_type="pressure_risk",
+            severity="blocking",
+            description=f"货物 [{record.cargo_name}] 的实际堆叠承压超限",
+            details={"risks": pressure_risks},
+        ))
+
+    has_temp_violation, temp_violations = _check_temperature_violation(db, task_id, record)
+    if has_temp_violation:
+        discrepancies.append(models.ReviewDiscrepancy(
+            task_id=task_id,
+            cargo_record_id=record.id,
+            discrepancy_type="temperature_violation",
+            severity="blocking",
+            description=f"货物 [{record.cargo_name}] 的实际摆放导致温控隔离失效",
+            details={"violations": temp_violations},
+        ))
+
+    return discrepancies
+
+
+def _rebuild_review_discrepancies(db: Session, task_id: int):
+    db.query(models.ReviewDiscrepancy).filter(
+        models.ReviewDiscrepancy.task_id == task_id
+    ).delete()
+
+    records = get_review_cargo_records(db, task_id)
+    for record in records:
+        for disc in _build_review_discrepancies_for_record(db, task_id, record):
+            db.add(disc)
 
 
 def update_cargo_review_record(
@@ -1237,72 +1339,7 @@ def update_cargo_review_record(
         task.status = "in_progress"
         task.started_at = datetime.utcnow()
 
-    db.query(models.ReviewDiscrepancy).filter(
-        models.ReviewDiscrepancy.cargo_record_id == record.id
-    ).delete()
-
-    discrepancies = []
-
-    if record.review_status == "missing":
-        disc = models.ReviewDiscrepancy(
-            task_id=task_id,
-            cargo_record_id=record.id,
-            discrepancy_type="missing",
-            severity="blocking",
-            description=f"货物 [{record.cargo_name}] 漏装",
-            details={"cargo_id": record.cargo_id, "cargo_name": record.cargo_name},
-        )
-        discrepancies.append(disc)
-
-    elif record.review_status == "extra":
-        disc = models.ReviewDiscrepancy(
-            task_id=task_id,
-            cargo_record_id=record.id,
-            discrepancy_type="extra",
-            severity="blocking",
-            description=f"发现多装货物 [{record.cargo_name}]",
-            details={"cargo_id": record.cargo_id, "cargo_name": record.cargo_name},
-        )
-        discrepancies.append(disc)
-
-    elif record.review_status == "confirmed":
-        has_pos_dev, pos_distance = _check_position_deviation(
-            record.plan_x, record.plan_y, record.plan_z,
-            record.actual_x, record.actual_y, record.actual_z
-        )
-        if has_pos_dev:
-            severity = "blocking" if pos_distance > 200 else "releasable"
-            disc = models.ReviewDiscrepancy(
-                task_id=task_id,
-                cargo_record_id=record.id,
-                discrepancy_type="position",
-                severity=severity,
-                description=f"货物 [{record.cargo_name}] 位置偏差 {pos_distance:.0f}mm",
-                details={
-                    "plan": {"x": record.plan_x, "y": record.plan_y, "z": record.plan_z},
-                    "actual": {"x": record.actual_x, "y": record.actual_y, "z": record.actual_z},
-                    "distance_mm": pos_distance,
-                },
-            )
-            discrepancies.append(disc)
-
-        has_orient_dev = _check_orientation_deviation(record.plan_orientation, record.actual_orientation)
-        if has_orient_dev:
-            disc = models.ReviewDiscrepancy(
-                task_id=task_id,
-                cargo_record_id=record.id,
-                discrepancy_type="orientation",
-                severity="releasable",
-                description=f"货物 [{record.cargo_name}] 朝向不一致",
-                details={
-                    "plan_orientation": record.plan_orientation,
-                    "actual_orientation": record.actual_orientation,
-                },
-            )
-            discrepancies.append(disc)
-
-    for disc in discrepancies:
-        db.add(disc)
+    _rebuild_review_discrepancies(db, task_id)
 
     db.commit()
     db.refresh(record)
@@ -1375,6 +1412,11 @@ def get_review_task_stats(db: Session, task_id: int) -> dict:
 
 
 def can_complete_review(db: Session, task_id: int) -> tuple:
+    records = get_review_cargo_records(db, task_id)
+    pending_records = [r for r in records if r.review_status == "pending"]
+    if pending_records:
+        return False, pending_records
+
     discrepancies = get_review_discrepancies(db, task_id, only_unresolved=True)
     blocking_unresolved = [d for d in discrepancies if d.severity == "blocking"]
     return len(blocking_unresolved) == 0, blocking_unresolved
@@ -1388,6 +1430,8 @@ def complete_review_task(db: Session, task_id: int) -> models.ReviewTask:
 
     can_complete, blocking = can_complete_review(db, task_id)
     if not can_complete:
+        if blocking and hasattr(blocking[0], "review_status"):
+            raise ValueError(f"仍有 {len(blocking)} 件货物未完成复核，无法完成复核")
         raise ValueError(f"仍有 {len(blocking)} 项阻断差异未处理，无法完成复核")
 
     task.status = "completed"
@@ -1466,6 +1510,8 @@ def release_confirmation(db: Session, task_id: int, released_by: str, release_re
 
     can_complete, blocking = can_complete_review(db, task_id)
     if not can_complete:
+        if blocking and hasattr(blocking[0], "review_status"):
+            raise ValueError(f"仍有 {len(blocking)} 件货物未完成复核，无法放行")
         raise ValueError(f"仍有 {len(blocking)} 项阻断差异未处理，无法放行")
 
     conf = db.query(models.LoadingConfirmation).filter(
@@ -1686,5 +1732,3 @@ def create_demo_review_record(db: Session):
 
     complete_review_task(db, task.id)
     db.refresh(task)
-
-
