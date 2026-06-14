@@ -1925,6 +1925,7 @@ def update_unloading_route(
         route.name = name
     if description is not None:
         route.description = description
+    route.updated_at = datetime.utcnow()
 
     if stops is not None:
         db.query(models.UnloadingRouteStop).filter(
@@ -2029,19 +2030,18 @@ def create_unloading_simulation(
 
     simulation_no = generate_simulation_no()
 
+    fresh_stops = db.query(models.UnloadingRouteStop).filter(
+        models.UnloadingRouteStop.route_id == route.id
+    ).order_by(models.UnloadingRouteStop.stop_order).all()
+    stop_order_to_id = {s.stop_order: s.id for s in fresh_stops}
+
     worst_stop_id = None
     if simulation_result.worst_stop_order is not None:
-        for stop in route.stops:
-            if stop.stop_order == simulation_result.worst_stop_order:
-                worst_stop_id = stop.id
-                break
+        worst_stop_id = stop_order_to_id.get(simulation_result.worst_stop_order)
 
     deadlock_stop_id = None
     if simulation_result.deadlock_stop_order is not None:
-        for stop in route.stops:
-            if stop.stop_order == simulation_result.deadlock_stop_order:
-                deadlock_stop_id = stop.id
-                break
+        deadlock_stop_id = stop_order_to_id.get(simulation_result.deadlock_stop_order)
 
     status = "deadlock" if simulation_result.has_deadlock else "completed"
 
@@ -2076,12 +2076,13 @@ def create_unloading_simulation(
                 "cargo_name": move.cargo_name,
                 "stop_order": move.stop_order,
                 "move_sequence": move.move_sequence,
-                "reason": move.reason
+                "reason": move.reason,
+                "cargo_state_snapshot": move.cargo_state_snapshot
             })
 
         db_stop_result = models.UnloadingStopResult(
             simulation_id=db_simulation.id,
-            stop_id=stop_result.stop_id,
+            stop_id=stop_order_to_id.get(stop_result.stop_order, stop_result.stop_id),
             stop_order=stop_result.stop_order,
             stop_name=stop_result.stop_name,
             rehandle_count=stop_result.rehandle_count,

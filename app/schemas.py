@@ -969,6 +969,7 @@ class UnloadingMove(BaseModel):
     stop_order: int
     move_sequence: int = Field(description="动作序号")
     reason: Optional[str] = None
+    cargo_state_snapshot: List[dict] = Field(default_factory=list, description="本次动作完成后所有货物的箱内状态快照，含status字段: in_box在箱内/unloaded已卸/temporary_out临时搬出")
 
 
 class UnloadingStopResultDetail(BaseModel):

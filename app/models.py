@@ -339,6 +339,7 @@ class UnloadingRoute(Base):
     name = Column(String, comment="路线名称")
     description = Column(Text, nullable=True, comment="路线描述")
     created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
     created_by = Column(String, nullable=True)
 
     plan = relationship("PackingPlan")

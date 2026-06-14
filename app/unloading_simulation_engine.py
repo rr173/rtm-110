@@ -42,6 +42,7 @@ class SimulationMove:
     stop_order: int
     move_sequence: int
     reason: Optional[str] = None
+    cargo_state_snapshot: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -183,6 +184,31 @@ def _check_deadlock(
     return False, []
 
 
+def _generate_state_snapshot(cargos: List[CargoState]) -> List[Dict[str, Any]]:
+    snapshot = []
+    for c in cargos:
+        status = "in_box"
+        if c.is_removed:
+            status = "unloaded"
+        elif c.is_temporary_out:
+            status = "temporary_out"
+        snapshot.append({
+            "packed_cargo_id": c.packed_cargo_id,
+            "cargo_id": c.cargo_id,
+            "cargo_name": c.cargo_name,
+            "stop_order": c.stop_order,
+            "status": status,
+            "x": c.x,
+            "y": c.y,
+            "z": c.z,
+            "length": c.length,
+            "width": c.width,
+            "height": c.height,
+            "weight": c.weight
+        })
+    return snapshot
+
+
 def _identify_poorly_stacked_cargos(
     all_cargos: List[CargoState]
 ) -> List[int]:
@@ -285,44 +311,50 @@ def run_unloading_simulation(
 
                 move_sequence += 1
                 rehandle_count += 1
-                stop_result.moves.append(SimulationMove(
+                rehandle_candidate.is_temporary_out = True
+                move = SimulationMove(
                     move_type="rehandle_out",
                     packed_cargo_id=rehandle_candidate.packed_cargo_id,
                     cargo_id=rehandle_candidate.cargo_id,
                     cargo_name=rehandle_candidate.cargo_name,
                     stop_order=stop_order,
                     move_sequence=move_sequence,
-                    reason=f"挡住了{target_cargo.cargo_name}(ID:{target_cargo.cargo_id})，临时搬出"
-                ))
-                rehandle_candidate.is_temporary_out = True
+                    reason=f"挡住了{target_cargo.cargo_name}(ID:{target_cargo.cargo_id})，临时搬出",
+                    cargo_state_snapshot=_generate_state_snapshot(cargo_states)
+                )
+                stop_result.moves.append(move)
 
             move_sequence += 1
             unload_count += 1
             target_cargo.is_removed = True
-            stop_result.moves.append(SimulationMove(
+            move = SimulationMove(
                 move_type="unload",
                 packed_cargo_id=target_cargo.packed_cargo_id,
                 cargo_id=target_cargo.cargo_id,
                 cargo_name=target_cargo.cargo_name,
                 stop_order=stop_order,
                 move_sequence=move_sequence,
-                reason="本站点卸货"
-            ))
+                reason="本站点卸货",
+                cargo_state_snapshot=_generate_state_snapshot(cargo_states)
+            )
+            stop_result.moves.append(move)
 
         temp_out_cargos = [c for c in cargo_states if c.is_temporary_out]
         for temp_cargo in temp_out_cargos:
             move_sequence += 1
             rehandle_count += 1
-            stop_result.moves.append(SimulationMove(
+            temp_cargo.is_temporary_out = False
+            move = SimulationMove(
                 move_type="rehandle_in",
                 packed_cargo_id=temp_cargo.packed_cargo_id,
                 cargo_id=temp_cargo.cargo_id,
                 cargo_name=temp_cargo.cargo_name,
                 stop_order=stop_order,
                 move_sequence=move_sequence,
-                reason="卸货完成，将临时搬出的货物放回箱内"
-            ))
-            temp_cargo.is_temporary_out = False
+                reason="卸货完成，将临时搬出的货物放回箱内",
+                cargo_state_snapshot=_generate_state_snapshot(cargo_states)
+            )
+            stop_result.moves.append(move)
 
         remaining = [c for c in cargo_states if not c.is_removed]
         stop_result.rehandle_count = rehandle_count

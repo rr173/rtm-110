@@ -2443,7 +2443,8 @@ def get_simulation_detail(
                 "cargo_name": move["cargo_name"],
                 "stop_order": move["stop_order"],
                 "move_sequence": move["move_sequence"],
-                "reason": move.get("reason")
+                "reason": move.get("reason"),
+                "cargo_state_snapshot": move.get("cargo_state_snapshot", [])
             })
 
         stop_results_list.append({
@@ -2509,6 +2510,33 @@ def compare_routes(
         stops = crud.get_route_stops(db, route_id=route.id)
         assignments = crud.get_route_cargo_assignments(db, route_id=route.id)
         latest_sim = crud.get_latest_simulation_by_route(db, route_id=route.id)
+
+        needs_renew = False
+        if latest_sim is None:
+            needs_renew = True
+        elif route.updated_at and latest_sim.created_at < route.updated_at:
+            needs_renew = True
+
+        if needs_renew:
+            plan = crud.get_packing_plan(db, plan_id=route.plan_id)
+            if plan:
+                packed_cargos_db = crud.get_packed_cargos(db, plan_id=plan.id)
+                if packed_cargos_db:
+                    packed_cargos_list = [{
+                        "id": pc.id, "cargo_id": pc.cargo_id, "cargo_name": pc.cargo_name,
+                        "x": pc.x, "y": pc.y, "z": pc.z,
+                        "length": pc.length, "width": pc.width, "height": pc.height, "weight": pc.weight
+                    } for pc in packed_cargos_db]
+                    stops_list = [{
+                        "id": s.id, "stop_order": s.stop_order,
+                        "stop_name": s.stop_name, "stop_code": s.stop_code
+                    } for s in stops]
+                    assignments_list = [{
+                        "packed_cargo_id": a.packed_cargo_id,
+                        "stop_order": a.stop_order, "unload_order": a.unload_order
+                    } for a in assignments]
+                    new_sim_result = run_unloading_simulation(packed_cargos_list, stops_list, assignments_list)
+                    latest_sim = crud.create_unloading_simulation(db, route, new_sim_result)
 
         worst_stop_name = None
         has_deadlock = False
