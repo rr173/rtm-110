@@ -68,6 +68,7 @@ class PackingPlan(Base):
     unplaced_cargos = relationship("UnplacedCargo", back_populates="plan", cascade="all, delete-orphan")
     compliance_audits = relationship("ComplianceAudit", back_populates="plan", cascade="all, delete-orphan")
     customs_documents = relationship("CustomsDocument", back_populates="plan", cascade="all, delete-orphan")
+    publications = relationship("PublicationRecord", back_populates="plan", cascade="all, delete-orphan")
 
 
 class PackedCargo(Base):
@@ -603,3 +604,68 @@ class ChangeDiffSnapshot(Base):
 
     analysis = relationship("ChangeImpactAnalysis", back_populates="diff_snapshot")
     plan = relationship("PackingPlan")
+
+
+class PublicationRecord(Base):
+    __tablename__ = "publication_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    publication_no = Column(String, unique=True, index=True, comment="发布编号")
+    plan_id = Column(Integer, ForeignKey("packing_plans.id"))
+    plan_no = Column(String, index=True, comment="方案编号")
+    plan_version = Column(Integer, comment="发布时的方案版本")
+    plan_content_hash = Column(String, nullable=True, comment="发布时的方案内容哈希")
+    container_no = Column(String, nullable=True, comment="冻结的箱号")
+    seal_no = Column(String, nullable=True, comment="冻结的铅封号")
+    audit_id = Column(Integer, nullable=True, comment="冻结的审核ID")
+    audit_no = Column(String, nullable=True, comment="冻结的审核编号")
+    audit_passed = Column(Boolean, default=False, comment="冻结的审核结论")
+    confirmation_id = Column(Integer, nullable=True, comment="冻结的确认单ID")
+    confirmation_no = Column(String, nullable=True, comment="冻结的确认单编号")
+    confirmation_released = Column(Boolean, default=False, comment="冻结的确认单是否放行")
+    route_id = Column(Integer, nullable=True, comment="冻结的路线ID")
+    route_no = Column(String, nullable=True, comment="冻结的路线编号")
+    simulation_id = Column(Integer, nullable=True, comment="冻结的推演ID")
+    simulation_no = Column(String, nullable=True, comment="冻结的推演编号")
+    trailer_plan_id = Column(Integer, nullable=True, comment="冻结的拖车方案ID")
+    trailer_plan_no = Column(String, nullable=True, comment="冻结的拖车方案编号")
+    document_snapshot = Column(JSON, default=list, comment="冻结的单据摘要列表")
+    snapshot_data = Column(JSON, default=dict, comment="完整发布快照")
+    status = Column(String, default="pending_approval", comment="状态: pending_approval待审批/approved已发布/rejected已驳回/revoked已撤回")
+    published_by = Column(String, nullable=True, comment="提交人")
+    published_at = Column(DateTime, server_default=func.now())
+    approved_by = Column(String, nullable=True, comment="审批人")
+    approved_at = Column(DateTime, nullable=True)
+    rejected_reason = Column(Text, nullable=True, comment="驳回原因")
+    gate_check_result = Column(JSON, default=dict, comment="发布闸口检查结果")
+
+    plan = relationship("PackingPlan", back_populates="publications")
+    dispatch_task = relationship("DispatchTask", back_populates="publication", uselist=False, cascade="all, delete-orphan")
+
+
+class DispatchTask(Base):
+    __tablename__ = "dispatch_tasks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_no = Column(String, unique=True, index=True, comment="发运任务编号")
+    plan_id = Column(Integer, ForeignKey("packing_plans.id"))
+    plan_no = Column(String, index=True, comment="方案编号")
+    publication_id = Column(Integer, ForeignKey("publication_records.id"))
+    frozen_version = Column(Integer, comment="冻结的方案版本")
+    frozen_content_hash = Column(String, nullable=True, comment="冻结的方案内容哈希")
+    frozen_snapshot = Column(JSON, default=dict, comment="发布时冻结的完整快照(方案/箱号铅封/审核/确认单/路线/拖车/单据)")
+    vehicle_no = Column(String, nullable=True, comment="车牌号")
+    driver_name = Column(String, nullable=True, comment="司机姓名")
+    planned_departure_time = Column(DateTime, nullable=True, comment="计划出车时间")
+    arrival_time = Column(DateTime, nullable=True, comment="到场时间")
+    terminal_window = Column(String, nullable=True, comment="码头窗口")
+    status = Column(String, default="pending_approval", comment="状态: pending_approval待审批/pending_dispatch待出车/loading装车中/dispatched已发运/cancelled已取消/pending_re_review待重审")
+    block_reasons = Column(JSON, default=list, comment="阻断原因列表,每项含type和detail")
+    last_validated_at = Column(DateTime, nullable=True, comment="最近一次校验时间")
+    status_changed_at = Column(DateTime, nullable=True, comment="状态变更时间")
+    created_by = Column(String, nullable=True, comment="创建人")
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    plan = relationship("PackingPlan")
+    publication = relationship("PublicationRecord", back_populates="dispatch_task")

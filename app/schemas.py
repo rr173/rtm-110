@@ -1270,3 +1270,126 @@ class ChangeImpactAnalysisResult(BaseModel):
     draft_no: str
     analysis: ChangeImpactAnalysisDetail
 
+
+class GateCheckItem(BaseModel):
+    check_name: str = Field(description="检查项名称")
+    passed: bool = Field(description="是否通过")
+    detail: Optional[str] = None
+
+
+class GateCheckResult(BaseModel):
+    can_publish: bool = Field(description="是否可以发布")
+    checks: List[GateCheckItem] = []
+    summary: Optional[str] = None
+
+
+class PublicationRequest(BaseModel):
+    plan_identifier: str = Field(description="方案ID或方案编号")
+    route_identifier: Optional[str] = Field(default=None, description="路线ID或编号,可选指定")
+    simulation_identifier: Optional[str] = Field(default=None, description="推演ID或编号,可选指定")
+    trailer_plan_identifier: Optional[str] = Field(default=None, description="拖车方案ID或编号,可选指定")
+    published_by: Optional[str] = None
+
+
+class PublicationApproveRequest(BaseModel):
+    approved_by: str
+
+
+class PublicationRejectRequest(BaseModel):
+    rejected_reason: str
+
+
+class PublicationBase(BaseModel):
+    plan_id: int
+    plan_no: str
+    plan_version: int
+    plan_content_hash: Optional[str] = None
+    container_no: Optional[str] = None
+    seal_no: Optional[str] = None
+    audit_no: Optional[str] = None
+    audit_passed: bool = False
+    confirmation_no: Optional[str] = None
+    confirmation_released: bool = False
+    route_no: Optional[str] = None
+    simulation_no: Optional[str] = None
+    trailer_plan_no: Optional[str] = None
+
+
+class Publication(PublicationBase):
+    id: int
+    publication_no: str
+    status: str
+    published_by: Optional[str] = None
+    published_at: Optional[str] = None
+    approved_by: Optional[str] = None
+    approved_at: Optional[str] = None
+    rejected_reason: Optional[str] = None
+    gate_check_result: Optional[Dict[str, Any]] = None
+
+    class Config:
+        from_attributes = True
+
+
+class PublicationDetail(Publication):
+    document_snapshot: List[Dict[str, Any]] = []
+    snapshot_data: Optional[Dict[str, Any]] = None
+    dispatch_task: Optional[dict] = None
+
+
+class DispatchTaskUpdateRequest(BaseModel):
+    vehicle_no: Optional[str] = None
+    driver_name: Optional[str] = None
+    planned_departure_time: Optional[str] = None
+    arrival_time: Optional[str] = None
+    terminal_window: Optional[str] = None
+
+
+class DispatchStatusTransitionRequest(BaseModel):
+    target_status: str = Field(description="目标状态: pending_dispatch/loading/dispatched/cancelled")
+    reason: Optional[str] = None
+
+
+class DispatchTaskBase(BaseModel):
+    plan_id: int
+    plan_no: str
+    frozen_version: int
+    frozen_content_hash: Optional[str] = None
+    status: str
+
+
+class DispatchTask(DispatchTaskBase):
+    id: int
+    task_no: str
+    publication_id: int
+    vehicle_no: Optional[str] = None
+    driver_name: Optional[str] = None
+    planned_departure_time: Optional[str] = None
+    arrival_time: Optional[str] = None
+    terminal_window: Optional[str] = None
+    block_reasons: List[Dict[str, Any]] = []
+    last_validated_at: Optional[str] = None
+    status_changed_at: Optional[str] = None
+    created_by: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class DispatchTaskDetail(DispatchTask):
+    frozen_snapshot: Optional[Dict[str, Any]] = None
+    publication_no: Optional[str] = None
+
+
+class DispatchTaskQuery(BaseModel):
+    plan_no: Optional[str] = None
+    status: Optional[str] = None
+    skip: int = 0
+    limit: int = 100
+
+
+class BlockReasonItem(BaseModel):
+    type: str = Field(description="阻断类型: version_change/audit_invalidated/review_not_released/route_outdated/trailer_outdated/document_outdated")
+    detail: str = Field(description="阻断详情")
+

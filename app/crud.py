@@ -3150,3 +3150,492 @@ def get_change_history(db: Session, plan_identifier: str, skip: int = 0, limit: 
     return result
 
 
+def generate_publication_no() -> str:
+    return f"PUB-{uuid.uuid4().hex[:8].upper()}"
+
+
+def generate_dispatch_no() -> str:
+    return f"DISP-{uuid.uuid4().hex[:8].upper()}"
+
+
+def run_gate_check(db: Session, plan_id: int) -> dict:
+    plan = get_packing_plan(db, plan_id=plan_id)
+    if not plan:
+        return {"can_publish": False, "checks": [{"check_name": "方案存在性", "passed": False, "detail": "方案不存在"}], "summary": "方案不存在"}
+
+    checks = []
+    current_hash = compute_plan_content_hash(db, plan_id)
+
+    latest_audit = get_latest_passed_audit(db, plan_id)
+    if latest_audit and latest_audit.status == "valid" and latest_audit.plan_content_hash == current_hash:
+        checks.append({"check_name": "合规审核通过", "passed": True, "detail": f"审核编号 {latest_audit.audit_no}，已通过且为当前版本"})
+    else:
+        reasons = []
+        if not latest_audit:
+            reasons.append("无通过的审核记录")
+        else:
+            if latest_audit.status != "valid":
+                reasons.append(f"审核状态为 {latest_audit.status}")
+            if latest_audit.plan_content_hash != current_hash:
+                reasons.append("审核基于旧版本方案")
+            if not latest_audit.is_passed:
+                reasons.append("审核未通过")
+        checks.append({"check_name": "合规审核通过", "passed": False, "detail": "；".join(reasons)})
+
+    latest_review = get_latest_review_task(db, plan_id)
+    latest_confirmation = get_latest_confirmation_by_plan(db, plan_id)
+    if latest_review and latest_review.is_valid and latest_review.status == "completed" and latest_confirmation and latest_confirmation.is_valid and latest_confirmation.is_released:
+        disc_unresolved = get_review_discrepancies(db, latest_review.id, severity="blocking", only_unresolved=True)
+        if disc_unresolved:
+            checks.append({"check_name": "装箱复核放行", "passed": False, "detail": f"仍有 {len(disc_unresolved)} 项阻断差异未处理"})
+        else:
+            checks.append({"check_name": "装箱复核放行", "passed": True, "detail": f"确认单 {latest_confirmation.confirmation_no} 已放行"})
+    else:
+        reasons = []
+        if not latest_review or not latest_review.is_valid:
+            reasons.append("无有效的复核任务")
+        elif latest_review.status != "completed":
+            reasons.append(f"复核状态为 {latest_review.status}")
+        if not latest_confirmation or not latest_confirmation.is_valid:
+            reasons.append("无有效的确认单")
+        elif not latest_confirmation.is_released:
+            reasons.append("确认单未放行")
+        checks.append({"check_name": "装箱复核放行", "passed": False, "detail": "；".join(reasons)})
+
+    routes = db.query(models.UnloadingRoute).filter(models.UnloadingRoute.plan_id == plan_id).all()
+    if not routes:
+        checks.append({"check_name": "路线推演", "passed": True, "detail": "无关联路线，跳过检查"})
+    else:
+        route_ok = True
+        route_details = []
+        for route in routes:
+            latest_sim = get_latest_simulation_by_route(db, route.id)
+            if not latest_sim:
+                route_ok = False
+                route_details.append(f"路线 {route.route_no} 无推演结果")
+            elif latest_sim.has_deadlock:
+                route_ok = False
+                route_details.append(f"路线 {route.route_no} 推演存在死局")
+        if route_ok:
+            checks.append({"check_name": "路线推演", "passed": True, "detail": f"共 {len(routes)} 条路线推演有效"})
+        else:
+            checks.append({"check_name": "路线推演", "passed": False, "detail": "；".join(route_details)})
+
+    trailer_plans = db.query(models.TrailerLoadPlan).filter(
+        models.TrailerLoadPlan.packing_plan_id == plan_id,
+        models.TrailerLoadPlan.status == "valid"
+    ).all()
+    if not trailer_plans:
+        checks.append({"check_name": "拖车装载", "passed": True, "detail": "无关联拖车方案，跳过检查"})
+    else:
+        trailer_ok = True
+        trailer_details = []
+        for tp in trailer_plans:
+            if tp.plan_content_hash and tp.plan_content_hash != current_hash:
+                trailer_ok = False
+                trailer_details.append(f"拖车方案 {tp.plan_no} 基于旧版本")
+            if tp.plan_version and tp.plan_version < (plan.version or 1):
+                trailer_ok = False
+                trailer_details.append(f"拖车方案 {tp.plan_no} 版本过期(v{tp.plan_version})")
+        if trailer_ok:
+            checks.append({"check_name": "拖车装载", "passed": True, "detail": f"共 {len(trailer_plans)} 个拖车方案为当前版本"})
+        else:
+            checks.append({"check_name": "拖车装载", "passed": False, "detail": "；".join(trailer_details)})
+
+    docs = db.query(models.CustomsDocument).filter(
+        models.CustomsDocument.plan_id == plan_id,
+        models.CustomsDocument.status == "valid"
+    ).all()
+    if not docs:
+        checks.append({"check_name": "海关单据", "passed": True, "detail": "无有效单据，跳过检查"})
+    else:
+        doc_ok = True
+        doc_details = []
+        for doc in docs:
+            if doc.plan_content_hash and doc.plan_content_hash != current_hash:
+                doc_ok = False
+                doc_details.append(f"单据 {doc.document_no} 基于旧版本")
+            if doc.plan_version and doc.plan_version < (plan.version or 1):
+                doc_ok = False
+                doc_details.append(f"单据 {doc.document_no} 版本过期(v{doc.plan_version})")
+        if doc_ok:
+            checks.append({"check_name": "海关单据", "passed": True, "detail": f"共 {len(docs)} 份单据为当前版本"})
+        else:
+            checks.append({"check_name": "海关单据", "passed": False, "detail": "；".join(doc_details)})
+
+    can_publish = all(c["passed"] for c in checks)
+    failed_checks = [c["check_name"] for c in checks if not c["passed"]]
+    summary = "所有闸口检查通过，允许发布" if can_publish else f"以下检查未通过: {', '.join(failed_checks)}"
+
+    return {"can_publish": can_publish, "checks": checks, "summary": summary}
+
+
+def create_publication(
+    db: Session,
+    plan_id: int,
+    route_id: int = None,
+    simulation_id: int = None,
+    trailer_plan_id: int = None,
+    published_by: str = None
+) -> models.PublicationRecord:
+    plan = get_packing_plan(db, plan_id=plan_id)
+    if not plan:
+        raise ValueError("方案不存在")
+
+    current_hash = compute_plan_content_hash(db, plan_id)
+    gate_result = run_gate_check(db, plan_id)
+    if not gate_result["can_publish"]:
+        raise ValueError(f"闸口检查未通过: {gate_result['summary']}")
+
+    publication_no = generate_publication_no()
+
+    latest_audit = get_latest_passed_audit(db, plan_id)
+    latest_confirmation = get_latest_confirmation_by_plan(db, plan_id)
+
+    route_obj = None
+    simulation_obj = None
+    if route_id:
+        route_obj = get_unloading_route(db, route_id=route_id)
+    elif not route_id:
+        routes = db.query(models.UnloadingRoute).filter(models.UnloadingRoute.plan_id == plan_id).all()
+        if routes:
+            route_obj = routes[0]
+
+    if simulation_id:
+        simulation_obj = get_unloading_simulation(db, simulation_id=simulation_id)
+    elif route_obj:
+        simulation_obj = get_latest_simulation_by_route(db, route_obj.id)
+
+    trailer_obj = None
+    if trailer_plan_id:
+        trailer_obj = get_trailer_load_plan(db, plan_id=trailer_plan_id)
+    else:
+        trailer_plans = db.query(models.TrailerLoadPlan).filter(
+            models.TrailerLoadPlan.packing_plan_id == plan_id,
+            models.TrailerLoadPlan.status == "valid"
+        ).all()
+        if trailer_plans:
+            trailer_obj = trailer_plans[0]
+
+    documents = db.query(models.CustomsDocument).filter(
+        models.CustomsDocument.plan_id == plan_id,
+        models.CustomsDocument.status == "valid"
+    ).all()
+    doc_snapshot = []
+    for doc in documents:
+        doc_snapshot.append({
+            "document_id": doc.id,
+            "document_no": doc.document_no,
+            "document_type": doc.document_type,
+            "plan_version": doc.plan_version,
+            "status": doc.status,
+            "container_no": doc.container_no,
+            "seal_no": doc.seal_no,
+            "total_packages": doc.total_packages,
+            "total_weight_kg": doc.total_weight_kg,
+        })
+
+    snapshot = {
+        "plan": {
+            "id": plan.id, "plan_no": plan.plan_no, "version": plan.version,
+            "content_hash": current_hash, "container_no": plan.container_no,
+            "seal_no": plan.seal_no, "declared_weight": plan.declared_weight,
+            "container_name": plan.container_name, "total_weight": plan.total_weight,
+            "volume_utilization": plan.volume_utilization,
+        },
+        "audit": {
+            "id": latest_audit.id if latest_audit else None,
+            "audit_no": latest_audit.audit_no if latest_audit else None,
+            "is_passed": latest_audit.is_passed if latest_audit else None,
+            "plan_version": latest_audit.plan_version if latest_audit else None,
+            "plan_content_hash": latest_audit.plan_content_hash if latest_audit else None,
+        } if latest_audit else None,
+        "confirmation": {
+            "id": latest_confirmation.id if latest_confirmation else None,
+            "confirmation_no": latest_confirmation.confirmation_no if latest_confirmation else None,
+            "is_released": latest_confirmation.is_released if latest_confirmation else None,
+            "plan_version": latest_confirmation.plan_version if latest_confirmation else None,
+        } if latest_confirmation else None,
+        "route": {
+            "id": route_obj.id, "route_no": route_obj.route_no, "name": route_obj.name,
+        } if route_obj else None,
+        "simulation": {
+            "id": simulation_obj.id, "simulation_no": simulation_obj.simulation_no,
+            "total_rehandle_count": simulation_obj.total_rehandle_count,
+            "has_deadlock": simulation_obj.has_deadlock,
+        } if simulation_obj else None,
+        "trailer": {
+            "id": trailer_obj.id, "plan_no": trailer_obj.plan_no,
+            "total_weight": trailer_obj.total_weight,
+            "axles_within_limit": trailer_obj.axles_within_limit,
+        } if trailer_obj else None,
+        "documents": doc_snapshot,
+        "gate_check": gate_result,
+    }
+
+    db_pub = models.PublicationRecord(
+        publication_no=publication_no,
+        plan_id=plan_id,
+        plan_no=plan.plan_no,
+        plan_version=plan.version or 1,
+        plan_content_hash=current_hash,
+        container_no=plan.container_no,
+        seal_no=plan.seal_no,
+        audit_id=latest_audit.id if latest_audit else None,
+        audit_no=latest_audit.audit_no if latest_audit else None,
+        audit_passed=latest_audit.is_passed if latest_audit else False,
+        confirmation_id=latest_confirmation.id if latest_confirmation else None,
+        confirmation_no=latest_confirmation.confirmation_no if latest_confirmation else None,
+        confirmation_released=latest_confirmation.is_released if latest_confirmation else False,
+        route_id=route_obj.id if route_obj else None,
+        route_no=route_obj.route_no if route_obj else None,
+        simulation_id=simulation_obj.id if simulation_obj else None,
+        simulation_no=simulation_obj.simulation_no if simulation_obj else None,
+        trailer_plan_id=trailer_obj.id if trailer_obj else None,
+        trailer_plan_no=trailer_obj.plan_no if trailer_obj else None,
+        document_snapshot=doc_snapshot,
+        snapshot_data=snapshot,
+        status="pending_approval",
+        published_by=published_by,
+        gate_check_result=gate_result,
+    )
+    db.add(db_pub)
+    db.commit()
+    db.refresh(db_pub)
+    return db_pub
+
+
+def get_publication(db: Session, pub_id: int = None, publication_no: str = None):
+    if pub_id:
+        return db.query(models.PublicationRecord).filter(models.PublicationRecord.id == pub_id).first()
+    if publication_no:
+        return db.query(models.PublicationRecord).filter(models.PublicationRecord.publication_no == publication_no).first()
+    return None
+
+
+def list_publications(db: Session, plan_id: int = None, status: str = None, skip: int = 0, limit: int = 100):
+    q = db.query(models.PublicationRecord)
+    if plan_id:
+        q = q.filter(models.PublicationRecord.plan_id == plan_id)
+    if status:
+        q = q.filter(models.PublicationRecord.status == status)
+    return q.order_by(models.PublicationRecord.published_at.desc()).offset(skip).limit(limit).all()
+
+
+def approve_publication(db: Session, pub_id: int, approved_by: str) -> models.PublicationRecord:
+    from datetime import datetime
+    pub = get_publication(db, pub_id=pub_id)
+    if not pub:
+        raise ValueError("发布记录不存在")
+    if pub.status != "pending_approval":
+        raise ValueError(f"当前状态为 {pub.status}，不允许审批")
+
+    pub.status = "approved"
+    pub.approved_by = approved_by
+    pub.approved_at = datetime.utcnow()
+
+    dispatch_no = generate_dispatch_no()
+    db_dispatch = models.DispatchTask(
+        task_no=dispatch_no,
+        plan_id=pub.plan_id,
+        plan_no=pub.plan_no,
+        publication_id=pub.id,
+        frozen_version=pub.plan_version,
+        frozen_content_hash=pub.plan_content_hash,
+        frozen_snapshot=pub.snapshot_data,
+        status="pending_dispatch",
+        block_reasons=[],
+        created_by=approved_by,
+    )
+    db.add(db_dispatch)
+    db.commit()
+    db.refresh(pub)
+    db.refresh(db_dispatch)
+    return pub
+
+
+def reject_publication(db: Session, pub_id: int, rejected_reason: str) -> models.PublicationRecord:
+    from datetime import datetime
+    pub = get_publication(db, pub_id=pub_id)
+    if not pub:
+        raise ValueError("发布记录不存在")
+    if pub.status != "pending_approval":
+        raise ValueError(f"当前状态为 {pub.status}，不允许驳回")
+
+    pub.status = "rejected"
+    pub.rejected_reason = rejected_reason
+    db.commit()
+    db.refresh(pub)
+    return pub
+
+
+def get_dispatch_task(db: Session, task_id: int = None, task_no: str = None):
+    if task_id:
+        return db.query(models.DispatchTask).filter(models.DispatchTask.id == task_id).first()
+    if task_no:
+        return db.query(models.DispatchTask).filter(models.DispatchTask.task_no == task_no).first()
+    return None
+
+
+def list_dispatch_tasks(db: Session, plan_no: str = None, status: str = None, skip: int = 0, limit: int = 100):
+    q = db.query(models.DispatchTask)
+    if plan_no:
+        q = q.filter(models.DispatchTask.plan_no == plan_no)
+    if status:
+        if status == "actionable":
+            q = q.filter(models.DispatchTask.status.in_(["pending_dispatch", "pending_re_review"]))
+        else:
+            q = q.filter(models.DispatchTask.status == status)
+    return q.order_by(models.DispatchTask.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def update_dispatch_task(db: Session, task_id: int, update_data: dict) -> models.DispatchTask:
+    from datetime import datetime
+    task = get_dispatch_task(db, task_id=task_id)
+    if not task:
+        return None
+    allowed_fields = ["vehicle_no", "driver_name", "terminal_window"]
+    for field in allowed_fields:
+        if field in update_data and update_data[field] is not None:
+            setattr(task, field, update_data[field])
+    if "planned_departure_time" in update_data and update_data["planned_departure_time"]:
+        task.planned_departure_time = datetime.fromisoformat(update_data["planned_departure_time"].replace('Z', '+00:00'))
+    if "arrival_time" in update_data and update_data["arrival_time"]:
+        task.arrival_time = datetime.fromisoformat(update_data["arrival_time"].replace('Z', '+00:00'))
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def transition_dispatch_status(db: Session, task_id: int, target_status: str, reason: str = None) -> models.DispatchTask:
+    from datetime import datetime
+    task = get_dispatch_task(db, task_id=task_id)
+    if not task:
+        raise ValueError("发运任务不存在")
+
+    valid_transitions = {
+        "pending_approval": ["pending_dispatch", "cancelled"],
+        "pending_dispatch": ["loading", "cancelled"],
+        "loading": ["dispatched", "cancelled"],
+        "dispatched": [],
+        "cancelled": [],
+        "pending_re_review": ["pending_dispatch", "cancelled"],
+    }
+    allowed = valid_transitions.get(task.status, [])
+    if target_status not in allowed:
+        raise ValueError(f"当前状态 {task.status} 不允许转到 {target_status}，允许的目标: {allowed}")
+
+    if target_status == "pending_dispatch" and task.status == "pending_re_review":
+        validation = validate_dispatch_dependencies(db, task_id)
+        if not validation["is_valid"]:
+            raise ValueError(f"依赖校验未通过，不允许转为待出车: {validation['summary']}")
+
+    task.status = target_status
+    task.status_changed_at = datetime.utcnow()
+    if target_status == "pending_dispatch":
+        task.block_reasons = []
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def validate_dispatch_dependencies(db: Session, task_id: int) -> dict:
+    from datetime import datetime
+    task = get_dispatch_task(db, task_id=task_id)
+    if not task:
+        return {"is_valid": False, "block_reasons": [{"type": "not_found", "detail": "发运任务不存在"}], "summary": "任务不存在"}
+
+    plan = get_packing_plan(db, plan_id=task.plan_id)
+    block_reasons = []
+
+    if not plan:
+        block_reasons.append({"type": "version_change", "detail": "关联方案不存在"})
+    else:
+        current_hash = compute_plan_content_hash(db, task.plan_id)
+        if plan.version != task.frozen_version:
+            block_reasons.append({
+                "type": "version_change",
+                "detail": f"方案版本已从v{task.frozen_version}变更为v{plan.version}"
+            })
+        if current_hash != task.frozen_content_hash:
+            block_reasons.append({
+                "type": "version_change",
+                "detail": "方案内容哈希已变更，装载方案被修改"
+            })
+
+    if task.publication_id:
+        pub = get_publication(db, pub_id=task.publication_id)
+        if pub and pub.audit_id:
+            audit = get_compliance_audit(db, audit_id=pub.audit_id)
+            if not audit or audit.status != "valid":
+                block_reasons.append({"type": "audit_invalidated", "detail": f"审核 {pub.audit_no} 已失效(状态: {audit.status if audit else '不存在'})"})
+            elif audit.plan_content_hash != (current_hash if plan else ""):
+                block_reasons.append({"type": "audit_invalidated", "detail": f"审核 {pub.audit_no} 基于旧版本方案"})
+
+    if task.publication_id:
+        pub = get_publication(db, pub_id=task.publication_id)
+        if pub and pub.confirmation_id:
+            conf = get_loading_confirmation(db, conf_id=pub.confirmation_id)
+            if not conf or not conf.is_valid:
+                block_reasons.append({"type": "review_not_released", "detail": f"确认单 {pub.confirmation_no} 已失效"})
+            elif not conf.is_released:
+                block_reasons.append({"type": "review_not_released", "detail": f"确认单 {pub.confirmation_no} 未放行"})
+
+    if task.publication_id:
+        pub = get_publication(db, pub_id=task.publication_id)
+        if pub and pub.route_id:
+            latest_sim = get_latest_simulation_by_route(db, pub.route_id)
+            if latest_sim and latest_sim.has_deadlock:
+                block_reasons.append({"type": "route_outdated", "detail": f"路线 {pub.route_no} 最新推演存在死局"})
+
+    if task.publication_id:
+        pub = get_publication(db, pub_id=task.publication_id)
+        if pub and pub.trailer_plan_id:
+            tp = get_trailer_load_plan(db, plan_id=pub.trailer_plan_id)
+            if tp and tp.status != "valid":
+                block_reasons.append({"type": "trailer_outdated", "detail": f"拖车方案 {pub.trailer_plan_no} 已失效(状态: {tp.status})"})
+            elif tp and tp.plan_content_hash and plan and tp.plan_content_hash != current_hash:
+                block_reasons.append({"type": "trailer_outdated", "detail": f"拖车方案 {pub.trailer_plan_no} 基于旧版本方案"})
+
+    if task.publication_id:
+        pub = get_publication(db, pub_id=task.publication_id)
+        if pub and pub.document_snapshot:
+            for doc_snap in pub.document_snapshot:
+                doc = get_customs_document(db, doc_id=doc_snap.get("document_id"))
+                if doc and doc.status != "valid":
+                    block_reasons.append({"type": "document_outdated", "detail": f"单据 {doc_snap['document_no']} 已失效(状态: {doc.status})"})
+
+    is_valid = len(block_reasons) == 0
+    summary = "所有依赖有效" if is_valid else f"发现 {len(block_reasons)} 项阻断: " + "；".join(b["detail"] for b in block_reasons)
+
+    task.block_reasons = block_reasons
+    task.last_validated_at = datetime.utcnow()
+
+    if not is_valid and task.status in ("pending_dispatch", "pending_approval"):
+        task.status = "pending_re_review"
+        task.status_changed_at = datetime.utcnow()
+
+    db.commit()
+    db.refresh(task)
+
+    return {"is_valid": is_valid, "block_reasons": block_reasons, "summary": summary}
+
+
+def validate_all_active_dispatches(db: Session):
+    active_tasks = db.query(models.DispatchTask).filter(
+        models.DispatchTask.status.in_(["pending_approval", "pending_dispatch", "loading"])
+    ).all()
+    results = []
+    for task in active_tasks:
+        validation = validate_dispatch_dependencies(db, task.id)
+        results.append({
+            "task_id": task.id,
+            "task_no": task.task_no,
+            "plan_no": task.plan_no,
+            "is_valid": validation["is_valid"],
+            "block_reasons": validation["block_reasons"],
+            "new_status": task.status,
+        })
+    return results
+
+

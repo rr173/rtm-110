@@ -2997,3 +2997,308 @@ def get_plan_change_history(
         "history": history
     }
 
+
+def _resolve_dispatch_task(task_identifier: str, db: Session):
+    task = None
+    if task_identifier.isdigit():
+        task = crud.get_dispatch_task(db, task_id=int(task_identifier))
+    if task is None:
+        task = crud.get_dispatch_task(db, task_no=task_identifier)
+    return task
+
+
+def _serialize_publication(pub: models.PublicationRecord) -> dict:
+    result = {
+        "id": pub.id,
+        "publication_no": pub.publication_no,
+        "plan_id": pub.plan_id,
+        "plan_no": pub.plan_no,
+        "plan_version": pub.plan_version,
+        "plan_content_hash": pub.plan_content_hash,
+        "container_no": pub.container_no,
+        "seal_no": pub.seal_no,
+        "audit_no": pub.audit_no,
+        "audit_passed": pub.audit_passed,
+        "confirmation_no": pub.confirmation_no,
+        "confirmation_released": pub.confirmation_released,
+        "route_no": pub.route_no,
+        "simulation_no": pub.simulation_no,
+        "trailer_plan_no": pub.trailer_plan_no,
+        "status": pub.status,
+        "published_by": pub.published_by,
+        "published_at": pub.published_at.isoformat() if pub.published_at else None,
+        "approved_by": pub.approved_by,
+        "approved_at": pub.approved_at.isoformat() if pub.approved_at else None,
+        "rejected_reason": pub.rejected_reason,
+        "gate_check_result": pub.gate_check_result or {},
+    }
+    return result
+
+
+def _serialize_dispatch_task(task: models.DispatchTask, db: Session = None, include_snapshot: bool = False) -> dict:
+    result = {
+        "id": task.id,
+        "task_no": task.task_no,
+        "plan_id": task.plan_id,
+        "plan_no": task.plan_no,
+        "publication_id": task.publication_id,
+        "frozen_version": task.frozen_version,
+        "frozen_content_hash": task.frozen_content_hash,
+        "vehicle_no": task.vehicle_no,
+        "driver_name": task.driver_name,
+        "planned_departure_time": task.planned_departure_time.isoformat() if task.planned_departure_time else None,
+        "arrival_time": task.arrival_time.isoformat() if task.arrival_time else None,
+        "terminal_window": task.terminal_window,
+        "status": task.status,
+        "block_reasons": task.block_reasons or [],
+        "last_validated_at": task.last_validated_at.isoformat() if task.last_validated_at else None,
+        "status_changed_at": task.status_changed_at.isoformat() if task.status_changed_at else None,
+        "created_by": task.created_by,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "updated_at": task.updated_at.isoformat() if task.updated_at else None,
+    }
+    if include_snapshot and db:
+        result["frozen_snapshot"] = task.frozen_snapshot
+        pub = crud.get_publication(db, pub_id=task.publication_id)
+        result["publication_no"] = pub.publication_no if pub else None
+    return result
+
+
+@app.get("/dispatch/plans/{plan_identifier}/gate-check", response_model=schemas.GateCheckResult)
+def check_dispatch_gate(
+    plan_identifier: str,
+    db: Session = Depends(get_db)
+):
+    plan = _resolve_packing_plan(plan_identifier, db)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+    return crud.run_gate_check(db, plan.id)
+
+
+@app.post("/dispatch/publish", response_model=schemas.PublicationDetail)
+def publish_plan(
+    request: schemas.PublicationRequest,
+    db: Session = Depends(get_db)
+):
+    plan = _resolve_packing_plan(request.plan_identifier, db)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+
+    route_id = None
+    if request.route_identifier:
+        route = crud.get_unloading_route(db, route_id=int(request.route_identifier) if request.route_identifier.isdigit() else None, route_no=request.route_identifier if not request.route_identifier.isdigit() else None)
+        if route:
+            route_id = route.id
+
+    simulation_id = None
+    if request.simulation_identifier:
+        sim = crud.get_unloading_simulation(db, simulation_id=int(request.simulation_identifier) if request.simulation_identifier.isdigit() else None, simulation_no=request.simulation_identifier if not request.simulation_identifier.isdigit() else None)
+        if sim:
+            simulation_id = sim.id
+
+    trailer_plan_id = None
+    if request.trailer_plan_identifier:
+        tp = crud.get_trailer_load_plan(db, plan_id=int(request.trailer_plan_identifier) if request.trailer_plan_identifier.isdigit() else None, plan_no=request.trailer_plan_identifier if not request.trailer_plan_identifier.isdigit() else None)
+        if tp:
+            trailer_plan_id = tp.id
+
+    try:
+        pub = crud.create_publication(
+            db, plan_id=plan.id,
+            route_id=route_id,
+            simulation_id=simulation_id,
+            trailer_plan_id=trailer_plan_id,
+            published_by=request.published_by,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    result = _serialize_publication(pub)
+    result["document_snapshot"] = pub.document_snapshot or []
+    result["snapshot_data"] = pub.snapshot_data or {}
+
+    dt = db.query(models.DispatchTask).filter(models.DispatchTask.publication_id == pub.id).first()
+    result["dispatch_task"] = _serialize_dispatch_task(dt, db=db) if dt else None
+    return result
+
+
+@app.post("/dispatch/publish/{pub_identifier}/approve", response_model=schemas.PublicationDetail)
+def approve_publication(
+    pub_identifier: str,
+    request: schemas.PublicationApproveRequest,
+    db: Session = Depends(get_db)
+):
+    pub = None
+    if pub_identifier.isdigit():
+        pub = crud.get_publication(db, pub_id=int(pub_identifier))
+    if pub is None:
+        pub = crud.get_publication(db, publication_no=pub_identifier)
+    if pub is None:
+        raise HTTPException(status_code=404, detail="发布记录不存在")
+
+    try:
+        pub = crud.approve_publication(db, pub_id=pub.id, approved_by=request.approved_by)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    result = _serialize_publication(pub)
+    result["document_snapshot"] = pub.document_snapshot or []
+    result["snapshot_data"] = pub.snapshot_data or {}
+    dt = db.query(models.DispatchTask).filter(models.DispatchTask.publication_id == pub.id).first()
+    result["dispatch_task"] = _serialize_dispatch_task(dt, db=db) if dt else None
+    return result
+
+
+@app.post("/dispatch/publish/{pub_identifier}/reject", response_model=schemas.PublicationDetail)
+def reject_publication(
+    pub_identifier: str,
+    request: schemas.PublicationRejectRequest,
+    db: Session = Depends(get_db)
+):
+    pub = None
+    if pub_identifier.isdigit():
+        pub = crud.get_publication(db, pub_id=int(pub_identifier))
+    if pub is None:
+        pub = crud.get_publication(db, publication_no=pub_identifier)
+    if pub is None:
+        raise HTTPException(status_code=404, detail="发布记录不存在")
+
+    try:
+        pub = crud.reject_publication(db, pub_id=pub.id, rejected_reason=request.rejected_reason)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    result = _serialize_publication(pub)
+    result["document_snapshot"] = pub.document_snapshot or []
+    result["snapshot_data"] = pub.snapshot_data or {}
+    result["dispatch_task"] = None
+    return result
+
+
+@app.get("/dispatch/plans/{plan_identifier}/publish-history", response_model=List[schemas.Publication])
+def get_publish_history(
+    plan_identifier: str,
+    status: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    plan = _resolve_packing_plan(plan_identifier, db)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+
+    pubs = crud.list_publications(db, plan_id=plan.id, status=status, skip=skip, limit=limit)
+    return [_serialize_publication(p) for p in pubs]
+
+
+@app.get("/dispatch/publish/{pub_identifier}", response_model=schemas.PublicationDetail)
+def get_publication_detail(
+    pub_identifier: str,
+    db: Session = Depends(get_db)
+):
+    pub = None
+    if pub_identifier.isdigit():
+        pub = crud.get_publication(db, pub_id=int(pub_identifier))
+    if pub is None:
+        pub = crud.get_publication(db, publication_no=pub_identifier)
+    if pub is None:
+        raise HTTPException(status_code=404, detail="发布记录不存在")
+
+    result = _serialize_publication(pub)
+    result["document_snapshot"] = pub.document_snapshot or []
+    result["snapshot_data"] = pub.snapshot_data or {}
+    dt = db.query(models.DispatchTask).filter(models.DispatchTask.publication_id == pub.id).first()
+    result["dispatch_task"] = _serialize_dispatch_task(dt, db=db) if dt else None
+    return result
+
+
+@app.get("/dispatch/tasks", response_model=List[schemas.DispatchTask])
+def list_dispatch_tasks(
+    plan_no: Optional[str] = None,
+    status: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    tasks = crud.list_dispatch_tasks(db, plan_no=plan_no, status=status, skip=skip, limit=limit)
+    return [_serialize_dispatch_task(t, db=db) for t in tasks]
+
+
+@app.get("/dispatch/tasks/{task_identifier}", response_model=schemas.DispatchTaskDetail)
+def get_dispatch_task_detail(
+    task_identifier: str,
+    db: Session = Depends(get_db)
+):
+    task = _resolve_dispatch_task(task_identifier, db)
+    if task is None:
+        raise HTTPException(status_code=404, detail="发运任务不存在")
+
+    result = _serialize_dispatch_task(task, db=db, include_snapshot=True)
+    result["frozen_snapshot"] = task.frozen_snapshot or {}
+    pub = crud.get_publication(db, pub_id=task.publication_id)
+    result["publication_no"] = pub.publication_no if pub else None
+    return result
+
+
+@app.put("/dispatch/tasks/{task_identifier}", response_model=schemas.DispatchTask)
+def update_dispatch_task(
+    task_identifier: str,
+    request: schemas.DispatchTaskUpdateRequest,
+    db: Session = Depends(get_db)
+):
+    task = _resolve_dispatch_task(task_identifier, db)
+    if task is None:
+        raise HTTPException(status_code=404, detail="发运任务不存在")
+
+    updated = crud.update_dispatch_task(db, task_id=task.id, update_data=request.model_dump())
+    if not updated:
+        raise HTTPException(status_code=400, detail="更新失败")
+    return _serialize_dispatch_task(updated, db=db)
+
+
+@app.post("/dispatch/tasks/{task_identifier}/status", response_model=schemas.DispatchTask)
+def transition_dispatch_status(
+    task_identifier: str,
+    request: schemas.DispatchStatusTransitionRequest,
+    db: Session = Depends(get_db)
+):
+    task = _resolve_dispatch_task(task_identifier, db)
+    if task is None:
+        raise HTTPException(status_code=404, detail="发运任务不存在")
+
+    try:
+        updated = crud.transition_dispatch_status(db, task_id=task.id, target_status=request.target_status, reason=request.reason)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return _serialize_dispatch_task(updated, db=db)
+
+
+@app.post("/dispatch/tasks/{task_identifier}/validate")
+def validate_dispatch_task(
+    task_identifier: str,
+    db: Session = Depends(get_db)
+):
+    task = _resolve_dispatch_task(task_identifier, db)
+    if task is None:
+        raise HTTPException(status_code=404, detail="发运任务不存在")
+
+    validation = crud.validate_dispatch_dependencies(db, task.id)
+    return {
+        "task_id": task.id,
+        "task_no": task.task_no,
+        "is_valid": validation["is_valid"],
+        "block_reasons": validation["block_reasons"],
+        "summary": validation["summary"],
+        "current_status": task.status,
+    }
+
+
+@app.post("/dispatch/validate-all")
+def validate_all_dispatches(db: Session = Depends(get_db)):
+    results = crud.validate_all_active_dispatches(db)
+    return {
+        "total_checked": len(results),
+        "invalid_count": sum(1 for r in results if not r["is_valid"]),
+        "results": results,
+    }
+
