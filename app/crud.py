@@ -504,17 +504,25 @@ def compute_plan_content_hash(db: Session, plan_id: int) -> str:
     packed_cargos = get_packed_cargos(db, plan_id=plan_id)
     cargo_list = []
     for pc in sorted(packed_cargos, key=lambda x: (x.x, x.y, x.z)):
-        cargo_list.append({
+        item = {
             "cargo_id": pc.cargo_id,
             "cargo_name": pc.cargo_name,
             "x": pc.x, "y": pc.y, "z": pc.z,
             "length": pc.length, "width": pc.width, "height": pc.height,
-            "weight": pc.weight, "orientation": pc.orientation
-        })
+            "weight": pc.weight, "orientation": pc.orientation,
+            "max_top_load": pc.max_top_load,
+        }
+        for extra_field in ["can_flip", "site_code", "site_order", "unload_sequence"]:
+            if hasattr(pc, extra_field):
+                item[extra_field] = getattr(pc, extra_field)
+        cargo_list.append(item)
     content = {
         "container_id": plan.container_id,
+        "container_no": plan.container_no,
+        "shipment_no": plan.shipment_no,
         "total_cargos": plan.total_cargos,
         "placed_count": plan.placed_count,
+        "cog_x": plan.cog_x, "cog_y": plan.cog_y, "cog_z": plan.cog_z,
         "cargos": cargo_list,
     }
     return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
@@ -2234,5 +2242,825 @@ def create_demo_unloading_routes(db: Session):
 
     sim_result2 = run_unloading_simulation(packed_cargos_list, stops_list2, assignments_list2)
     create_unloading_simulation(db, route2, sim_result2)
+
+
+def generate_draft_no() -> str:
+    return f"CHG-{uuid.uuid4().hex[:8].upper()}"
+
+
+def generate_analysis_no() -> str:
+    return f"ANA-{uuid.uuid4().hex[:8].upper()}"
+
+
+def generate_snapshot_no() -> str:
+    return f"SNP-{uuid.uuid4().hex[:8].upper()}"
+
+
+def _determine_change_type(proposed_changes: dict) -> str:
+    change_types = set()
+    if proposed_changes.get("cargo_changes"):
+        change_types.add("cargo_info")
+    if proposed_changes.get("site_changes"):
+        change_types.add("site_assign")
+    if proposed_changes.get("plan_meta_changes"):
+        change_types.add("plan_meta")
+
+    if len(change_types) == 0:
+        return "plan_meta"
+    elif len(change_types) == 1:
+        return list(change_types)[0]
+    else:
+        return "mixed"
+
+
+IMPACT_RULES = {
+    "stowage_report": {
+        "affected_by": ["cargo_info"],
+        "fields": ["length", "width", "height", "weight", "max_top_load", "can_flip"],
+        "decision_on_change": "rerun",
+        "decision_on_other": "keep",
+        "reason_rerun": "货物尺寸、重量或承压属性变更，堆码分析结果已失效，需重新生成",
+        "reason_keep": "变更不涉及货物物理属性，堆码报告可继续沿用"
+    },
+    "compliance_audit": {
+        "affected_by": ["cargo_info", "plan_meta"],
+        "fields": ["hazard_class", "temperature_class", "declared_name", "declared_weight", "declared_weight"],
+        "decision_on_change": "rerun",
+        "decision_on_other": "keep",
+        "reason_rerun": "危险品等级、温控等级或申报信息变更，合规校验结果已失效，需重新审核",
+        "reason_keep": "变更不涉及合规校验相关字段，审核结果可继续沿用"
+    },
+    "review_task": {
+        "affected_by": ["cargo_info", "site_assign", "plan_meta"],
+        "fields": ["*"],
+        "decision_on_change": "invalidate",
+        "decision_on_other": "invalidate",
+        "reason_rerun": "",
+        "reason_invalidate": "方案已变更，现场装箱复核基于旧版本方案执行，复核结果自动失效",
+        "reason_keep": ""
+    },
+    "unloading_route": {
+        "affected_by": ["site_assign"],
+        "fields": ["stop_order", "unload_order"],
+        "decision_on_change": "rerun",
+        "decision_on_other": "keep",
+        "reason_rerun": "站点分配或卸货顺序变更，路线规划已失效，需重新规划",
+        "reason_keep": "变更不涉及站点分配，路线规划可继续沿用"
+    },
+    "unloading_simulation": {
+        "affected_by": ["cargo_info", "site_assign"],
+        "fields": ["length", "width", "height", "weight", "stop_order", "unload_order"],
+        "decision_on_change": "rerun",
+        "decision_on_other": "keep",
+        "reason_rerun": "货物属性或站点分配变更，卸货推演结果已失效，需重新推演",
+        "reason_keep": "变更不涉及货物属性或站点分配，推演结果可继续沿用"
+    },
+    "trailer_load": {
+        "affected_by": ["cargo_info"],
+        "fields": ["length", "width", "weight", "cog_offset_x"],
+        "decision_on_change": "rerun",
+        "decision_on_other": "keep",
+        "reason_rerun": "货物尺寸或重量变更，拖车配载和重心计算结果已失效，需重新计算",
+        "reason_keep": "变更不涉及拖车配载相关字段，配载方案可继续沿用"
+    },
+    "customs_document": {
+        "affected_by": ["cargo_info", "plan_meta"],
+        "fields": ["declared_name", "declared_weight", "hazard_class", "container_no", "seal_no", "declared_weight"],
+        "decision_on_change": "invalidate",
+        "decision_on_other": "keep",
+        "reason_invalidate": "申报信息、箱号或铅封号变更，海关单据内容已失效，需作废重开",
+        "reason_keep": "变更不涉及海关申报相关字段，单据可继续沿用"
+    }
+}
+
+
+def _analyze_single_result_impact(
+    result_type: str,
+    result_obj,
+    proposed_changes: dict,
+    plan_version: int
+) -> dict:
+    rules = IMPACT_RULES.get(result_type, {})
+    if not rules:
+        return {
+            "impact_decision": "keep",
+            "impact_reason": "未知结果类型，默认可沿用",
+            "affected_fields": []
+        }
+
+    result_version = getattr(result_obj, "plan_version", None)
+    if result_version is not None and result_version < plan_version:
+        return {
+            "impact_decision": rules["decision_on_change"],
+            "impact_reason": f"该结果基于方案v{result_version}生成，当前已升级到v{plan_version}，" +
+                            (rules.get("reason_rerun", "") or rules.get("reason_invalidate", "")),
+            "affected_fields": ["version"]
+        }
+
+    change_types = set()
+    affected_fields = []
+
+    cargo_changes = proposed_changes.get("cargo_changes", [])
+    if cargo_changes:
+        change_types.add("cargo_info")
+        for cc in cargo_changes:
+            field_name = cc.get("field_name", "")
+            if field_name in rules["fields"] or "*" in rules["fields"]:
+                affected_fields.append(field_name)
+
+    site_changes = proposed_changes.get("site_changes", [])
+    if site_changes:
+        change_types.add("site_assign")
+        if "stop_order" in rules["fields"] or "*" in rules["fields"]:
+            affected_fields.extend(["stop_order", "unload_order"])
+
+    meta_changes = proposed_changes.get("plan_meta_changes", [])
+    if meta_changes:
+        change_types.add("plan_meta")
+        for mc in meta_changes:
+            field_name = mc.get("field_name", "")
+            if field_name in rules["fields"] or "*" in rules["fields"]:
+                affected_fields.append(field_name)
+
+    has_impact = bool(change_types & set(rules["affected_by"])) and bool(affected_fields)
+
+    if has_impact:
+        if rules["decision_on_change"] == "rerun":
+            reason = rules["reason_rerun"]
+        elif rules["decision_on_change"] == "invalidate":
+            reason = rules["reason_invalidate"]
+        else:
+            reason = rules["reason_keep"]
+        return {
+            "impact_decision": rules["decision_on_change"],
+            "impact_reason": reason + f"。受影响字段: {', '.join(sorted(set(affected_fields)))}",
+            "affected_fields": sorted(set(affected_fields))
+        }
+    else:
+        return {
+            "impact_decision": "keep",
+            "impact_reason": rules["reason_keep"],
+            "affected_fields": []
+        }
+
+
+def create_change_draft(
+    db: Session,
+    plan_id: int,
+    change_type: str,
+    change_description: str = None,
+    proposed_changes: dict = None,
+    created_by: str = None,
+    remarks: str = None
+) -> models.ChangeDraft:
+    plan = get_packing_plan(db, plan_id=plan_id)
+    if not plan:
+        raise ValueError("方案不存在")
+
+    draft_no = generate_draft_no()
+    content_hash = compute_plan_content_hash(db, plan_id)
+
+    db_draft = models.ChangeDraft(
+        draft_no=draft_no,
+        plan_id=plan_id,
+        plan_no=plan.plan_no,
+        base_version=plan.version or 1,
+        base_content_hash=content_hash,
+        status="draft",
+        change_type=change_type,
+        change_description=change_description,
+        proposed_changes=proposed_changes or {},
+        created_by=created_by,
+        remarks=remarks
+    )
+    db.add(db_draft)
+    db.commit()
+    db.refresh(db_draft)
+    return db_draft
+
+
+def get_change_draft(db: Session, draft_id: int = None, draft_no: str = None):
+    if draft_id:
+        return db.query(models.ChangeDraft).filter(models.ChangeDraft.id == draft_id).first()
+    if draft_no:
+        return db.query(models.ChangeDraft).filter(models.ChangeDraft.draft_no == draft_no).first()
+    return None
+
+
+def list_change_drafts(
+    db: Session,
+    plan_identifier: str = None,
+    status: str = None,
+    skip: int = 0,
+    limit: int = 100
+):
+    q = db.query(models.ChangeDraft)
+    if plan_identifier:
+        if plan_identifier.isdigit():
+            q = q.filter(models.ChangeDraft.plan_id == int(plan_identifier))
+        else:
+            q = q.filter(models.ChangeDraft.plan_no == plan_identifier)
+    if status:
+        q = q.filter(models.ChangeDraft.status == status)
+    return q.order_by(models.ChangeDraft.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def update_change_draft(
+    db: Session,
+    draft_id: int,
+    update_data: dict
+):
+    draft = get_change_draft(db, draft_id=draft_id)
+    if not draft:
+        return None
+    if draft.status != "draft":
+        raise ValueError(f"草案状态为{draft.status}，不允许修改")
+
+    if "proposed_changes" in update_data:
+        update_data["change_type"] = _determine_change_type(update_data["proposed_changes"])
+
+    for key, value in update_data.items():
+        if hasattr(draft, key) and value is not None:
+            setattr(draft, key, value)
+
+    db.commit()
+    db.refresh(draft)
+    return draft
+
+
+def cancel_change_draft(db: Session, draft_id: int):
+    draft = get_change_draft(db, draft_id=draft_id)
+    if not draft:
+        return None
+    if draft.status in ("applied", "cancelled"):
+        raise ValueError(f"草案状态为{draft.status}，不允许取消")
+    draft.status = "cancelled"
+    db.commit()
+    db.refresh(draft)
+    return draft
+
+
+def _collect_downstream_results(db: Session, plan_id: int, plan_version: int) -> list:
+    results = []
+
+    stowage_reports = db.query(models.StowageReport).filter(
+        models.StowageReport.plan_id == plan_id
+    ).all()
+    for r in stowage_reports:
+        results.append({
+            "type": "stowage_report",
+            "obj": r,
+            "id": r.id,
+            "no": r.report_no,
+            "version": r.plan_version
+        })
+
+    audits = db.query(models.ComplianceAudit).filter(
+        models.ComplianceAudit.plan_id == plan_id
+    ).all()
+    for r in audits:
+        results.append({
+            "type": "compliance_audit",
+            "obj": r,
+            "id": r.id,
+            "no": r.audit_no,
+            "version": r.plan_version
+        })
+
+    review_tasks = db.query(models.ReviewTask).filter(
+        models.ReviewTask.plan_id == plan_id,
+        models.ReviewTask.is_valid == True
+    ).all()
+    for r in review_tasks:
+        results.append({
+            "type": "review_task",
+            "obj": r,
+            "id": r.id,
+            "no": r.task_no,
+            "version": r.plan_version
+        })
+
+    routes = db.query(models.UnloadingRoute).filter(
+        models.UnloadingRoute.plan_id == plan_id
+    ).all()
+    for r in routes:
+        results.append({
+            "type": "unloading_route",
+            "obj": r,
+            "id": r.id,
+            "no": r.route_no,
+            "version": plan_version
+        })
+
+    for route in routes:
+        simulations = db.query(models.UnloadingSimulation).filter(
+            models.UnloadingSimulation.route_id == route.id
+        ).all()
+        for s in simulations:
+            results.append({
+                "type": "unloading_simulation",
+                "obj": s,
+                "id": s.id,
+                "no": s.simulation_no,
+                "version": plan_version,
+                "route_id": route.id
+            })
+
+    trailer_plans = db.query(models.TrailerLoadPlan).all()
+    for r in trailer_plans:
+        results.append({
+            "type": "trailer_load",
+            "obj": r,
+            "id": r.id,
+            "no": r.plan_no,
+            "version": plan_version
+        })
+
+    documents = db.query(models.CustomsDocument).filter(
+        models.CustomsDocument.plan_id == plan_id,
+        models.CustomsDocument.status == "valid"
+    ).all()
+    for r in documents:
+        results.append({
+            "type": "customs_document",
+            "obj": r,
+            "id": r.id,
+            "no": r.document_no,
+            "version": r.plan_version
+        })
+
+    return results
+
+
+def _build_plan_snapshot_data(db: Session, plan_id: int) -> dict:
+    plan = get_packing_plan(db, plan_id=plan_id)
+    if not plan:
+        return {}
+
+    packed_cargos = get_packed_cargos(db, plan_id=plan_id)
+    cargo_list = []
+    for pc in packed_cargos:
+        cargo_list.append({
+            "packed_cargo_id": pc.id,
+            "cargo_id": pc.cargo_id,
+            "cargo_name": pc.cargo_name,
+            "x": pc.x,
+            "y": pc.y,
+            "z": pc.z,
+            "length": pc.length,
+            "width": pc.width,
+            "height": pc.height,
+            "weight": pc.weight,
+            "orientation": pc.orientation,
+            "max_top_load": pc.max_top_load,
+            "temperature_class": pc.temperature_class
+        })
+
+    return {
+        "plan": {
+            "id": plan.id,
+            "plan_no": plan.plan_no,
+            "version": plan.version,
+            "container_id": plan.container_id,
+            "container_name": plan.container_name,
+            "container_no": plan.container_no,
+            "seal_no": plan.seal_no,
+            "declared_weight": plan.declared_weight,
+            "total_cargos": plan.total_cargos,
+            "placed_count": plan.placed_count,
+            "total_weight": plan.total_weight,
+            "volume_utilization": plan.volume_utilization,
+            "cog_x": plan.cog_x,
+            "cog_y": plan.cog_y,
+            "cog_z": plan.cog_z,
+            "content_hash": plan.content_hash
+        },
+        "packed_cargos": cargo_list
+    }
+
+
+def _calculate_field_diffs(before_data: dict, after_data: dict, proposed_changes: dict) -> tuple:
+    field_diffs = []
+    cargo_diffs = []
+
+    plan_before = before_data.get("plan", {})
+    plan_after = after_data.get("plan", {})
+
+    meta_changes = proposed_changes.get("plan_meta_changes", [])
+    for mc in meta_changes:
+        field_name = mc["field_name"]
+        field_diffs.append({
+            "field_name": field_name,
+            "old_value": mc["old_value"],
+            "new_value": mc["new_value"],
+            "change_type": "plan_meta"
+        })
+
+    cargo_changes = proposed_changes.get("cargo_changes", [])
+    cargo_change_map = {}
+    for cc in cargo_changes:
+        cargo_id = cc["cargo_id"]
+        if cargo_id not in cargo_change_map:
+            cargo_change_map[cargo_id] = []
+        cargo_change_map[cargo_id].append(cc)
+
+    cargos_before = {c["packed_cargo_id"]: c for c in before_data.get("packed_cargos", [])}
+    cargos_after = {c["packed_cargo_id"]: c for c in after_data.get("packed_cargos", [])}
+
+    for cargo_id, changes in cargo_change_map.items():
+        cargo_name = ""
+        field_diffs_for_cargo = []
+        for pc in cargos_before.values():
+            if pc["cargo_id"] == cargo_id:
+                cargo_name = pc["cargo_name"]
+                break
+
+        for cc in changes:
+            field_diffs_for_cargo.append({
+                "field_name": cc["field_name"],
+                "old_value": cc["old_value"],
+                "new_value": cc["new_value"],
+                "change_type": "cargo_info"
+            })
+
+        if field_diffs_for_cargo:
+            cargo_diffs.append({
+                "cargo_id": cargo_id,
+                "cargo_name": cargo_name,
+                "field_diffs": field_diffs_for_cargo
+            })
+
+    site_changes = proposed_changes.get("site_changes", [])
+    if site_changes:
+        field_diffs.append({
+            "field_name": "site_assignment",
+            "old_value": f"{len(site_changes)}条站点分配记录",
+            "new_value": f"{len(site_changes)}条站点分配记录已更新",
+            "change_type": "site_assign"
+        })
+
+    return field_diffs, cargo_diffs
+
+
+def run_impact_analysis(db: Session, draft_id: int) -> models.ChangeImpactAnalysis:
+    from datetime import datetime
+
+    draft = get_change_draft(db, draft_id=draft_id)
+    if not draft:
+        raise ValueError("变更草案不存在")
+    if draft.status not in ("draft", "analyzed"):
+        raise ValueError(f"草案状态为{draft.status}，不允许执行分析")
+
+    plan = get_packing_plan(db, plan_id=draft.plan_id)
+    if not plan:
+        raise ValueError("关联方案不存在")
+
+    current_version = plan.version or 1
+    new_version = current_version + 1
+
+    if draft.base_version != current_version:
+        raise ValueError(
+            f"草案基于方案v{draft.base_version}创建，但当前方案已升级到v{current_version}，"
+            "请基于最新版本重新创建变更草案"
+        )
+
+    current_hash = compute_plan_content_hash(db, plan.id)
+    if draft.base_content_hash != current_hash:
+        raise ValueError(
+            "方案内容已被其他操作修改，请基于最新版本重新创建变更草案"
+        )
+
+    draft.status = "analyzing"
+    db.commit()
+
+    proposed_changes = draft.proposed_changes or {}
+    downstream_results = _collect_downstream_results(db, plan.id, current_version)
+
+    analysis_no = generate_analysis_no()
+    db_analysis = models.ChangeImpactAnalysis(
+        analysis_no=analysis_no,
+        draft_id=draft.id,
+        plan_id=plan.id,
+        plan_no=plan.plan_no,
+        base_version=current_version,
+        new_version=new_version,
+        total_affected_count=0,
+        need_rerun_count=0,
+        can_keep_count=0,
+        must_invalidate_count=0
+    )
+    db.add(db_analysis)
+    db.flush()
+
+    impact_items = []
+    need_rerun = 0
+    can_keep = 0
+    must_invalidate = 0
+
+    for result in downstream_results:
+        analysis_result = _analyze_single_result_impact(
+            result["type"],
+            result["obj"],
+            proposed_changes,
+            current_version
+        )
+
+        decision = analysis_result["impact_decision"]
+        if decision == "rerun":
+            need_rerun += 1
+        elif decision == "invalidate":
+            must_invalidate += 1
+        else:
+            can_keep += 1
+
+        db_item = models.ChangeImpactItem(
+            analysis_id=db_analysis.id,
+            result_type=result["type"],
+            result_id=result["id"],
+            result_no=result["no"],
+            result_version=result["version"],
+            impact_decision=decision,
+            impact_reason=analysis_result["impact_reason"],
+            affected_fields=analysis_result["affected_fields"]
+        )
+        impact_items.append(db_item)
+        db.add(db_item)
+
+    total_affected = need_rerun + must_invalidate
+
+    db_analysis.total_affected_count = total_affected
+    db_analysis.need_rerun_count = need_rerun
+    db_analysis.can_keep_count = can_keep
+    db_analysis.must_invalidate_count = must_invalidate
+
+    summary_parts = []
+    if total_affected == 0:
+        summary_parts.append("本次变更不影响任何下游结果，所有历史结果均可继续沿用。")
+    else:
+        if can_keep > 0:
+            summary_parts.append(f"{can_keep}项结果可继续沿用")
+        if need_rerun > 0:
+            summary_parts.append(f"{need_rerun}项结果需要重新生成")
+        if must_invalidate > 0:
+            summary_parts.append(f"{must_invalidate}项结果需要直接失效")
+    db_analysis.analysis_summary = "；".join(summary_parts)
+
+    before_data = _build_plan_snapshot_data(db, plan.id)
+
+    after_data = json.loads(json.dumps(before_data))
+    cargo_changes = proposed_changes.get("cargo_changes", [])
+    for cc in cargo_changes:
+        for pc in after_data["packed_cargos"]:
+            if pc["cargo_id"] == cc["cargo_id"]:
+                field_name = cc["field_name"]
+                if field_name in pc:
+                    pc[field_name] = cc["new_value"]
+
+    meta_changes = proposed_changes.get("plan_meta_changes", [])
+    for mc in meta_changes:
+        field_name = mc["field_name"]
+        if field_name in after_data["plan"]:
+            after_data["plan"][field_name] = mc["new_value"]
+
+    after_data["plan"]["version"] = new_version
+
+    field_diffs, cargo_diffs = _calculate_field_diffs(before_data, after_data, proposed_changes)
+
+    snapshot_no = generate_snapshot_no()
+    db_snapshot = models.ChangeDiffSnapshot(
+        snapshot_no=snapshot_no,
+        analysis_id=db_analysis.id,
+        plan_id=plan.id,
+        plan_no=plan.plan_no,
+        base_version=current_version,
+        new_version=new_version,
+        before_data=before_data,
+        after_data=after_data,
+        field_diffs=field_diffs,
+        cargo_diffs=cargo_diffs
+    )
+    db.add(db_snapshot)
+
+    draft.status = "analyzed"
+    draft.analyzed_at = datetime.utcnow()
+
+    db.commit()
+    db.refresh(db_analysis)
+    db.refresh(draft)
+
+    return db_analysis
+
+
+def apply_change(db: Session, draft_id: int, applied_by: str = None, remarks: str = None) -> models.PackingPlan:
+    from datetime import datetime
+
+    draft = get_change_draft(db, draft_id=draft_id)
+    if not draft:
+        raise ValueError("变更草案不存在")
+    if draft.status != "analyzed":
+        raise ValueError(f"草案状态为{draft.status}，请先执行影响分析")
+
+    plan = get_packing_plan(db, plan_id=draft.plan_id)
+    if not plan:
+        raise ValueError("关联方案不存在")
+
+    current_version = plan.version or 1
+    if draft.base_version != current_version:
+        raise ValueError(
+            f"草案基于方案v{draft.base_version}创建，但当前方案已升级到v{current_version}，"
+            "请基于最新版本重新创建变更草案"
+        )
+
+    analysis = db.query(models.ChangeImpactAnalysis).filter(
+        models.ChangeImpactAnalysis.draft_id == draft.id
+    ).first()
+    if not analysis:
+        raise ValueError("未找到影响分析结果，请先执行影响分析")
+
+    proposed_changes = draft.proposed_changes or {}
+
+    cargo_changes = proposed_changes.get("cargo_changes", [])
+    for cc in cargo_changes:
+        cargo_id = cc["cargo_id"]
+        field_name = cc["field_name"]
+        new_value = cc["new_value"]
+
+        packed_cargos = db.query(models.PackedCargo).filter(
+            models.PackedCargo.plan_id == plan.id,
+            models.PackedCargo.cargo_id == cargo_id
+        ).all()
+        for pc in packed_cargos:
+            if hasattr(pc, field_name):
+                setattr(pc, field_name, new_value)
+
+        cargo = get_cargo(db, cargo_id=cargo_id)
+        if cargo and hasattr(cargo, field_name):
+            setattr(cargo, field_name, new_value)
+
+    meta_changes = proposed_changes.get("plan_meta_changes", [])
+    for mc in meta_changes:
+        field_name = mc["field_name"]
+        new_value = mc["new_value"]
+        if hasattr(plan, field_name):
+            setattr(plan, field_name, new_value)
+
+    site_changes = proposed_changes.get("site_changes", [])
+    if site_changes:
+        routes = db.query(models.UnloadingRoute).filter(
+            models.UnloadingRoute.plan_id == plan.id
+        ).all()
+        for route in routes:
+            for sc in site_changes:
+                assignments = db.query(models.UnloadingCargoAssignment).filter(
+                    models.UnloadingCargoAssignment.route_id == route.id,
+                    models.UnloadingCargoAssignment.packed_cargo_id == sc["packed_cargo_id"]
+                ).all()
+                for assign in assignments:
+                    if sc["new_stop_order"] is not None:
+                        assign.stop_order = sc["new_stop_order"]
+                    if sc["new_unload_order"] is not None:
+                        assign.unload_order = sc["new_unload_order"]
+
+    bump_plan_version(db, plan.id)
+    db.refresh(plan)
+
+    impact_items = db.query(models.ChangeImpactItem).filter(
+        models.ChangeImpactItem.analysis_id == analysis.id
+    ).all()
+
+    for item in impact_items:
+        decision = item.impact_decision
+        result_type = item.result_type
+        result_id = item.result_id
+
+        if decision == "invalidate":
+            if result_type == "review_task":
+                task = db.query(models.ReviewTask).filter(
+                    models.ReviewTask.id == result_id
+                ).first()
+                if task:
+                    task.is_valid = False
+                    task.invalid_reason = f"方案变更(v{current_version}→v{plan.version})：{item.impact_reason}"
+
+                confirmations = db.query(models.LoadingConfirmation).filter(
+                    models.LoadingConfirmation.task_id == result_id
+                ).all()
+                for conf in confirmations:
+                    conf.is_valid = False
+                    conf.status = "void"
+
+            elif result_type == "customs_document":
+                doc = db.query(models.CustomsDocument).filter(
+                    models.CustomsDocument.id == result_id
+                ).first()
+                if doc:
+                    doc.status = "outdated"
+                    doc.void_reason = f"方案变更(v{current_version}→v{plan.version})：{item.impact_reason}"
+                    doc.voided_at = datetime.utcnow()
+
+        elif decision == "rerun":
+            if result_type == "compliance_audit":
+                pass
+            elif result_type == "unloading_route":
+                simulations = db.query(models.UnloadingSimulation).filter(
+                    models.UnloadingSimulation.route_id == result_id
+                ).all()
+                for sim in simulations:
+                    sim.status = "outdated" if hasattr(sim, 'status') else sim.status
+
+    draft.status = "applied"
+    draft.applied_at = datetime.utcnow()
+    draft.applied_by = applied_by
+    if remarks:
+        draft.remarks = (draft.remarks or "") + f"\n应用备注: {remarks}"
+
+    db.commit()
+    db.refresh(plan)
+    db.refresh(draft)
+
+    return plan
+
+
+def get_impact_analysis(db: Session, analysis_id: int = None, analysis_no: str = None):
+    if analysis_id:
+        return db.query(models.ChangeImpactAnalysis).filter(
+            models.ChangeImpactAnalysis.id == analysis_id
+        ).first()
+    if analysis_no:
+        return db.query(models.ChangeImpactAnalysis).filter(
+            models.ChangeImpactAnalysis.analysis_no == analysis_no
+        ).first()
+    return None
+
+
+def get_impact_analyses_by_plan(db: Session, plan_identifier: str, skip: int = 0, limit: int = 100):
+    q = db.query(models.ChangeImpactAnalysis)
+    if plan_identifier.isdigit():
+        q = q.filter(models.ChangeImpactAnalysis.plan_id == int(plan_identifier))
+    else:
+        q = q.filter(models.ChangeImpactAnalysis.plan_no == plan_identifier)
+    return q.order_by(models.ChangeImpactAnalysis.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def get_impact_items_by_analysis(db: Session, analysis_id: int):
+    return db.query(models.ChangeImpactItem).filter(
+        models.ChangeImpactItem.analysis_id == analysis_id
+    ).all()
+
+
+def get_diff_snapshot(db: Session, snapshot_id: int = None, snapshot_no: str = None):
+    if snapshot_id:
+        return db.query(models.ChangeDiffSnapshot).filter(
+            models.ChangeDiffSnapshot.id == snapshot_id
+        ).first()
+    if snapshot_no:
+        return db.query(models.ChangeDiffSnapshot).filter(
+            models.ChangeDiffSnapshot.snapshot_no == snapshot_no
+        ).first()
+    return None
+
+
+def get_change_history(db: Session, plan_identifier: str, skip: int = 0, limit: int = 100):
+    drafts = list_change_drafts(db, plan_identifier=plan_identifier, skip=skip, limit=limit)
+    result = []
+    for draft in drafts:
+        item = {
+            "draft_id": draft.id,
+            "draft_no": draft.draft_no,
+            "plan_id": draft.plan_id,
+            "plan_no": draft.plan_no,
+            "base_version": draft.base_version,
+            "change_type": draft.change_type,
+            "change_description": draft.change_description,
+            "status": draft.status,
+            "created_by": draft.created_by,
+            "created_at": draft.created_at.isoformat() if draft.created_at else None,
+            "analyzed_at": draft.analyzed_at.isoformat() if draft.analyzed_at else None,
+            "applied_at": draft.applied_at.isoformat() if draft.applied_at else None,
+            "applied_by": draft.applied_by,
+            "remarks": draft.remarks,
+            "impact_analysis": None
+        }
+
+        if draft.status in ("analyzed", "applied"):
+            analysis = db.query(models.ChangeImpactAnalysis).filter(
+                models.ChangeImpactAnalysis.draft_id == draft.id
+            ).first()
+            if analysis:
+                item["analysis_no"] = analysis.analysis_no
+                item["new_version"] = analysis.new_version
+                item["impact_analysis"] = {
+                    "analysis_id": analysis.id,
+                    "analysis_no": analysis.analysis_no,
+                    "new_version": analysis.new_version,
+                    "total_affected_count": analysis.total_affected_count,
+                    "need_rerun_count": analysis.need_rerun_count,
+                    "can_keep_count": analysis.can_keep_count,
+                    "must_invalidate_count": analysis.must_invalidate_count,
+                    "analysis_summary": analysis.analysis_summary
+                }
+
+        result.append(item)
+    return result
 
 

@@ -62,6 +62,7 @@ class PackingPlan(Base):
     container_no = Column(String, nullable=True, comment="实际集装箱箱号")
     seal_no = Column(String, nullable=True, comment="铅封号")
     declared_weight = Column(Float, nullable=True, comment="整箱申报重量 kg")
+    shipment_no = Column(String, nullable=True, comment="运单号/提单号")
 
     placed_cargos = relationship("PackedCargo", back_populates="plan", cascade="all, delete-orphan")
     unplaced_cargos = relationship("UnplacedCargo", back_populates="plan", cascade="all, delete-orphan")
@@ -89,6 +90,10 @@ class PackedCargo(Base):
     original_width = Column(Float, nullable=True, comment="原始宽度 mm")
     original_height = Column(Float, nullable=True, comment="原始高度 mm")
     temperature_class = Column(String, nullable=True, default="AMBIENT", comment="温控等级: FROZEN/REFRIGERATED/AMBIENT")
+    can_flip = Column(Boolean, default=True, comment="是否可翻转")
+    site_code = Column(String, nullable=True, comment="卸货站点编码")
+    site_order = Column(Integer, nullable=True, comment="卸货顺序")
+    unload_sequence = Column(Integer, nullable=True, comment="推演的卸货顺序号")
 
     plan = relationship("PackingPlan", back_populates="placed_cargos")
 
@@ -503,4 +508,88 @@ class LoadingConfirmation(Base):
     confirmed_at = Column(DateTime, nullable=True)
 
     task = relationship("ReviewTask", back_populates="confirmations")
+    plan = relationship("PackingPlan")
+
+
+class ChangeDraft(Base):
+    __tablename__ = "change_drafts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    draft_no = Column(String, unique=True, index=True, comment="变更草案编号")
+    plan_id = Column(Integer, ForeignKey("packing_plans.id"), comment="关联方案ID")
+    plan_no = Column(String, index=True, comment="关联方案编号")
+    base_version = Column(Integer, comment="基于的方案版本")
+    base_content_hash = Column(String, comment="基于的方案内容哈希")
+    status = Column(String, default="draft", comment="状态: draft草稿/analyzing分析中/analyzed已分析/applied已应用/cancelled已取消")
+    change_type = Column(String, comment="变更类型: cargo_info货物资料/site_assign站点分配/plan_meta方案元数据/mixed混合")
+    change_description = Column(Text, nullable=True, comment="变更描述")
+    proposed_changes = Column(JSON, default=dict, comment="拟变更内容(JSON)")
+    created_by = Column(String, nullable=True, comment="创建人")
+    created_at = Column(DateTime, server_default=func.now())
+    analyzed_at = Column(DateTime, nullable=True, comment="分析时间")
+    applied_at = Column(DateTime, nullable=True, comment="应用时间")
+    applied_by = Column(String, nullable=True, comment="应用人")
+    remarks = Column(Text, nullable=True)
+
+    plan = relationship("PackingPlan")
+    impact_analysis = relationship("ChangeImpactAnalysis", back_populates="draft", uselist=False, cascade="all, delete-orphan")
+
+
+class ChangeImpactAnalysis(Base):
+    __tablename__ = "change_impact_analyses"
+
+    id = Column(Integer, primary_key=True, index=True)
+    analysis_no = Column(String, unique=True, index=True, comment="分析编号")
+    draft_id = Column(Integer, ForeignKey("change_drafts.id"), comment="关联变更草案ID")
+    plan_id = Column(Integer, ForeignKey("packing_plans.id"), comment="关联方案ID")
+    plan_no = Column(String, index=True, comment="关联方案编号")
+    base_version = Column(Integer, comment="分析时的方案版本")
+    new_version = Column(Integer, comment="变更后的方案版本")
+    total_affected_count = Column(Integer, default=0, comment="受影响的结果总数")
+    need_rerun_count = Column(Integer, default=0, comment="需要重跑的数量")
+    can_keep_count = Column(Integer, default=0, comment="可沿用的数量")
+    must_invalidate_count = Column(Integer, default=0, comment="需失效的数量")
+    analysis_summary = Column(Text, nullable=True, comment="分析摘要")
+    created_at = Column(DateTime, server_default=func.now())
+
+    draft = relationship("ChangeDraft", back_populates="impact_analysis")
+    plan = relationship("PackingPlan")
+    impact_items = relationship("ChangeImpactItem", back_populates="analysis", cascade="all, delete-orphan")
+    diff_snapshot = relationship("ChangeDiffSnapshot", back_populates="analysis", uselist=False, cascade="all, delete-orphan")
+
+
+class ChangeImpactItem(Base):
+    __tablename__ = "change_impact_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    analysis_id = Column(Integer, ForeignKey("change_impact_analyses.id"), comment="关联分析ID")
+    result_type = Column(String, comment="结果类型: stowage_report堆码报告/compliance_audit合规审核/review_task装箱复核/unloading_route卸货路线/unloading_simulation卸货推演/trailer_load拖车装载/customs_document海关单据")
+    result_id = Column(Integer, comment="关联结果ID")
+    result_no = Column(String, index=True, comment="关联结果编号")
+    result_version = Column(Integer, nullable=True, comment="结果关联的方案版本")
+    impact_decision = Column(String, comment="影响决策: keep可沿用/rerun需重跑/invalidate需失效")
+    impact_reason = Column(Text, comment="影响原因")
+    affected_fields = Column(JSON, default=list, comment="受影响的字段列表")
+    created_at = Column(DateTime, server_default=func.now())
+
+    analysis = relationship("ChangeImpactAnalysis", back_populates="impact_items")
+
+
+class ChangeDiffSnapshot(Base):
+    __tablename__ = "change_diff_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    snapshot_no = Column(String, unique=True, index=True, comment="快照编号")
+    analysis_id = Column(Integer, ForeignKey("change_impact_analyses.id"), comment="关联分析ID")
+    plan_id = Column(Integer, ForeignKey("packing_plans.id"), comment="关联方案ID")
+    plan_no = Column(String, index=True, comment="关联方案编号")
+    base_version = Column(Integer, comment="变更前版本")
+    new_version = Column(Integer, comment="变更后版本")
+    before_data = Column(JSON, default=dict, comment="变更前完整数据")
+    after_data = Column(JSON, default=dict, comment="变更后完整数据")
+    field_diffs = Column(JSON, default=list, comment="字段级差异列表")
+    cargo_diffs = Column(JSON, default=list, comment="货物级差异列表")
+    created_at = Column(DateTime, server_default=func.now())
+
+    analysis = relationship("ChangeImpactAnalysis", back_populates="diff_snapshot")
     plan = relationship("PackingPlan")

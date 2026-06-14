@@ -1070,3 +1070,203 @@ class RouteComparisonResult(BaseModel):
     routes: List[RouteComparisonItem]
     recommendation: str
 
+
+class ChangeTypeEnum(str, Enum):
+    CARGO_INFO = "cargo_info"
+    SITE_ASSIGN = "site_assign"
+    PLAN_META = "plan_meta"
+    MIXED = "mixed"
+
+
+class ChangeDraftStatusEnum(str, Enum):
+    DRAFT = "draft"
+    ANALYZING = "analyzing"
+    ANALYZED = "analyzed"
+    APPLIED = "applied"
+    CANCELLED = "cancelled"
+
+
+class ImpactDecisionEnum(str, Enum):
+    KEEP = "keep"
+    RERUN = "rerun"
+    INVALIDATE = "invalidate"
+
+
+class ResultTypeEnum(str, Enum):
+    STOWAGE_REPORT = "stowage_report"
+    COMPLIANCE_AUDIT = "compliance_audit"
+    REVIEW_TASK = "review_task"
+    UNLOADING_ROUTE = "unloading_route"
+    UNLOADING_SIMULATION = "unloading_simulation"
+    TRAILER_LOAD = "trailer_load"
+    CUSTOMS_DOCUMENT = "customs_document"
+
+
+class CargoChangeItem(BaseModel):
+    cargo_id: int
+    field_name: str
+    old_value: Any
+    new_value: Any
+
+
+class SiteChangeItem(BaseModel):
+    packed_cargo_id: int
+    old_stop_order: Optional[int] = None
+    new_stop_order: Optional[int] = None
+    old_unload_order: Optional[int] = None
+    new_unload_order: Optional[int] = None
+
+
+class PlanMetaChangeItem(BaseModel):
+    field_name: str
+    old_value: Any
+    new_value: Any
+
+
+class ProposedChanges(BaseModel):
+    cargo_changes: List[CargoChangeItem] = []
+    site_changes: List[SiteChangeItem] = []
+    plan_meta_changes: List[PlanMetaChangeItem] = []
+
+
+class ChangeDraftCreate(BaseModel):
+    plan_identifier: str = Field(description="方案ID或方案编号")
+    change_type: ChangeTypeEnum
+    change_description: Optional[str] = None
+    proposed_changes: ProposedChanges
+    created_by: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+class ChangeDraftUpdate(BaseModel):
+    change_type: Optional[ChangeTypeEnum] = None
+    change_description: Optional[str] = None
+    proposed_changes: Optional[ProposedChanges] = None
+    remarks: Optional[str] = None
+
+
+class ChangeImpactItemBase(BaseModel):
+    result_type: ResultTypeEnum
+    result_id: int
+    result_no: str
+    result_version: Optional[int] = None
+    impact_decision: ImpactDecisionEnum
+    impact_reason: str
+    affected_fields: List[str] = []
+
+
+class ChangeImpactItem(ChangeImpactItemBase):
+    id: int
+    analysis_id: int
+    created_at: str
+
+    class Config:
+        from_attributes = True
+
+
+class FieldDiffItem(BaseModel):
+    field_name: str
+    old_value: Any
+    new_value: Any
+    change_type: str
+
+
+class CargoDiffItem(BaseModel):
+    cargo_id: int
+    cargo_name: str
+    field_diffs: List[FieldDiffItem] = []
+
+
+class ChangeDiffSnapshotBase(BaseModel):
+    plan_id: int
+    plan_no: str
+    base_version: int
+    new_version: int
+    before_data: Dict[str, Any] = {}
+    after_data: Dict[str, Any] = {}
+    field_diffs: List[FieldDiffItem] = []
+    cargo_diffs: List[CargoDiffItem] = []
+
+
+class ChangeDiffSnapshot(ChangeDiffSnapshotBase):
+    id: int
+    snapshot_no: str
+    analysis_id: int
+    created_at: str
+
+    class Config:
+        from_attributes = True
+
+
+class ChangeImpactAnalysisBase(BaseModel):
+    plan_id: int
+    plan_no: str
+    base_version: int
+    new_version: int
+    total_affected_count: int = 0
+    need_rerun_count: int = 0
+    can_keep_count: int = 0
+    must_invalidate_count: int = 0
+    analysis_summary: Optional[str] = None
+
+
+class ChangeImpactAnalysis(ChangeImpactAnalysisBase):
+    id: int
+    analysis_no: str
+    draft_id: int
+    created_at: str
+    impact_items: List[ChangeImpactItem] = []
+    diff_snapshot: Optional[ChangeDiffSnapshot] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ChangeImpactAnalysisDetail(ChangeImpactAnalysis):
+    impact_items: List[ChangeImpactItem] = []
+    diff_snapshot: Optional[ChangeDiffSnapshot] = None
+
+
+class ChangeDraftBase(BaseModel):
+    plan_id: int
+    plan_no: str
+    base_version: int
+    base_content_hash: str
+    status: ChangeDraftStatusEnum
+    change_type: ChangeTypeEnum
+    change_description: Optional[str] = None
+    proposed_changes: ProposedChanges
+    created_by: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+class ChangeDraft(ChangeDraftBase):
+    id: int
+    draft_no: str
+    created_at: str
+    analyzed_at: Optional[str] = None
+    applied_at: Optional[str] = None
+    applied_by: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ChangeDraftDetail(ChangeDraft):
+    impact_analysis: Optional[ChangeImpactAnalysisDetail] = None
+
+
+class ChangeDraftList(ChangeDraft):
+    impact_analysis: Optional[ChangeImpactAnalysisBase] = None
+
+
+class ChangeApplyRequest(BaseModel):
+    applied_by: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+class ChangeImpactAnalysisResult(BaseModel):
+    draft_id: int
+    draft_no: str
+    analysis: ChangeImpactAnalysisDetail
+

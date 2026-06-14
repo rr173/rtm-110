@@ -2610,3 +2610,390 @@ def get_plan_unloading_routes(
         db=db
     )
 
+
+def _resolve_change_draft(draft_identifier: str, db: Session):
+    draft = None
+    if draft_identifier.isdigit():
+        draft = crud.get_change_draft(db, draft_id=int(draft_identifier))
+    if draft is None:
+        draft = crud.get_change_draft(db, draft_no=draft_identifier)
+    return draft
+
+
+def _serialize_change_draft(draft: models.ChangeDraft) -> dict:
+    proposed = draft.proposed_changes or {}
+    return {
+        "id": draft.id,
+        "draft_no": draft.draft_no,
+        "plan_id": draft.plan_id,
+        "plan_no": draft.plan_no,
+        "base_version": draft.base_version,
+        "base_content_hash": draft.base_content_hash,
+        "status": draft.status,
+        "change_type": draft.change_type,
+        "change_description": draft.change_description,
+        "proposed_changes": {
+            "cargo_changes": proposed.get("cargo_changes", []),
+            "site_changes": proposed.get("site_changes", []),
+            "plan_meta_changes": proposed.get("plan_meta_changes", []),
+        },
+        "created_by": draft.created_by,
+        "created_at": draft.created_at.isoformat() if draft.created_at else None,
+        "analyzed_at": draft.analyzed_at.isoformat() if draft.analyzed_at else None,
+        "applied_at": draft.applied_at.isoformat() if draft.applied_at else None,
+        "applied_by": draft.applied_by,
+        "remarks": draft.remarks,
+    }
+
+
+def _serialize_impact_analysis(analysis: models.ChangeImpactAnalysis, include_items: bool = True) -> dict:
+    result = {
+        "id": analysis.id,
+        "analysis_no": analysis.analysis_no,
+        "draft_id": analysis.draft_id,
+        "plan_id": analysis.plan_id,
+        "plan_no": analysis.plan_no,
+        "base_version": analysis.base_version,
+        "new_version": analysis.new_version,
+        "total_affected_count": analysis.total_affected_count,
+        "need_rerun_count": analysis.need_rerun_count,
+        "can_keep_count": analysis.can_keep_count,
+        "must_invalidate_count": analysis.must_invalidate_count,
+        "analysis_summary": analysis.analysis_summary,
+        "created_at": analysis.created_at.isoformat() if analysis.created_at else None,
+    }
+
+    if include_items:
+        impact_items = []
+        for item in analysis.impact_items:
+            impact_items.append({
+                "id": item.id,
+                "analysis_id": item.analysis_id,
+                "result_type": item.result_type,
+                "result_id": item.result_id,
+                "result_no": item.result_no,
+                "result_version": item.result_version,
+                "impact_decision": item.impact_decision,
+                "impact_reason": item.impact_reason,
+                "affected_fields": item.affected_fields or [],
+                "created_at": item.created_at.isoformat() if item.created_at else None,
+            })
+        result["impact_items"] = impact_items
+
+        if analysis.diff_snapshot:
+            snap = analysis.diff_snapshot
+            result["diff_snapshot"] = {
+                "id": snap.id,
+                "snapshot_no": snap.snapshot_no,
+                "analysis_id": snap.analysis_id,
+                "plan_id": snap.plan_id,
+                "plan_no": snap.plan_no,
+                "base_version": snap.base_version,
+                "new_version": snap.new_version,
+                "before_data": snap.before_data or {},
+                "after_data": snap.after_data or {},
+                "field_diffs": snap.field_diffs or [],
+                "cargo_diffs": snap.cargo_diffs or [],
+                "created_at": snap.created_at.isoformat() if snap.created_at else None,
+            }
+        else:
+            result["diff_snapshot"] = None
+
+    return result
+
+
+@app.post("/change/drafts", response_model=schemas.ChangeDraftDetail)
+def create_change_draft(
+    request: schemas.ChangeDraftCreate,
+    db: Session = Depends(get_db)
+):
+    plan = None
+    if request.plan_identifier.isdigit():
+        plan = crud.get_packing_plan(db, plan_id=int(request.plan_identifier))
+    if plan is None:
+        plan = crud.get_packing_plan(db, plan_no=request.plan_identifier)
+
+    if plan is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+
+    try:
+        draft = crud.create_change_draft(
+            db=db,
+            plan_id=plan.id,
+            change_type=request.change_type.value,
+            change_description=request.change_description,
+            proposed_changes=request.proposed_changes.model_dump(),
+            created_by=request.created_by,
+            remarks=request.remarks
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return get_change_draft_detail(draft_identifier=str(draft.id), db=db)
+
+
+@app.get("/change/drafts", response_model=List[schemas.ChangeDraftList])
+def list_change_drafts(
+    plan_identifier: Optional[str] = None,
+    status: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    drafts = crud.list_change_drafts(
+        db,
+        plan_identifier=plan_identifier,
+        status=status,
+        skip=skip,
+        limit=limit
+    )
+
+    result = []
+    for draft in drafts:
+        draft_data = _serialize_change_draft(draft)
+        if draft.status in ("analyzed", "applied") and draft.impact_analysis:
+            draft_data["impact_analysis"] = {
+                "id": draft.impact_analysis.id,
+                "analysis_no": draft.impact_analysis.analysis_no,
+                "plan_id": draft.impact_analysis.plan_id,
+                "plan_no": draft.impact_analysis.plan_no,
+                "base_version": draft.impact_analysis.base_version,
+                "new_version": draft.impact_analysis.new_version,
+                "total_affected_count": draft.impact_analysis.total_affected_count,
+                "need_rerun_count": draft.impact_analysis.need_rerun_count,
+                "can_keep_count": draft.impact_analysis.can_keep_count,
+                "must_invalidate_count": draft.impact_analysis.must_invalidate_count,
+                "analysis_summary": draft.impact_analysis.analysis_summary,
+                "created_at": draft.impact_analysis.created_at.isoformat() if draft.impact_analysis.created_at else None,
+            }
+        else:
+            draft_data["impact_analysis"] = None
+        result.append(draft_data)
+
+    return result
+
+
+@app.get("/change/drafts/{draft_identifier}", response_model=schemas.ChangeDraftDetail)
+def get_change_draft_detail(
+    draft_identifier: str,
+    db: Session = Depends(get_db)
+):
+    draft = _resolve_change_draft(draft_identifier, db)
+    if draft is None:
+        raise HTTPException(status_code=404, detail="变更草案不存在")
+
+    draft_data = _serialize_change_draft(draft)
+
+    if draft.impact_analysis:
+        draft_data["impact_analysis"] = _serialize_impact_analysis(draft.impact_analysis, include_items=True)
+    else:
+        draft_data["impact_analysis"] = None
+
+    return draft_data
+
+
+@app.put("/change/drafts/{draft_identifier}", response_model=schemas.ChangeDraftDetail)
+def update_change_draft(
+    draft_identifier: str,
+    request: schemas.ChangeDraftUpdate,
+    db: Session = Depends(get_db)
+):
+    draft = _resolve_change_draft(draft_identifier, db)
+    if draft is None:
+        raise HTTPException(status_code=404, detail="变更草案不存在")
+
+    update_data = {}
+    if request.change_type is not None:
+        update_data["change_type"] = request.change_type.value
+    if request.change_description is not None:
+        update_data["change_description"] = request.change_description
+    if request.proposed_changes is not None:
+        update_data["proposed_changes"] = request.proposed_changes.model_dump()
+    if request.remarks is not None:
+        update_data["remarks"] = request.remarks
+
+    try:
+        draft = crud.update_change_draft(db, draft_id=draft.id, update_data=update_data)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return get_change_draft_detail(draft_identifier=str(draft.id), db=db)
+
+
+@app.post("/change/drafts/{draft_identifier}/cancel")
+def cancel_change_draft(
+    draft_identifier: str,
+    db: Session = Depends(get_db)
+):
+    draft = _resolve_change_draft(draft_identifier, db)
+    if draft is None:
+        raise HTTPException(status_code=404, detail="变更草案不存在")
+
+    try:
+        draft = crud.cancel_change_draft(db, draft_id=draft.id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "message": "变更草案已取消",
+        "draft_id": draft.id,
+        "draft_no": draft.draft_no,
+        "status": draft.status
+    }
+
+
+@app.post("/change/drafts/{draft_identifier}/analyze", response_model=schemas.ChangeImpactAnalysisResult)
+def analyze_change_impact(
+    draft_identifier: str,
+    db: Session = Depends(get_db)
+):
+    draft = _resolve_change_draft(draft_identifier, db)
+    if draft is None:
+        raise HTTPException(status_code=404, detail="变更草案不存在")
+
+    try:
+        analysis = crud.run_impact_analysis(db, draft_id=draft.id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "draft_id": draft.id,
+        "draft_no": draft.draft_no,
+        "analysis": _serialize_impact_analysis(analysis, include_items=True)
+    }
+
+
+@app.post("/change/drafts/{draft_identifier}/apply")
+def apply_change(
+    draft_identifier: str,
+    request: schemas.ChangeApplyRequest,
+    db: Session = Depends(get_db)
+):
+    draft = _resolve_change_draft(draft_identifier, db)
+    if draft is None:
+        raise HTTPException(status_code=404, detail="变更草案不存在")
+
+    try:
+        plan = crud.apply_change(
+            db,
+            draft_id=draft.id,
+            applied_by=request.applied_by,
+            remarks=request.remarks
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    analysis = crud.get_impact_analysis(db, analysis_id=draft.impact_analysis.id) if draft.impact_analysis else None
+
+    return {
+        "message": "变更已应用",
+        "draft_id": draft.id,
+        "draft_no": draft.draft_no,
+        "plan_id": plan.id,
+        "plan_no": plan.plan_no,
+        "new_version": plan.version,
+        "new_content_hash": plan.content_hash,
+        "applied_at": draft.applied_at.isoformat() if draft.applied_at else None,
+        "applied_by": draft.applied_by,
+        "impact_summary": {
+            "total_affected": analysis.total_affected_count if analysis else 0,
+            "need_rerun": analysis.need_rerun_count if analysis else 0,
+            "can_keep": analysis.can_keep_count if analysis else 0,
+            "must_invalidate": analysis.must_invalidate_count if analysis else 0,
+        } if analysis else None
+    }
+
+
+@app.get("/change/analyses", response_model=List[schemas.ChangeImpactAnalysis])
+def list_impact_analyses(
+    plan_identifier: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    if plan_identifier:
+        analyses = crud.get_impact_analyses_by_plan(db, plan_identifier=plan_identifier, skip=skip, limit=limit)
+    else:
+        analyses = db.query(models.ChangeImpactAnalysis).order_by(
+            models.ChangeImpactAnalysis.created_at.desc()
+        ).offset(skip).limit(limit).all()
+
+    result = []
+    for analysis in analyses:
+        result.append(_serialize_impact_analysis(analysis, include_items=False))
+    return result
+
+
+@app.get("/change/analyses/{analysis_identifier}", response_model=schemas.ChangeImpactAnalysisDetail)
+def get_impact_analysis_detail(
+    analysis_identifier: str,
+    db: Session = Depends(get_db)
+):
+    analysis = None
+    if analysis_identifier.isdigit():
+        analysis = crud.get_impact_analysis(db, analysis_id=int(analysis_identifier))
+    if analysis is None:
+        analysis = crud.get_impact_analysis(db, analysis_no=analysis_identifier)
+
+    if analysis is None:
+        raise HTTPException(status_code=404, detail="影响分析记录不存在")
+
+    return _serialize_impact_analysis(analysis, include_items=True)
+
+
+@app.get("/change/snapshots/{snapshot_identifier}", response_model=schemas.ChangeDiffSnapshot)
+def get_diff_snapshot(
+    snapshot_identifier: str,
+    db: Session = Depends(get_db)
+):
+    snapshot = None
+    if snapshot_identifier.isdigit():
+        snapshot = crud.get_diff_snapshot(db, snapshot_id=int(snapshot_identifier))
+    if snapshot is None:
+        snapshot = crud.get_diff_snapshot(db, snapshot_no=snapshot_identifier)
+
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="差异快照不存在")
+
+    return {
+        "id": snapshot.id,
+        "snapshot_no": snapshot.snapshot_no,
+        "analysis_id": snapshot.analysis_id,
+        "plan_id": snapshot.plan_id,
+        "plan_no": snapshot.plan_no,
+        "base_version": snapshot.base_version,
+        "new_version": snapshot.new_version,
+        "before_data": snapshot.before_data or {},
+        "after_data": snapshot.after_data or {},
+        "field_diffs": snapshot.field_diffs or [],
+        "cargo_diffs": snapshot.cargo_diffs or [],
+        "created_at": snapshot.created_at.isoformat() if snapshot.created_at else None,
+    }
+
+
+@app.get("/plans/{plan_identifier}/change-history")
+def get_plan_change_history(
+    plan_identifier: str,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    plan = None
+    if plan_identifier.isdigit():
+        plan = crud.get_packing_plan(db, plan_id=int(plan_identifier))
+    if plan is None:
+        plan = crud.get_packing_plan(db, plan_no=plan_identifier)
+
+    if plan is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+
+    history = crud.get_change_history(db, plan_identifier=plan_identifier, skip=skip, limit=limit)
+
+    return {
+        "plan_id": plan.id,
+        "plan_no": plan.plan_no,
+        "current_version": plan.version,
+        "total_changes": len(history),
+        "history": history
+    }
+
