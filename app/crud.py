@@ -356,7 +356,9 @@ def create_trailer_load_plan(db: Session, plan_data: dict, loaded_boxes: list, u
     return db_plan
 
 
-def get_trailer_load_plan(db: Session, plan_id: int = None, plan_no: str = None):
+def get_trailer_load_plan(db: Session, plan_id: int = None, plan_no: str = None, trailer_plan_id: int = None):
+    if trailer_plan_id:
+        return db.query(models.TrailerLoadPlan).filter(models.TrailerLoadPlan.id == trailer_plan_id).first()
     if plan_id:
         return db.query(models.TrailerLoadPlan).filter(models.TrailerLoadPlan.id == plan_id).first()
     if plan_no:
@@ -3296,19 +3298,32 @@ def create_publication(
     simulation_obj = None
     if route_id:
         route_obj = get_unloading_route(db, route_id=route_id)
-    elif not route_id:
+        if not route_obj:
+            raise ValueError(f"路线 {route_id} 不存在")
+        if route_obj.plan_id != plan_id:
+            raise ValueError(f"路线 {route_id} 不属于当前方案，串单风险")
+    else:
         routes = db.query(models.UnloadingRoute).filter(models.UnloadingRoute.plan_id == plan_id).all()
         if routes:
             route_obj = routes[0]
 
     if simulation_id:
         simulation_obj = get_unloading_simulation(db, simulation_id=simulation_id)
+        if not simulation_obj:
+            raise ValueError(f"路线推演 {simulation_id} 不存在")
+        route_of_sim = None
+        if simulation_obj.route_id:
+            route_of_sim = get_unloading_route(db, route_id=simulation_obj.route_id)
+        if not route_of_sim or route_of_sim.plan_id != plan_id:
+            raise ValueError(f"路线推演 {simulation_id} 不属于当前方案，串单风险")
     elif route_obj:
         simulation_obj = get_latest_simulation_by_route(db, route_obj.id)
 
     trailer_obj = None
     if trailer_plan_id:
-        trailer_obj = get_trailer_load_plan(db, plan_id=trailer_plan_id)
+        trailer_obj = get_trailer_load_plan(db, plan_id=plan_id, trailer_plan_id=trailer_plan_id)
+        if not trailer_obj:
+            raise ValueError(f"拖车装载方案 {trailer_plan_id} 不存在或不属于当前方案，串单风险")
     else:
         trailer_plans = db.query(models.TrailerLoadPlan).filter(
             models.TrailerLoadPlan.packing_plan_id == plan_id,
@@ -3430,9 +3445,58 @@ def approve_publication(db: Session, pub_id: int, approved_by: str) -> models.Pu
     if pub.status != "pending_approval":
         raise ValueError(f"当前状态为 {pub.status}，不允许审批")
 
+    plan = get_packing_plan(db, plan_id=pub.plan_id)
+    if not plan:
+        raise ValueError("关联方案已不存在，无法审批")
+
+    current_hash = compute_plan_content_hash(db, pub.plan_id)
+    current_version = plan.version or 1
+
+    if current_version != pub.plan_version:
+        raise ValueError(
+            f"方案版本已变更(冻结:v{pub.plan_version} → 当前:v{current_version})，请重新走闸口发布"
+        )
+    if current_hash != pub.plan_content_hash:
+        raise ValueError(
+            "方案内容哈希已变化(冻结与当前不一致)，说明发布后方案被改动，请重新走闸口发布"
+        )
+
+    gate_result = run_gate_check(db, pub.plan_id)
+    if not gate_result["can_publish"]:
+        checks_summary = "; ".join(
+            f"[{c.get('name')}]{c.get('message','')}" for c in gate_result.get("checks", []) if not c.get("passed")
+        )
+        raise ValueError(f"审批前重跑闸口未通过: {gate_result['summary']} 详情: {checks_summary}")
+
+    if pub.route_id:
+        r = get_unloading_route(db, route_id=pub.route_id)
+        if (not r) or r.plan_id != pub.plan_id or r.status == "invalid":
+            raise ValueError(f"冻结的路线 {pub.route_id} 已失效/不属于本方案，请重新发布")
+    if pub.simulation_id:
+        s = get_unloading_simulation(db, simulation_id=pub.simulation_id)
+        if not s:
+            raise ValueError(f"冻结的路线推演 {pub.simulation_id} 已不存在，请重新发布")
+        sim_route = get_unloading_route(db, route_id=s.route_id) if s.route_id else None
+        if (not sim_route) or sim_route.plan_id != pub.plan_id:
+            raise ValueError(f"冻结的路线推演 {pub.simulation_id} 不属于本方案，请重新发布")
+    if pub.trailer_plan_id:
+        t = get_trailer_load_plan(db, trailer_plan_id=pub.trailer_plan_id)
+        if (not t) or t.packing_plan_id != pub.plan_id or t.status == "invalid":
+            raise ValueError(f"冻结的拖车装载方案 {pub.trailer_plan_id} 已失效/不属于本方案，请重新发布")
+
     pub.status = "approved"
     pub.approved_by = approved_by
     pub.approved_at = datetime.utcnow()
+    pub.gate_check_result = gate_result
+
+    snapshot = pub.snapshot_data or {}
+    if isinstance(snapshot, dict):
+        snapshot["gate_check_at_approve"] = gate_result
+        snapshot["approved_plan_snapshot"] = {
+            "version": current_version,
+            "content_hash": current_hash,
+        }
+        pub.snapshot_data = snapshot
 
     dispatch_no = generate_dispatch_no()
     db_dispatch = models.DispatchTask(
