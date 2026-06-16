@@ -722,3 +722,143 @@ class BatchTaskItem(Base):
     batch = relationship("BatchShipment", back_populates="task_items")
     dispatch_task = relationship("DispatchTask")
     plan = relationship("PackingPlan")
+
+
+class RateScheme(Base):
+    __tablename__ = "rate_schemes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    scheme_code = Column(String, unique=True, index=True, comment="费率方案编码")
+    scheme_name = Column(String, index=True, comment="费率方案名称(如:马士基2025Q2)")
+    carrier = Column(String, nullable=True, comment="承运商/船公司")
+    trade_lane = Column(String, nullable=True, comment="贸易航线(如:远东-欧洲)")
+    effective_from = Column(DateTime, nullable=True, comment="生效起始日期")
+    effective_to = Column(DateTime, nullable=True, comment="生效截止日期")
+    currency = Column(String, default="CNY", comment="币种")
+    is_default = Column(Boolean, default=False, comment="是否为默认费率方案")
+    is_active = Column(Boolean, default=True, comment="是否启用")
+    description = Column(Text, nullable=True, comment="备注说明")
+    created_at = Column(DateTime, server_default=func.now())
+    created_by = Column(String, nullable=True)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    container_rates = relationship("ContainerRateConfig", back_populates="scheme", cascade="all, delete-orphan")
+    cost_calculations = relationship("CostCalculation", back_populates="scheme")
+
+
+class ContainerRateConfig(Base):
+    __tablename__ = "container_rate_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    scheme_id = Column(Integer, ForeignKey("rate_schemes.id"), comment="所属费率方案ID")
+    container_id = Column(Integer, ForeignKey("containers.id"), comment="关联集装箱箱型ID")
+    container_name = Column(String, comment="集装箱名称快照")
+    base_freight = Column(Float, default=0.0, comment="单箱基础运费")
+    overweight_threshold_kg = Column(Float, default=0.0, comment="超重判定阈值 kg,0表示不限制")
+    overweight_surcharge_per_kg = Column(Float, default=0.0, comment="超重附加费 元/kg(超出部分)")
+    overweight_surcharge_flat = Column(Float, default=0.0, comment="超重附加费 定额 元/箱")
+    reefer_surcharge = Column(Float, default=0.0, comment="冷链(冷藏/冷冻)附加费 元/箱")
+    frozen_surcharge = Column(Float, default=0.0, comment="冷冻附加费(在冷藏基础上额外加收) 元/箱")
+    hazard_surcharge_by_class = Column(JSON, default=dict, comment="按危险品等级的附加费配置 {\"1\": 5000, \"2\": 3000} 元/箱")
+    hazard_surcharge_per_kg = Column(Float, default=0.0, comment="危险品按重量附加费 元/kg")
+    is_active = Column(Boolean, default=True, comment="是否启用")
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    scheme = relationship("RateScheme", back_populates="container_rates")
+    container = relationship("Container")
+
+
+class CostCalculation(Base):
+    __tablename__ = "cost_calculations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    calculation_no = Column(String, unique=True, index=True, comment="费用计算编号")
+    scheme_id = Column(Integer, ForeignKey("rate_schemes.id"), comment="使用的费率方案ID")
+    plan_id = Column(Integer, ForeignKey("packing_plans.id"), comment="配载方案ID")
+    plan_no = Column(String, index=True, comment="配载方案编号")
+    plan_version = Column(Integer, comment="配载方案版本号")
+    plan_content_hash = Column(String, nullable=True, comment="配载方案内容哈希")
+    total_base_freight = Column(Float, default=0.0, comment="基础运费合计")
+    total_overweight_surcharge = Column(Float, default=0.0, comment="超重附加费合计")
+    total_reefer_surcharge = Column(Float, default=0.0, comment="冷链附加费合计")
+    total_frozen_surcharge = Column(Float, default=0.0, comment="冷冻附加费合计")
+    total_hazard_surcharge = Column(Float, default=0.0, comment="危险品附加费合计")
+    total_cost = Column(Float, default=0.0, comment="总费用合计")
+    currency = Column(String, default="CNY", comment="币种")
+    calculation_status = Column(String, default="completed", comment="计算状态: pending计算中/completed已完成/failed失败")
+    error_message = Column(Text, nullable=True, comment="错误信息")
+    remarks = Column(Text, nullable=True)
+    calculated_by = Column(String, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+    scheme = relationship("RateScheme", back_populates="cost_calculations")
+    plan = relationship("PackingPlan")
+    box_details = relationship("BoxCostDetail", back_populates="calculation", cascade="all, delete-orphan")
+    cargo_allocations = relationship("CargoCostAllocation", back_populates="calculation", cascade="all, delete-orphan")
+
+
+class BoxCostDetail(Base):
+    __tablename__ = "box_cost_details"
+
+    id = Column(Integer, primary_key=True, index=True)
+    calculation_id = Column(Integer, ForeignKey("cost_calculations.id"), comment="所属费用计算ID")
+    plan_id = Column(Integer, ForeignKey("packing_plans.id"), comment="配载方案ID")
+    container_id = Column(Integer, ForeignKey("containers.id"), comment="箱型ID")
+    container_name = Column(String, comment="箱型名称")
+    box_index = Column(Integer, default=0, comment="箱号索引(多箱时从1开始)")
+    actual_weight_kg = Column(Float, default=0.0, comment="实际装箱重量 kg")
+    total_cargo_volume_cbm = Column(Float, default=0.0, comment="箱内货物总体积 CBM")
+    cargo_count = Column(Integer, default=0, comment="箱内货物件数")
+    has_hazard = Column(Boolean, default=False, comment="是否含危险品")
+    highest_hazard_class = Column(Integer, nullable=True, comment="箱内最高危险品等级")
+    temperature_mode = Column(String, default="AMBIENT", comment="箱内温控模式: AMBIENT/REFRIGERATED/FROZEN")
+    base_freight = Column(Float, default=0.0, comment="基础运费")
+    overweight_surcharge = Column(Float, default=0.0, comment="超重附加费")
+    overweight_details = Column(JSON, default=dict, comment="超重附加费计算详情 {threshold_kg, actual_weight_kg, overweight_kg, surcharge_type, amount}")
+    reefer_surcharge = Column(Float, default=0.0, comment="冷链附加费")
+    frozen_surcharge = Column(Float, default=0.0, comment="冷冻附加费")
+    hazard_surcharge = Column(Float, default=0.0, comment="危险品附加费")
+    hazard_details = Column(JSON, default=dict, comment="危险品附加费计算详情 {classes: [1,3], by_class_amount, per_kg_amount, total}")
+    temperature_details = Column(JSON, default=dict, comment="温控相关计算详情 {mode, reefer_applied, frozen_applied, amount}")
+    subtotal_shared = Column(Float, default=0.0, comment="需均摊的费用合计(基础运费+超重附加费)")
+    subtotal_dedicated = Column(Float, default=0.0, comment="需定向分摊的费用合计(冷链+危险品专属部分)")
+    subtotal_all = Column(Float, default=0.0, comment="该箱总费用 = subtotal_shared + subtotal_dedicated")
+    created_at = Column(DateTime, server_default=func.now())
+
+    calculation = relationship("CostCalculation", back_populates="box_details")
+    plan = relationship("PackingPlan")
+    container = relationship("Container")
+
+
+class CargoCostAllocation(Base):
+    __tablename__ = "cargo_cost_allocations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    calculation_id = Column(Integer, ForeignKey("cost_calculations.id"), comment="所属费用计算ID")
+    box_detail_id = Column(Integer, ForeignKey("box_cost_details.id"), comment="所属箱费用明细ID")
+    plan_id = Column(Integer, ForeignKey("packing_plans.id"), comment="配载方案ID")
+    packed_cargo_id = Column(Integer, ForeignKey("packed_cargos.id"), comment="已装货物ID")
+    cargo_id = Column(Integer, comment="货物ID")
+    cargo_name = Column(String, comment="货物名称")
+    box_index = Column(Integer, default=0, comment="箱号索引")
+    volume_cbm = Column(Float, default=0.0, comment="该货物体积 CBM")
+    volume_ratio = Column(Float, default=0.0, comment="在箱内的体积占比(0-1)")
+    weight_kg = Column(Float, default=0.0, comment="货物重量 kg")
+    hazard_class = Column(Integer, nullable=True, comment="危险品等级")
+    temperature_class = Column(String, nullable=True, default="AMBIENT", comment="温控等级")
+    allocated_base_freight = Column(Float, default=0.0, comment="分摊的基础运费")
+    allocated_overweight_surcharge = Column(Float, default=0.0, comment="分摊的超重附加费")
+    allocated_reefer_surcharge = Column(Float, default=0.0, comment="分摊的冷链附加费(专属)")
+    allocated_frozen_surcharge = Column(Float, default=0.0, comment="分摊的冷冻附加费(专属)")
+    allocated_hazard_surcharge = Column(Float, default=0.0, comment="分摊的危险品附加费(专属)")
+    total_allocated = Column(Float, default=0.0, comment="分摊总金额 = 均摊部分 + 专属部分")
+    shared_portion = Column(Float, default=0.0, comment="均摊部分小计(基础运费+超重附加费分摊)")
+    dedicated_portion = Column(Float, default=0.0, comment="专属部分小计(冷链+危险品专属分摊)")
+    allocation_breakdown = Column(JSON, default=dict, comment="分摊明细 {shared_breakdown: {...}, dedicated_breakdown: {...}}")
+    created_at = Column(DateTime, server_default=func.now())
+
+    calculation = relationship("CostCalculation", back_populates="cargo_allocations")
+    box_detail = relationship("BoxCostDetail")
+    plan = relationship("PackingPlan")
+    packed_cargo = relationship("PackedCargo")

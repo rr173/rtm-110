@@ -1511,3 +1511,272 @@ class BatchShipmentQuery(BaseModel):
     skip: int = 0
     limit: int = 100
 
+
+# ==================== 费用核算与分摊 Schemas ====================
+
+class HazardSurchargeConfig(BaseModel):
+    hazard_class: int = Field(ge=1, le=6, description="危险品等级 1-6")
+    surcharge_amount: float = Field(ge=0, description="该等级的附加费 元/箱")
+
+
+class ContainerRateConfigBase(BaseModel):
+    container_id: int = Field(description="集装箱箱型ID")
+    base_freight: float = Field(ge=0, default=0.0, description="单箱基础运费")
+    overweight_threshold_kg: float = Field(ge=0, default=0.0, description="超重判定阈值 kg, 0表示按箱型max_weight")
+    overweight_surcharge_per_kg: float = Field(ge=0, default=0.0, description="超重附加费 元/kg(超出部分)")
+    overweight_surcharge_flat: float = Field(ge=0, default=0.0, description="超重附加费 定额 元/箱")
+    reefer_surcharge: float = Field(ge=0, default=0.0, description="冷链(冷藏/冷冻)附加费 元/箱")
+    frozen_surcharge: float = Field(ge=0, default=0.0, description="冷冻附加费(在冷藏基础上额外加收) 元/箱")
+    hazard_surcharges: List[HazardSurchargeConfig] = Field(default=[], description="按危险品等级的附加费配置列表")
+    hazard_surcharge_per_kg: float = Field(ge=0, default=0.0, description="危险品按重量附加费 元/kg")
+    is_active: bool = Field(default=True, description="是否启用")
+
+
+class ContainerRateConfigCreate(ContainerRateConfigBase):
+    pass
+
+
+class ContainerRateConfigUpdate(BaseModel):
+    base_freight: Optional[float] = None
+    overweight_threshold_kg: Optional[float] = None
+    overweight_surcharge_per_kg: Optional[float] = None
+    overweight_surcharge_flat: Optional[float] = None
+    reefer_surcharge: Optional[float] = None
+    frozen_surcharge: Optional[float] = None
+    hazard_surcharges: Optional[List[HazardSurchargeConfig]] = None
+    hazard_surcharge_per_kg: Optional[float] = None
+    is_active: Optional[bool] = None
+
+
+class ContainerRateConfig(ContainerRateConfigBase):
+    id: int
+    scheme_id: int
+    container_name: str
+    hazard_surcharge_by_class: Dict[str, float] = Field(default={}, description="按危险品等级的附加费配置字典 {class: amount}")
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class RateSchemeBase(BaseModel):
+    scheme_code: str = Field(description="费率方案编码(唯一)")
+    scheme_name: str = Field(description="费率方案名称")
+    carrier: Optional[str] = Field(default=None, description="承运商/船公司")
+    trade_lane: Optional[str] = Field(default=None, description="贸易航线")
+    effective_from: Optional[str] = Field(default=None, description="生效起始日期 ISO格式")
+    effective_to: Optional[str] = Field(default=None, description="生效截止日期 ISO格式")
+    currency: str = Field(default="CNY", description="币种")
+    is_default: bool = Field(default=False, description="是否为默认费率方案")
+    is_active: bool = Field(default=True, description="是否启用")
+    description: Optional[str] = Field(default=None, description="备注说明")
+    created_by: Optional[str] = Field(default=None)
+
+
+class RateSchemeCreate(RateSchemeBase):
+    container_rates: List[ContainerRateConfigCreate] = Field(default=[], description="各箱型费率配置列表")
+
+
+class RateSchemeUpdate(BaseModel):
+    scheme_name: Optional[str] = None
+    carrier: Optional[str] = None
+    trade_lane: Optional[str] = None
+    effective_from: Optional[str] = None
+    effective_to: Optional[str] = None
+    currency: Optional[str] = None
+    is_default: Optional[bool] = None
+    is_active: Optional[bool] = None
+    description: Optional[str] = None
+
+
+class RateScheme(RateSchemeBase):
+    id: int
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class RateSchemeDetail(RateScheme):
+    container_rates: List[ContainerRateConfig] = []
+
+
+class RateSchemeSummary(BaseModel):
+    id: int
+    scheme_code: str
+    scheme_name: str
+    carrier: Optional[str] = None
+    trade_lane: Optional[str] = None
+    currency: str
+    is_default: bool
+    is_active: bool
+    container_count: int = Field(default=0, description="配置的箱型数量")
+    description: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class CostCalculateRequest(BaseModel):
+    plan_identifier: str = Field(description="配载方案ID或方案编号")
+    scheme_identifier: Optional[str] = Field(default=None, description="费率方案ID或编码,不传则使用默认费率方案")
+    recalculate: bool = Field(default=False, description="是否强制重新计算")
+    calculated_by: Optional[str] = Field(default=None)
+    remarks: Optional[str] = Field(default=None)
+
+
+class BoxCostDetailSchema(BaseModel):
+    id: int
+    calculation_id: int
+    box_index: int
+    container_id: int
+    container_name: str
+    actual_weight_kg: float
+    total_cargo_volume_cbm: float
+    cargo_count: int
+    has_hazard: bool
+    highest_hazard_class: Optional[int] = None
+    temperature_mode: str
+    base_freight: float
+    overweight_surcharge: float
+    overweight_details: Dict[str, Any] = {}
+    reefer_surcharge: float
+    frozen_surcharge: float
+    hazard_surcharge: float
+    hazard_details: Dict[str, Any] = {}
+    temperature_details: Dict[str, Any] = {}
+    subtotal_shared: float
+    subtotal_dedicated: float
+    subtotal_all: float
+    created_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class CargoCostAllocationSchema(BaseModel):
+    id: int
+    calculation_id: int
+    box_detail_id: int
+    packed_cargo_id: int
+    cargo_id: int
+    cargo_name: str
+    box_index: int
+    volume_cbm: float
+    volume_ratio: float
+    weight_kg: float
+    hazard_class: Optional[int] = None
+    temperature_class: Optional[str] = None
+    allocated_base_freight: float
+    allocated_overweight_surcharge: float
+    allocated_reefer_surcharge: float
+    allocated_frozen_surcharge: float
+    allocated_hazard_surcharge: float
+    total_allocated: float
+    shared_portion: float
+    dedicated_portion: float
+    allocation_breakdown: Dict[str, Any] = {}
+    created_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class CostCalculationBase(BaseModel):
+    scheme_id: int
+    plan_id: int
+    plan_no: str
+    plan_version: int
+    currency: str
+    total_base_freight: float
+    total_overweight_surcharge: float
+    total_reefer_surcharge: float
+    total_frozen_surcharge: float
+    total_hazard_surcharge: float
+    total_cost: float
+    calculation_status: str = "completed"
+    error_message: Optional[str] = None
+    remarks: Optional[str] = None
+    calculated_by: Optional[str] = None
+
+
+class CostCalculation(CostCalculationBase):
+    id: int
+    calculation_no: str
+    plan_content_hash: Optional[str] = None
+    created_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class CostCalculationDetail(CostCalculation):
+    scheme_name: Optional[str] = None
+    scheme_code: Optional[str] = None
+    carrier: Optional[str] = None
+    box_count: int = 0
+    total_cargo_count: int = 0
+    box_details: List[BoxCostDetailSchema] = []
+    cargo_allocations: List[CargoCostAllocationSchema] = []
+
+
+class CostCalculationSummary(BaseModel):
+    id: int
+    calculation_no: str
+    plan_id: int
+    plan_no: str
+    plan_version: int
+    scheme_id: int
+    scheme_code: str
+    scheme_name: str
+    carrier: Optional[str] = None
+    currency: str
+    total_base_freight: float
+    total_overweight_surcharge: float
+    total_reefer_surcharge: float
+    total_frozen_surcharge: float
+    total_hazard_surcharge: float
+    total_cost: float
+    box_count: int = 0
+    total_cargo_count: int = 0
+    calculation_status: str
+    created_at: Optional[str] = None
+
+
+class CostCalculationQuery(BaseModel):
+    plan_identifier: Optional[str] = Field(default=None, description="按配载方案ID或编号查询")
+    scheme_identifier: Optional[str] = Field(default=None, description="按费率方案ID或编码查询")
+    calculation_status: Optional[str] = Field(default=None, description="计算状态筛选")
+    skip: int = 0
+    limit: int = 100
+
+
+class RateCompareRequest(BaseModel):
+    plan_identifier: str = Field(description="配载方案ID或方案编号")
+    scheme_identifiers: List[str] = Field(description="要对比的费率方案ID或编码列表(至少2个)")
+
+
+class PerCargoCostDiff(BaseModel):
+    packed_cargo_id: int
+    cargo_id: int
+    cargo_name: str
+    box_index: int
+    base_cost: float
+    compare_cost: float
+    diff_amount: float
+    diff_ratio: float
+    breakdown: Dict[str, Any] = {}
+
+
+class RateCompareResult(BaseModel):
+    comparison_id: str
+    plan_id: int
+    plan_no: str
+    plan_version: int
+    currency: str
+    base_scheme: CostCalculationSummary
+    compared_schemes: List[Dict[str, Any]]
+    total_cost_diff_summary: List[Dict[str, Any]]
+    per_cargo_diffs: List[PerCargoCostDiff]
+    recommendation: str
+

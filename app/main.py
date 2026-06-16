@@ -23,10 +23,15 @@ from app.compliance_engine import (
     generate_clc_content,
 )
 from app.unloading_simulation_engine import run_unloading_simulation
+from app.cost_allocation_engine import (
+    calculate_and_allocate_for_plan,
+    get_calculation_detail,
+    compare_rate_schemes_for_plan,
+)
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="集装箱三维配载计算服务", version="1.3.0")
+app = FastAPI(title="集装箱三维配载计算服务", version="1.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,6 +54,7 @@ def startup_event():
     crud.init_plan_hash_and_version(db)
     crud.create_demo_review_record(db)
     crud.create_demo_unloading_routes(db)
+    crud.create_default_rate_schemes(db)
 
 
 @app.get("/")
@@ -3599,4 +3605,426 @@ def get_batch_history(
         "removed_items": removed_items,
         "vehicle_assignments": vehicle_map,
     }
+
+
+# ==================== 费率方案管理 API ====================
+
+def _resolve_rate_scheme(identifier: str, db: Session):
+    return crud.resolve_rate_scheme(db, identifier)
+
+
+@app.get("/rate/schemes", response_model=List[schemas.RateSchemeSummary])
+def list_rate_schemes(
+    is_active: Optional[bool] = None,
+    carrier: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    schemes = crud.list_rate_schemes(db, skip=skip, limit=limit, is_active=is_active, carrier=carrier)
+    result = []
+    for s in schemes:
+        rates = crud.get_scheme_container_rates(db, s.id)
+        result.append({
+            "id": s.id,
+            "scheme_code": s.scheme_code,
+            "scheme_name": s.scheme_name,
+            "carrier": s.carrier,
+            "trade_lane": s.trade_lane,
+            "currency": s.currency,
+            "is_default": s.is_default,
+            "is_active": s.is_active,
+            "container_count": len(rates),
+            "description": s.description,
+            "created_at": s.created_at.isoformat() if s.created_at else "",
+        })
+    return result
+
+
+@app.get("/rate/schemes/{scheme_identifier}", response_model=schemas.RateSchemeDetail)
+def get_rate_scheme_detail(scheme_identifier: str, db: Session = Depends(get_db)):
+    scheme = _resolve_rate_scheme(scheme_identifier, db)
+    if scheme is None:
+        raise HTTPException(status_code=404, detail="费率方案不存在")
+
+    rates = crud.get_scheme_container_rates(db, scheme.id)
+    rate_list = []
+    for r in rates:
+        hazard_list = []
+        for hc_str, amt in (r.hazard_surcharge_by_class or {}).items():
+            try:
+                hazard_list.append({"hazard_class": int(hc_str), "surcharge_amount": float(amt)})
+            except (ValueError, TypeError):
+                continue
+        rate_list.append({
+            "id": r.id,
+            "scheme_id": r.scheme_id,
+            "container_id": r.container_id,
+            "container_name": r.container_name,
+            "base_freight": r.base_freight,
+            "overweight_threshold_kg": r.overweight_threshold_kg,
+            "overweight_surcharge_per_kg": r.overweight_surcharge_per_kg,
+            "overweight_surcharge_flat": r.overweight_surcharge_flat,
+            "reefer_surcharge": r.reefer_surcharge,
+            "frozen_surcharge": r.frozen_surcharge,
+            "hazard_surcharge_by_class": r.hazard_surcharge_by_class or {},
+            "hazard_surcharges": hazard_list,
+            "hazard_surcharge_per_kg": r.hazard_surcharge_per_kg,
+            "is_active": r.is_active,
+            "created_at": r.created_at.isoformat() if r.created_at else "",
+            "updated_at": r.updated_at.isoformat() if r.updated_at else "",
+        })
+
+    return {
+        "id": scheme.id,
+        "scheme_code": scheme.scheme_code,
+        "scheme_name": scheme.scheme_name,
+        "carrier": scheme.carrier,
+        "trade_lane": scheme.trade_lane,
+        "effective_from": scheme.effective_from.isoformat() if scheme.effective_from else None,
+        "effective_to": scheme.effective_to.isoformat() if scheme.effective_to else None,
+        "currency": scheme.currency,
+        "is_default": scheme.is_default,
+        "is_active": scheme.is_active,
+        "description": scheme.description,
+        "created_by": scheme.created_by,
+        "created_at": scheme.created_at.isoformat() if scheme.created_at else "",
+        "updated_at": scheme.updated_at.isoformat() if scheme.updated_at else "",
+        "container_rates": rate_list,
+    }
+
+
+@app.post("/rate/schemes", response_model=schemas.RateSchemeDetail)
+def create_rate_scheme(scheme: schemas.RateSchemeCreate, db: Session = Depends(get_db)):
+    existing = crud.get_rate_scheme(db, scheme_code=scheme.scheme_code)
+    if existing:
+        raise HTTPException(status_code=400, detail=f"费率方案编码 {scheme.scheme_code} 已存在")
+
+    scheme_data = scheme.model_dump()
+    container_rates_data = scheme_data.pop("container_rates", []) or []
+
+    try:
+        if scheme_data.get("effective_from"):
+            scheme_data["effective_from"] = datetime.fromisoformat(scheme_data["effective_from"])
+        if scheme_data.get("effective_to"):
+            scheme_data["effective_to"] = datetime.fromisoformat(scheme_data["effective_to"])
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"日期格式错误: {str(e)}")
+
+    rate_dicts = []
+    for r in container_rates_data:
+        if isinstance(r, dict):
+            rate_dicts.append(r)
+        else:
+            rate_dicts.append(r.model_dump())
+    db_scheme = crud.create_rate_scheme(db, scheme_data, rate_dicts)
+
+    return get_rate_scheme_detail(str(db_scheme.id), db)
+
+
+@app.put("/rate/schemes/{scheme_identifier}")
+def update_rate_scheme(
+    scheme_identifier: str,
+    update: schemas.RateSchemeUpdate,
+    db: Session = Depends(get_db)
+):
+    scheme = _resolve_rate_scheme(scheme_identifier, db)
+    if scheme is None:
+        raise HTTPException(status_code=404, detail="费率方案不存在")
+
+    update_data = update.model_dump(exclude_unset=True)
+    try:
+        if "effective_from" in update_data and update_data["effective_from"]:
+            update_data["effective_from"] = datetime.fromisoformat(update_data["effective_from"])
+        if "effective_to" in update_data and update_data["effective_to"]:
+            update_data["effective_to"] = datetime.fromisoformat(update_data["effective_to"])
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"日期格式错误: {str(e)}")
+
+    updated = crud.update_rate_scheme(db, scheme.id, update_data)
+    return get_rate_scheme_detail(str(updated.id), db)
+
+
+@app.delete("/rate/schemes/{scheme_identifier}")
+def delete_rate_scheme(scheme_identifier: str, db: Session = Depends(get_db)):
+    scheme = crud.delete_rate_scheme(
+        db,
+        scheme_id=int(scheme_identifier) if scheme_identifier.isdigit() else None,
+        scheme_code=None if scheme_identifier.isdigit() else scheme_identifier,
+    )
+    if scheme is None:
+        raise HTTPException(status_code=404, detail="费率方案不存在")
+    return {"message": "删除成功", "scheme_code": scheme.scheme_code, "scheme_name": scheme.scheme_name}
+
+
+# ==================== 箱型费率配置 API ====================
+
+@app.post("/rate/schemes/{scheme_identifier}/rates")
+def add_container_rate_config(
+    scheme_identifier: str,
+    rate_config: schemas.ContainerRateConfigCreate,
+    db: Session = Depends(get_db)
+):
+    scheme = _resolve_rate_scheme(scheme_identifier, db)
+    if scheme is None:
+        raise HTTPException(status_code=404, detail="费率方案不存在")
+
+    try:
+        result = crud.create_container_rate_config(db, scheme.id, rate_config.model_dump())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "message": "配置成功",
+        "config_id": result.id,
+        "container_name": result.container_name,
+        "base_freight": result.base_freight,
+    }
+
+
+@app.put("/rate/rates/{config_id}")
+def update_container_rate_config(
+    config_id: int,
+    update: schemas.ContainerRateConfigUpdate,
+    db: Session = Depends(get_db)
+):
+    update_data = update.model_dump(exclude_unset=True)
+    updated = crud.update_container_rate_config(db, config_id, update_data)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="费率配置不存在")
+    return {"message": "更新成功", "config_id": updated.id}
+
+
+@app.delete("/rate/rates/{config_id}")
+def delete_container_rate_config(config_id: int, db: Session = Depends(get_db)):
+    deleted = crud.delete_container_rate_config(db, config_id)
+    if deleted is None:
+        raise HTTPException(status_code=404, detail="费率配置不存在")
+    return {"message": "删除成功", "config_id": deleted.id}
+
+
+# ==================== 费用计算与分摊 API ====================
+
+@app.post("/cost/calculate", response_model=schemas.CostCalculationDetail)
+def calculate_cost_allocation(request: schemas.CostCalculateRequest, db: Session = Depends(get_db)):
+    plan = None
+    if request.plan_identifier.isdigit():
+        plan = crud.get_packing_plan(db, plan_id=int(request.plan_identifier))
+    if plan is None:
+        plan = crud.get_packing_plan(db, plan_no=request.plan_identifier)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="配载方案不存在")
+
+    scheme = _resolve_rate_scheme(request.scheme_identifier, db) if request.scheme_identifier else crud.get_default_rate_scheme(db)
+    if scheme is None:
+        raise HTTPException(status_code=400, detail="未找到可用的费率方案(请先配置默认费率方案或指定方案ID/编码)")
+
+    result = calculate_and_allocate_for_plan(
+        db,
+        plan_id=plan.id,
+        scheme_id=scheme.id,
+        calculated_by=request.calculated_by,
+        remarks=request.remarks,
+        recalculate=request.recalculate,
+    )
+
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+
+    calc_id = result.get("calculation_id")
+    detail = get_calculation_detail(db, calculation_id=calc_id)
+    if "error" in detail:
+        raise HTTPException(status_code=500, detail=detail["error"])
+
+    return detail
+
+
+@app.get("/cost/calculations")
+def list_cost_calculations(
+    plan_identifier: Optional[str] = None,
+    scheme_identifier: Optional[str] = None,
+    calculation_status: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    plan_id = None
+    scheme_id = None
+
+    if plan_identifier:
+        plan = None
+        if plan_identifier.isdigit():
+            plan = crud.get_packing_plan(db, plan_id=int(plan_identifier))
+        if plan is None:
+            plan = crud.get_packing_plan(db, plan_no=plan_identifier)
+        if plan is None:
+            raise HTTPException(status_code=404, detail="配载方案不存在")
+        plan_id = plan.id
+
+    if scheme_identifier:
+        scheme = _resolve_rate_scheme(scheme_identifier, db)
+        if scheme is None:
+            raise HTTPException(status_code=404, detail="费率方案不存在")
+        scheme_id = scheme.id
+
+    calcs = crud.list_cost_calculations(
+        db,
+        plan_id=plan_id,
+        scheme_id=scheme_id,
+        calculation_status=calculation_status,
+        skip=skip,
+        limit=limit,
+    )
+
+    result = []
+    for calc in calcs:
+        scheme = crud.get_rate_scheme(db, scheme_id=calc.scheme_id)
+        boxes = crud.get_box_details(db, calc.id)
+        allocs = crud.get_cargo_allocations(db, calc.id)
+        result.append({
+            "id": calc.id,
+            "calculation_no": calc.calculation_no,
+            "plan_id": calc.plan_id,
+            "plan_no": calc.plan_no,
+            "plan_version": calc.plan_version,
+            "scheme_id": calc.scheme_id,
+            "scheme_code": scheme.scheme_code if scheme else "",
+            "scheme_name": scheme.scheme_name if scheme else "",
+            "carrier": scheme.carrier if scheme else "",
+            "currency": calc.currency,
+            "total_base_freight": calc.total_base_freight,
+            "total_overweight_surcharge": calc.total_overweight_surcharge,
+            "total_reefer_surcharge": calc.total_reefer_surcharge,
+            "total_frozen_surcharge": calc.total_frozen_surcharge,
+            "total_hazard_surcharge": calc.total_hazard_surcharge,
+            "total_cost": calc.total_cost,
+            "box_count": len(boxes),
+            "total_cargo_count": len(allocs),
+            "calculation_status": calc.calculation_status,
+            "created_at": calc.created_at.isoformat() if calc.created_at else "",
+        })
+    return result
+
+
+@app.get("/cost/calculations/{calc_identifier}", response_model=schemas.CostCalculationDetail)
+def get_cost_calculation_detail(calc_identifier: str, db: Session = Depends(get_db)):
+    calc_id = None
+    calc_no = None
+    if calc_identifier.isdigit():
+        calc_id = int(calc_identifier)
+    else:
+        calc_no = calc_identifier
+
+    detail = get_calculation_detail(db, calculation_id=calc_id, calculation_no=calc_no)
+    if "error" in detail:
+        raise HTTPException(status_code=404, detail=detail["error"])
+    return detail
+
+
+@app.get("/plans/{plan_identifier}/cost")
+def get_plan_cost_by_plan(
+    plan_identifier: str,
+    scheme_identifier: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    plan = None
+    if plan_identifier.isdigit():
+        plan = crud.get_packing_plan(db, plan_id=int(plan_identifier))
+    if plan is None:
+        plan = crud.get_packing_plan(db, plan_no=plan_identifier)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="配载方案不存在")
+
+    scheme = _resolve_rate_scheme(scheme_identifier, db) if scheme_identifier else crud.get_default_rate_scheme(db)
+    if scheme is None:
+        raise HTTPException(status_code=400, detail="未找到可用的费率方案")
+
+    existing = crud.find_existing_calculation(
+        db,
+        plan_id=plan.id,
+        scheme_id=scheme.id,
+        plan_version=plan.version,
+        plan_content_hash=plan.content_hash,
+    )
+    if existing:
+        detail = get_calculation_detail(db, calculation_id=existing.id)
+        return {
+            "from_cache": True,
+            "calculation_id": existing.id,
+            "calculation_no": existing.calculation_no,
+            "currency": existing.currency,
+            "total_cost": existing.total_cost,
+            "detail": detail,
+        }
+
+    result = calculate_and_allocate_for_plan(
+        db,
+        plan_id=plan.id,
+        scheme_id=scheme.id,
+        calculated_by="plan_query_auto",
+        remarks=f"按方案 {plan.plan_no} 查询时自动计算",
+        recalculate=False,
+    )
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+
+    detail = get_calculation_detail(db, calculation_id=result["calculation_id"])
+    return {
+        "from_cache": False,
+        "calculation_id": result["calculation_id"],
+        "calculation_no": result["calculation_no"],
+        "currency": result.get("currency", scheme.currency),
+        "total_cost": result.get("total_cost"),
+        "detail": detail,
+    }
+
+
+@app.delete("/cost/calculations/{calc_identifier}")
+def delete_cost_calculation(calc_identifier: str, db: Session = Depends(get_db)):
+    calc_id = None
+    calc_no = None
+    if calc_identifier.isdigit():
+        calc_id = int(calc_identifier)
+    else:
+        calc_no = calc_identifier
+
+    deleted = crud.delete_cost_calculation(db, calculation_id=calc_id, calculation_no=calc_no)
+    if deleted is None:
+        raise HTTPException(status_code=404, detail="费用计算记录不存在")
+    return {
+        "message": "删除成功",
+        "calculation_id": deleted.id,
+        "calculation_no": deleted.calculation_no,
+        "total_cost": deleted.total_cost,
+    }
+
+
+# ==================== 费率方案对比 API ====================
+
+@app.post("/cost/compare", response_model=schemas.RateCompareResult)
+def compare_rate_schemes(request: schemas.RateCompareRequest, db: Session = Depends(get_db)):
+    if len(request.scheme_identifiers) < 2:
+        raise HTTPException(status_code=400, detail="至少需要2个费率方案进行对比")
+
+    plan = None
+    if request.plan_identifier.isdigit():
+        plan = crud.get_packing_plan(db, plan_id=int(request.plan_identifier))
+    if plan is None:
+        plan = crud.get_packing_plan(db, plan_no=request.plan_identifier)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="配载方案不存在")
+
+    scheme_ids = []
+    for sid in request.scheme_identifiers:
+        scheme = _resolve_rate_scheme(sid, db)
+        if scheme is None:
+            raise HTTPException(status_code=404, detail=f"费率方案 {sid} 不存在")
+        scheme_ids.append(scheme.id)
+
+    result = compare_rate_schemes_for_plan(db, plan.id, scheme_ids)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+
+    return result
+
 

@@ -2,7 +2,7 @@ from sqlalchemy.orm import Session
 from app import models, schemas
 from app.schemas import TemperatureClassEnum
 from datetime import datetime
-from typing import List
+from typing import List, Optional, Dict, Any
 import uuid
 
 VALID_TEMPERATURE_CLASSES = {tc.value for tc in TemperatureClassEnum}
@@ -4105,5 +4105,438 @@ def recalculate_batch_totals(db: Session, batch_id: int) -> models.BatchShipment
     db.commit()
     db.refresh(batch)
     return batch
+
+
+# ==================== 费用核算 CRUD Functions ====================
+
+def generate_rate_scheme_code() -> str:
+    return f"RATE-{uuid.uuid4().hex[:6].upper()}"
+
+
+def generate_calculation_no() -> str:
+    return f"COST-{uuid.uuid4().hex[:8].upper()}"
+
+
+def get_rate_scheme(db: Session, scheme_id: int = None, scheme_code: str = None) -> Optional[models.RateScheme]:
+    if scheme_id:
+        return db.query(models.RateScheme).filter(models.RateScheme.id == scheme_id).first()
+    if scheme_code:
+        return db.query(models.RateScheme).filter(models.RateScheme.scheme_code == scheme_code).first()
+    return None
+
+
+def resolve_rate_scheme(db: Session, identifier: str) -> Optional[models.RateScheme]:
+    if not identifier:
+        return get_default_rate_scheme(db)
+    if identifier.isdigit():
+        scheme = get_rate_scheme(db, scheme_id=int(identifier))
+        if scheme:
+            return scheme
+    return get_rate_scheme(db, scheme_code=identifier)
+
+
+def get_default_rate_scheme(db: Session) -> Optional[models.RateScheme]:
+    return db.query(models.RateScheme).filter(
+        models.RateScheme.is_default == True,
+        models.RateScheme.is_active == True
+    ).first()
+
+
+def list_rate_schemes(
+    db: Session,
+    skip: int = 0,
+    limit: int = 100,
+    is_active: Optional[bool] = None,
+    carrier: Optional[str] = None,
+) -> List[models.RateScheme]:
+    q = db.query(models.RateScheme)
+    if is_active is not None:
+        q = q.filter(models.RateScheme.is_active == is_active)
+    if carrier:
+        q = q.filter(models.RateScheme.carrier == carrier)
+    return q.order_by(
+        models.RateScheme.is_default.desc(),
+        models.RateScheme.created_at.desc()
+    ).offset(skip).limit(limit).all()
+
+
+def create_rate_scheme(
+    db: Session,
+    scheme_data: dict,
+    container_rates: List[dict] = None,
+) -> models.RateScheme:
+    if not scheme_data.get("scheme_code"):
+        scheme_data["scheme_code"] = generate_rate_scheme_code()
+
+    if scheme_data.get("is_default"):
+        db.query(models.RateScheme).filter(
+            models.RateScheme.is_default == True
+        ).update({"is_default": False})
+
+    db_scheme = models.RateScheme(**scheme_data)
+    db.add(db_scheme)
+    db.flush()
+
+    if container_rates:
+        for rate_data in container_rates:
+            container_id = rate_data["container_id"]
+            container = get_container(db, container_id=container_id)
+            hazard_list = rate_data.pop("hazard_surcharges", []) or []
+            hazard_by_class = {}
+            for h in hazard_list:
+                if isinstance(h, dict):
+                    hazard_by_class[str(h.get("hazard_class"))] = float(h.get("surcharge_amount", 0))
+            rate_data["hazard_surcharge_by_class"] = hazard_by_class
+            rate_config = models.ContainerRateConfig(
+                scheme_id=db_scheme.id,
+                container_name=container.name if container else f"Container-{container_id}",
+                **rate_data
+            )
+            db.add(rate_config)
+
+    db.commit()
+    db.refresh(db_scheme)
+    return db_scheme
+
+
+def update_rate_scheme(db: Session, scheme_id: int, update_data: dict) -> Optional[models.RateScheme]:
+    scheme = get_rate_scheme(db, scheme_id=scheme_id)
+    if not scheme:
+        return None
+
+    if update_data.get("is_default") and not scheme.is_default:
+        db.query(models.RateScheme).filter(
+            models.RateScheme.is_default == True,
+            models.RateScheme.id != scheme_id
+        ).update({"is_default": False})
+
+    for key, value in update_data.items():
+        if value is not None and hasattr(scheme, key):
+            setattr(scheme, key, value)
+
+    db.commit()
+    db.refresh(scheme)
+    return scheme
+
+
+def delete_rate_scheme(db: Session, scheme_id: int = None, scheme_code: str = None) -> Optional[models.RateScheme]:
+    scheme = get_rate_scheme(db, scheme_id=scheme_id, scheme_code=scheme_code)
+    if scheme:
+        db.delete(scheme)
+        db.commit()
+    return scheme
+
+
+def get_container_rate_config(db: Session, scheme_id: int, container_id: int) -> Optional[models.ContainerRateConfig]:
+    return db.query(models.ContainerRateConfig).filter(
+        models.ContainerRateConfig.scheme_id == scheme_id,
+        models.ContainerRateConfig.container_id == container_id,
+        models.ContainerRateConfig.is_active == True
+    ).first()
+
+
+def get_scheme_container_rates(db: Session, scheme_id: int) -> List[models.ContainerRateConfig]:
+    return db.query(models.ContainerRateConfig).filter(
+        models.ContainerRateConfig.scheme_id == scheme_id,
+        models.ContainerRateConfig.is_active == True
+    ).all()
+
+
+def create_container_rate_config(
+    db: Session,
+    scheme_id: int,
+    rate_data: dict,
+) -> models.ContainerRateConfig:
+    scheme = get_rate_scheme(db, scheme_id=scheme_id)
+    if not scheme:
+        raise ValueError(f"费率方案 {scheme_id} 不存在")
+
+    container_id = rate_data["container_id"]
+    container = get_container(db, container_id=container_id)
+    if not container:
+        raise ValueError(f"集装箱 {container_id} 不存在")
+
+    existing = get_container_rate_config(db, scheme_id, container_id)
+    if existing:
+        return update_container_rate_config(db, existing.id, rate_data)
+
+    hazard_list = rate_data.pop("hazard_surcharges", []) or []
+    hazard_by_class = {}
+    for h in hazard_list:
+        if isinstance(h, dict):
+            hazard_by_class[str(h.get("hazard_class"))] = float(h.get("surcharge_amount", 0))
+    rate_data["hazard_surcharge_by_class"] = hazard_by_class
+
+    db_rate = models.ContainerRateConfig(
+        scheme_id=scheme_id,
+        container_name=container.name,
+        **rate_data
+    )
+    db.add(db_rate)
+    db.commit()
+    db.refresh(db_rate)
+    return db_rate
+
+
+def update_container_rate_config(
+    db: Session,
+    config_id: int,
+    update_data: dict,
+) -> Optional[models.ContainerRateConfig]:
+    config = db.query(models.ContainerRateConfig).filter(
+        models.ContainerRateConfig.id == config_id
+    ).first()
+    if not config:
+        return None
+
+    hazard_list = update_data.pop("hazard_surcharges", None)
+    if hazard_list is not None:
+        hazard_by_class = {}
+        for h in hazard_list:
+            if isinstance(h, dict):
+                hazard_by_class[str(h.get("hazard_class"))] = float(h.get("surcharge_amount", 0))
+        config.hazard_surcharge_by_class = hazard_by_class
+
+    for key, value in update_data.items():
+        if value is not None and hasattr(config, key):
+            setattr(config, key, value)
+
+    db.commit()
+    db.refresh(config)
+    return config
+
+
+def delete_container_rate_config(db: Session, config_id: int) -> Optional[models.ContainerRateConfig]:
+    config = db.query(models.ContainerRateConfig).filter(
+        models.ContainerRateConfig.id == config_id
+    ).first()
+    if config:
+        db.delete(config)
+        db.commit()
+    return config
+
+
+def get_cost_calculation(
+    db: Session,
+    calculation_id: int = None,
+    calculation_no: str = None,
+) -> Optional[models.CostCalculation]:
+    if calculation_id:
+        return db.query(models.CostCalculation).filter(
+            models.CostCalculation.id == calculation_id
+        ).first()
+    if calculation_no:
+        return db.query(models.CostCalculation).filter(
+            models.CostCalculation.calculation_no == calculation_no
+        ).first()
+    return None
+
+
+def find_existing_calculation(
+    db: Session,
+    plan_id: int,
+    scheme_id: int,
+    plan_version: int = None,
+    plan_content_hash: str = None,
+) -> Optional[models.CostCalculation]:
+    q = db.query(models.CostCalculation).filter(
+        models.CostCalculation.plan_id == plan_id,
+        models.CostCalculation.scheme_id == scheme_id,
+        models.CostCalculation.calculation_status == "completed"
+    )
+    if plan_version is not None:
+        q = q.filter(models.CostCalculation.plan_version == plan_version)
+    if plan_content_hash:
+        q = q.filter(models.CostCalculation.plan_content_hash == plan_content_hash)
+    return q.order_by(models.CostCalculation.created_at.desc()).first()
+
+
+def list_cost_calculations(
+    db: Session,
+    plan_id: Optional[int] = None,
+    scheme_id: Optional[int] = None,
+    calculation_status: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+) -> List[models.CostCalculation]:
+    q = db.query(models.CostCalculation)
+    if plan_id:
+        q = q.filter(models.CostCalculation.plan_id == plan_id)
+    if scheme_id:
+        q = q.filter(models.CostCalculation.scheme_id == scheme_id)
+    if calculation_status:
+        q = q.filter(models.CostCalculation.calculation_status == calculation_status)
+    return q.order_by(models.CostCalculation.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def get_box_details(db: Session, calculation_id: int) -> List[models.BoxCostDetail]:
+    return db.query(models.BoxCostDetail).filter(
+        models.BoxCostDetail.calculation_id == calculation_id
+    ).order_by(models.BoxCostDetail.box_index).all()
+
+
+def get_cargo_allocations(db: Session, calculation_id: int) -> List[models.CargoCostAllocation]:
+    return db.query(models.CargoCostAllocation).filter(
+        models.CargoCostAllocation.calculation_id == calculation_id
+    ).order_by(
+        models.CargoCostAllocation.box_index,
+        models.CargoCostAllocation.id
+    ).all()
+
+
+def create_cost_calculation(
+    db: Session,
+    calc_data: dict,
+    box_details: List[dict],
+    cargo_allocations: List[dict],
+) -> models.CostCalculation:
+    if not calc_data.get("calculation_no"):
+        calc_data["calculation_no"] = generate_calculation_no()
+
+    db_calc = models.CostCalculation(**calc_data)
+    db.add(db_calc)
+    db.flush()
+
+    for bd in box_details:
+        db_box = models.BoxCostDetail(
+            calculation_id=db_calc.id,
+            **bd
+        )
+        db.add(db_box)
+
+    db.flush()
+
+    box_id_map = {}
+    all_boxes = db.query(models.BoxCostDetail).filter(
+        models.BoxCostDetail.calculation_id == db_calc.id
+    ).all()
+    for b in all_boxes:
+        box_id_map[b.box_index] = b.id
+
+    for ca in cargo_allocations:
+        box_idx = ca.get("box_index", 0)
+        ca["box_detail_id"] = box_id_map.get(box_idx)
+        db_alloc = models.CargoCostAllocation(
+            calculation_id=db_calc.id,
+            **ca
+        )
+        db.add(db_alloc)
+
+    db.commit()
+    db.refresh(db_calc)
+    return db_calc
+
+
+def delete_cost_calculation(
+    db: Session,
+    calculation_id: int = None,
+    calculation_no: str = None,
+) -> Optional[models.CostCalculation]:
+    calc = get_cost_calculation(db, calculation_id=calculation_id, calculation_no=calculation_no)
+    if calc:
+        db.delete(calc)
+        db.commit()
+    return calc
+
+
+def create_default_rate_schemes(db: Session):
+    existing = db.query(models.RateScheme).filter(models.RateScheme.is_default == True).all()
+    if existing:
+        return
+
+    containers = get_containers(db)
+    if not containers:
+        create_default_containers(db)
+        containers = get_containers(db)
+
+    scheme_container_rates = {}
+    for c in containers:
+        cbm = (c.length * c.width * c.height) / 1e9
+        base_freight_20gp = 3000.0
+        factor = cbm / 33.2
+        base_freight = round(base_freight_20gp * factor, 2)
+
+        scheme_container_rates[c.id] = {
+            "20GP-BASE": {"base": base_freight, "overweight_flat": 500, "overweight_per_kg": 0.5, "threshold": c.max_weight * 0.9},
+            "MAERSK-PREMIUM": {"base": base_freight * 1.15, "overweight_flat": 600, "overweight_per_kg": 0.6, "threshold": c.max_weight * 0.85},
+            "COSCO-STANDARD": {"base": base_freight * 0.95, "overweight_flat": 450, "overweight_per_kg": 0.45, "threshold": c.max_weight * 0.92},
+        }
+
+    default_schemes = [
+        {
+            "scheme_code": "DEFAULT-MSC-2025",
+            "scheme_name": "地中海航运MSC-2025标准",
+            "carrier": "MSC地中海航运",
+            "trade_lane": "远东-欧洲",
+            "currency": "CNY",
+            "is_default": True,
+            "is_active": True,
+            "description": "系统默认的MSC标准费率方案,适用于日常报价估算",
+            "rates_key": "20GP-BASE",
+            "reefer": 2000,
+            "frozen": 1200,
+            "hazard": {"1": 8000, "2": 5000, "3": 4000, "4": 3000, "5": 6000, "6": 3500},
+            "hazard_per_kg": 2.0,
+        },
+        {
+            "scheme_code": "DEFAULT-MAERSK-2025",
+            "scheme_name": "马士基MAERSK-2025Q2航线",
+            "carrier": "MAERSK马士基",
+            "trade_lane": "远东-北欧",
+            "currency": "CNY",
+            "is_default": False,
+            "is_active": True,
+            "description": "马士基航运2025年第二季度远东至北欧航线报价",
+            "rates_key": "MAERSK-PREMIUM",
+            "reefer": 2800,
+            "frozen": 1500,
+            "hazard": {"1": 10000, "2": 6500, "3": 5000, "4": 3800, "5": 7500, "6": 4200},
+            "hazard_per_kg": 2.5,
+        },
+        {
+            "scheme_code": "DEFAULT-COSCO-2025",
+            "scheme_name": "中远海运COSCO-2025Q2",
+            "carrier": "COSCO中远海运",
+            "trade_lane": "远东-美西",
+            "currency": "CNY",
+            "is_default": False,
+            "is_active": True,
+            "description": "中远海运2025年第二季度远东至美西航线标准报价",
+            "rates_key": "COSCO-STANDARD",
+            "reefer": 2400,
+            "frozen": 1400,
+            "hazard": {"1": 9000, "2": 5800, "3": 4500, "4": 3400, "5": 6800, "6": 3800},
+            "hazard_per_kg": 2.2,
+        },
+    ]
+
+    for scheme_info in default_schemes:
+        rates_key = scheme_info.pop("rates_key")
+        reefer = scheme_info.pop("reefer")
+        frozen = scheme_info.pop("frozen")
+        hazard_conf = scheme_info.pop("hazard")
+        hazard_per_kg = scheme_info.pop("hazard_per_kg")
+
+        container_rates = []
+        for c in containers:
+            rate_conf = scheme_container_rates.get(c.id, {}).get(rates_key, {})
+            hazard_list = [
+                {"hazard_class": int(k), "surcharge_amount": float(v)}
+                for k, v in hazard_conf.items()
+            ]
+            container_rates.append({
+                "container_id": c.id,
+                "base_freight": rate_conf.get("base", 3000),
+                "overweight_threshold_kg": rate_conf.get("threshold", 25000),
+                "overweight_surcharge_per_kg": rate_conf.get("overweight_per_kg", 0.5),
+                "overweight_surcharge_flat": rate_conf.get("overweight_flat", 500),
+                "reefer_surcharge": reefer,
+                "frozen_surcharge": frozen,
+                "hazard_surcharges": hazard_list,
+                "hazard_surcharge_per_kg": hazard_per_kg,
+                "is_active": True,
+            })
+
+        create_rate_scheme(db, scheme_info, container_rates)
 
 
