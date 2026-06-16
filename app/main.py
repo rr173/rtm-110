@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from typing import List, Optional
+from datetime import date
 import uuid
 
 from app.database import engine, get_db, Base
@@ -57,6 +58,8 @@ def startup_event():
     crud.create_default_rate_schemes(db)
     crud.create_demo_damage_claim(db)
     crud.create_default_alert_rules_and_demo_event(db)
+    crud.create_default_insurance_products(db)
+    crud.create_demo_insurance_policy(db)
 
 
 @app.get("/")
@@ -4841,6 +4844,421 @@ def handle_alert_event_api(
         "handling_notes": handled.handling_notes,
         "created_at": handled.created_at.isoformat() if handled.created_at else "",
         "updated_at": handled.updated_at.isoformat() if handled.updated_at else "",
+    }
+
+
+# ==================== 保险模块序列化辅助函数 ====================
+
+def _serialize_insurance_policy_item(item):
+    return {
+        "id": item.id,
+        "policy_id": item.policy_id,
+        "packed_cargo_id": item.packed_cargo_id,
+        "product_id": item.product_id,
+        "cargo_id": item.cargo_id,
+        "cargo_name": item.cargo_name,
+        "cargo_type": item.cargo_type,
+        "hazard_class": item.hazard_class,
+        "temperature_class": item.temperature_class,
+        "declared_value": item.declared_value,
+        "base_rate_pct": item.base_rate_pct,
+        "hazard_coeff": item.hazard_coeff,
+        "cold_chain_coeff": item.cold_chain_coeff,
+        "high_value_coeff": item.high_value_coeff,
+        "final_rate_pct": item.final_rate_pct,
+        "premium": item.premium,
+        "deductible_summary": item.deductible_summary,
+        "alternative_products": item.alternative_products or [],
+        "created_at": item.created_at.isoformat() if item.created_at else "",
+    }
+
+
+def _serialize_insurance_policy(policy, include_items=True):
+    result = {
+        "id": policy.id,
+        "policy_no": policy.policy_no,
+        "plan_identifier": str(policy.plan_id),
+        "plan_id": policy.plan_id,
+        "plan_no": policy.plan_no,
+        "plan_version": policy.plan_version,
+        "policyholder_name": policy.policyholder_name,
+        "policyholder_contact": policy.policyholder_contact,
+        "voyage_no": policy.voyage_no,
+        "container_no": policy.container_no,
+        "shipment_no": policy.shipment_no,
+        "insurance_period_days": policy.insurance_period_days,
+        "total_insured_amount": policy.total_insured_amount,
+        "total_premium": policy.total_premium,
+        "currency": policy.currency,
+        "effective_date": policy.effective_date.isoformat() if policy.effective_date else None,
+        "expiry_date": policy.expiry_date.isoformat() if policy.expiry_date else None,
+        "status": policy.status,
+        "status_changed_at": policy.status_changed_at.isoformat() if policy.status_changed_at else None,
+        "submitted_at": policy.submitted_at.isoformat() if policy.submitted_at else None,
+        "accepted_at": policy.accepted_at.isoformat() if policy.accepted_at else None,
+        "created_by": policy.created_by,
+        "remarks": policy.remarks,
+        "created_at": policy.created_at.isoformat() if policy.created_at else "",
+        "updated_at": policy.updated_at.isoformat() if policy.updated_at else "",
+    }
+    if include_items:
+        result["policy_items"] = [_serialize_insurance_policy_item(item) for item in policy.policy_items]
+        surrender = getattr(policy, "surrender_record", None)
+        if surrender:
+            result["surrender_record"] = {
+                "id": surrender.id,
+                "policy_id": surrender.policy_id,
+                "surrender_no": surrender.surrender_no,
+                "surrender_reason": surrender.surrender_reason,
+                "total_premium": surrender.total_premium,
+                "used_days": surrender.used_days,
+                "total_days": surrender.total_days,
+                "refund_ratio": surrender.refund_ratio,
+                "refund_amount": surrender.refund_amount,
+                "surrendered_at": surrender.surrendered_at.isoformat() if surrender.surrendered_at else "",
+                "handled_by": surrender.handled_by,
+                "remarks": surrender.remarks,
+            }
+        else:
+            result["surrender_record"] = None
+    return result
+
+
+# ==================== 保险产品管理 API ====================
+
+@app.get("/insurance/products", response_model=List[schemas.InsuranceProduct])
+def list_insurance_products(
+    is_active: Optional[bool] = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    """查询保险产品列表"""
+    only_active = is_active if is_active is not None else True
+    products = crud.list_insurance_products(db, skip=skip, limit=limit, only_active=only_active)
+    result = []
+    for p in products:
+        result.append({
+            "id": p.id,
+            "product_code": p.product_code,
+            "product_name": p.product_name,
+            "description": p.description,
+            "is_active": p.is_active,
+            "applicable_cargo_types": p.applicable_cargo_types,
+            "min_temperature_class": p.min_temperature_class,
+            "max_temperature_class": p.max_temperature_class,
+            "min_hazard_class": p.min_hazard_class,
+            "max_hazard_class": p.max_hazard_class,
+            "max_unit_value": p.max_unit_value,
+            "base_rate_pct": p.base_rate_pct,
+            "hazard_surcharge_coeff": p.hazard_surcharge_coeff,
+            "cold_chain_surcharge_coeff": p.cold_chain_surcharge_coeff,
+            "high_value_threshold": p.high_value_threshold,
+            "high_value_surcharge_coeff": p.high_value_surcharge_coeff,
+            "deductible_amount": p.deductible_amount,
+            "deductible_rate_pct": p.deductible_rate_pct,
+            "excluded_items": p.excluded_items,
+            "created_at": p.created_at.isoformat() if p.created_at else "",
+            "updated_at": p.updated_at.isoformat() if p.updated_at else "",
+        })
+    return result
+
+
+@app.get("/insurance/products/{product_id}", response_model=schemas.InsuranceProduct)
+def get_insurance_product(product_id: int, db: Session = Depends(get_db)):
+    """获取保险产品详情"""
+    product = crud.get_insurance_product(db, product_id)
+    if not product:
+        raise HTTPException(status_code=404, detail="保险产品不存在")
+    return product
+
+
+@app.post("/insurance/products", response_model=schemas.InsuranceProduct)
+def create_insurance_product(
+    product_in: schemas.InsuranceProductCreate,
+    db: Session = Depends(get_db)
+):
+    """创建保险产品"""
+    try:
+        product = crud.create_insurance_product(db, product_in)
+        return product
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.put("/insurance/products/{product_id}", response_model=schemas.InsuranceProduct)
+def update_insurance_product(
+    product_id: int,
+    product_in: schemas.InsuranceProductUpdate,
+    db: Session = Depends(get_db)
+):
+    """更新保险产品"""
+    product = crud.get_insurance_product(db, product_id)
+    if not product:
+        raise HTTPException(status_code=404, detail="保险产品不存在")
+    try:
+        updated = crud.update_insurance_product(db, product_id, product_in)
+        return updated
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/insurance/products/{product_id}")
+def delete_insurance_product(product_id: int, db: Session = Depends(get_db)):
+    """删除保险产品"""
+    product = crud.get_insurance_product(db, product_id)
+    if not product:
+        raise HTTPException(status_code=404, detail="保险产品不存在")
+    crud.delete_insurance_product(db, product_id)
+    return {"message": "保险产品已删除"}
+
+
+# ==================== 保险产品匹配 API ====================
+
+@app.post("/insurance/match/packing/{plan_identifier}", response_model=schemas.InsuranceMatchResponse)
+def match_insurance_for_packing_plan(
+    plan_identifier: str,
+    db: Session = Depends(get_db)
+):
+    """为配载方案内的每件货物匹配保险产品"""
+    plan = _resolve_packing_plan(plan_identifier, db)
+    if not plan:
+        raise HTTPException(status_code=404, detail="配载方案不存在")
+    
+    result = crud.match_insurance_for_plan(db, plan.id)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.post("/insurance/match/cargo", response_model=List[schemas.InsuranceProductMatch])
+def match_insurance_for_single_cargo(
+    cargo_in: schemas.InsuranceSingleCargoMatchRequest,
+    db: Session = Depends(get_db)
+):
+    """为单件货物匹配保险产品"""
+    matches = crud.match_insurance_products_for_cargo(
+        db,
+        cargo_type=cargo_in.cargo_type,
+        declared_value=cargo_in.declared_value,
+        hazard_class=cargo_in.hazard_class,
+        temperature_class=cargo_in.temperature_class
+    )
+    return matches
+
+
+@app.post("/insurance/premium/calculate", response_model=schemas.InsurancePremiumCalculation)
+def calculate_insurance_premium(
+    req: schemas.InsurancePremiumCalculateRequest,
+    db: Session = Depends(get_db)
+):
+    """计算保费"""
+    product = crud.get_insurance_product(db, req.product_id)
+    if not product:
+        raise HTTPException(status_code=404, detail="保险产品不存在")
+    
+    result = crud.calculate_premium(
+        product=product,
+        declared_value=req.declared_value,
+        hazard_class=req.hazard_class,
+        temperature_class=req.temperature_class
+    )
+    return result
+
+
+# ==================== 投保单管理 API ====================
+
+@app.get("/insurance/policies", response_model=List[schemas.InsurancePolicy])
+def list_insurance_policies(
+    status: Optional[schemas.InsurancePolicyStatusEnum] = None,
+    packing_plan_id: Optional[int] = None,
+    product_id: Optional[int] = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    """查询投保单列表"""
+    policies = crud.list_insurance_policies(
+        db,
+        status=status.value if status else None,
+        plan_id=packing_plan_id,
+        product_id=product_id,
+        skip=skip,
+        limit=limit
+    )
+    return [_serialize_insurance_policy(p, include_items=False) for p in policies]
+
+
+@app.get("/insurance/policies/{policy_id}", response_model=schemas.InsurancePolicyDetail)
+def get_insurance_policy(policy_id: int, db: Session = Depends(get_db)):
+    """获取投保单详情"""
+    policy = crud.get_insurance_policy(db, policy_id)
+    if not policy:
+        raise HTTPException(status_code=404, detail="投保单不存在")
+    return _serialize_insurance_policy(policy)
+
+
+@app.get("/insurance/policies/plan/{plan_identifier}", response_model=List[schemas.InsurancePolicy])
+def get_insurance_policies_by_plan(
+    plan_identifier: str,
+    db: Session = Depends(get_db)
+):
+    """按方案编号查询投保历史"""
+    plan = _resolve_packing_plan(plan_identifier, db)
+    if not plan:
+        raise HTTPException(status_code=404, detail="配载方案不存在")
+    
+    policies = crud.get_insurance_policies_by_plan(db, plan.id)
+    return [_serialize_insurance_policy(p, include_items=False) for p in policies]
+
+
+@app.post("/insurance/policies", response_model=schemas.InsurancePolicyDetail)
+def create_insurance_policy(
+    policy_in: schemas.InsurancePolicyCreate,
+    db: Session = Depends(get_db)
+):
+    """创建投保单(一键生成)"""
+    try:
+        policy = crud.create_insurance_policy(db, policy_in.model_dump(), [item.model_dump() for item in policy_in.policy_items])
+        return _serialize_insurance_policy(policy)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/insurance/policies/generate/{plan_identifier}", response_model=schemas.InsurancePolicyDetail)
+def generate_insurance_policy_from_plan(
+    plan_identifier: str,
+    policy_info: schemas.InsurancePolicyGenerateRequest,
+    db: Session = Depends(get_db)
+):
+    """从配载方案一键生成投保单"""
+    plan = _resolve_packing_plan(plan_identifier, db)
+    if not plan:
+        raise HTTPException(status_code=404, detail="配载方案不存在")
+    
+    try:
+        policy = crud.generate_insurance_policy_from_plan(db, plan.id, policy_info)
+        return _serialize_insurance_policy(policy)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.put("/insurance/policies/{policy_id}", response_model=schemas.InsurancePolicyDetail)
+def update_insurance_policy(
+    policy_id: int,
+    policy_in: schemas.InsurancePolicyUpdate,
+    db: Session = Depends(get_db)
+):
+    """更新投保单(仅草稿状态可修改)"""
+    policy = crud.get_insurance_policy(db, policy_id)
+    if not policy:
+        raise HTTPException(status_code=404, detail="投保单不存在")
+    
+    if policy.status == schemas.InsurancePolicyStatusEnum.ACCEPTED:
+        raise HTTPException(status_code=400, detail="已承保的投保单不允许修改")
+    
+    try:
+        update_data = policy_in.model_dump(exclude_unset=True)
+        updated = crud.update_insurance_policy(db, policy_id, update_data)
+        return _serialize_insurance_policy(updated)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/insurance/policies/{policy_id}/status", response_model=schemas.InsurancePolicyDetail)
+def transition_insurance_policy_status(
+    policy_id: int,
+    req: schemas.InsurancePolicyStatusTransition,
+    db: Session = Depends(get_db)
+):
+    """投保单状态流转"""
+    policy = crud.get_insurance_policy(db, policy_id)
+    if not policy:
+        raise HTTPException(status_code=404, detail="投保单不存在")
+    
+    try:
+        updated = crud.transition_policy_status(db, policy_id, req.new_status.value if hasattr(req.new_status, 'value') else req.new_status, req.remark)
+        return _serialize_insurance_policy(updated)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/insurance/policies/{policy_id}/surrender", response_model=schemas.InsuranceSurrenderResponse)
+def surrender_insurance_policy(
+    policy_id: int,
+    req: schemas.InsuranceSurrenderRequest,
+    db: Session = Depends(get_db)
+):
+    """退保(仅已承保状态可退保)"""
+    policy = crud.get_insurance_policy(db, policy_id)
+    if not policy:
+        raise HTTPException(status_code=404, detail="投保单不存在")
+    
+    try:
+        result = crud.surrender_policy(db, policy_id, req.surrender_reason)
+        return {
+            "policy_id": result["policy_id"],
+            "policy_no": result["policy_no"],
+            "surrender_no": result["surrender_no"],
+            "surrender_reason": result["surrender_reason"],
+            "total_premium": result["total_premium"],
+            "used_days": result["used_days"],
+            "total_days": result["total_days"],
+            "refund_ratio": result["refund_ratio"],
+            "refund_amount": result["refund_amount"],
+            "new_status": result["new_status"],
+            "surrendered_at": result["surrendered_at"].isoformat() if hasattr(result["surrendered_at"], 'isoformat') else result["surrendered_at"],
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/insurance/policies/{policy_id}")
+def delete_insurance_policy(policy_id: int, db: Session = Depends(get_db)):
+    """删除投保单(仅草稿状态可删除)"""
+    policy = crud.get_insurance_policy(db, policy_id)
+    if not policy:
+        raise HTTPException(status_code=404, detail="投保单不存在")
+    
+    if policy.status != schemas.InsurancePolicyStatusEnum.DRAFT:
+        raise HTTPException(status_code=400, detail="仅草稿状态的投保单可删除")
+    
+    crud.delete_insurance_policy(db, policy_id)
+    return {"message": "投保单已删除"}
+
+
+# ==================== 保险统计 API ====================
+
+@app.get("/insurance/statistics/by-product", response_model=List[schemas.InsuranceProductStatistic])
+def get_insurance_statistics_by_product(
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    db: Session = Depends(get_db)
+):
+    """按保险产品统计出单量和总保费"""
+    stats = crud.get_insurance_statistics_by_product(db, start_date, end_date)
+    return stats
+
+
+@app.get("/insurance/surrender/{policy_id}", response_model=schemas.InsuranceSurrenderRecord)
+def get_surrender_record(policy_id: int, db: Session = Depends(get_db)):
+    """获取退保记录"""
+    record = crud.get_surrender_record_by_policy(db, policy_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="该投保单无退保记录")
+    return {
+        "id": record.id,
+        "policy_id": record.policy_id,
+        "surrender_no": record.surrender_no,
+        "surrender_reason": record.surrender_reason,
+        "total_premium": record.total_premium,
+        "used_days": record.used_days,
+        "total_days": record.total_days,
+        "refund_ratio": record.refund_ratio,
+        "refund_amount": record.refund_amount,
+        "surrendered_at": record.surrendered_at.isoformat() if record.surrendered_at else "",
+        "handled_by": record.handled_by,
+        "remarks": record.remarks,
     }
 
 

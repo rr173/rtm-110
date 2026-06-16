@@ -5673,4 +5673,994 @@ def create_default_alert_rules_and_demo_event(db: Session):
             })
 
 
+# ==================== 保险模块 CRUD ====================
+
+TEMP_PRIORITY = {"FROZEN": 3, "REFRIGERATED": 2, "AMBIENT": 1}
+
+
+def generate_insurance_product_no() -> str:
+    return f"INS-PROD-{uuid.uuid4().hex[:6].upper()}"
+
+
+def generate_policy_no() -> str:
+    return f"INS-POL-{uuid.uuid4().hex[:8].upper()}"
+
+
+def generate_surrender_no() -> str:
+    return f"INS-SUR-{uuid.uuid4().hex[:8].upper()}"
+
+
+def generate_match_id() -> str:
+    return f"INS-MATCH-{uuid.uuid4().hex[:8].upper()}"
+
+
+def create_insurance_product(db: Session, product_data: dict) -> models.InsuranceProduct:
+    if "applicable_cargo_types" in product_data and isinstance(product_data["applicable_cargo_types"], list):
+        product_data["applicable_cargo_types"] = [
+            ct.value if hasattr(ct, "value") else ct
+            for ct in product_data["applicable_cargo_types"]
+        ]
+    if "excluded_items" in product_data and isinstance(product_data["excluded_items"], list):
+        product_data["excluded_items"] = list(product_data["excluded_items"])
+    if "min_temperature_class" in product_data and product_data["min_temperature_class"]:
+        product_data["min_temperature_class"] = (
+            product_data["min_temperature_class"].value
+            if hasattr(product_data["min_temperature_class"], "value")
+            else product_data["min_temperature_class"]
+        )
+    if "max_temperature_class" in product_data and product_data["max_temperature_class"]:
+        product_data["max_temperature_class"] = (
+            product_data["max_temperature_class"].value
+            if hasattr(product_data["max_temperature_class"], "value")
+            else product_data["max_temperature_class"]
+        )
+
+    db_product = models.InsuranceProduct(**product_data)
+    db.add(db_product)
+    db.commit()
+    db.refresh(db_product)
+    return result
+
+
+def _resolve_packing_plan(plan_identifier: str, db: Session):
+    """解析配载方案标识符,支持ID或方案编号"""
+    plan = None
+    if str(plan_identifier).isdigit():
+        plan = get_packing_plan(db, plan_id=int(plan_identifier))
+    if plan is None:
+        plan = get_packing_plan(db, plan_no=str(plan_identifier))
+    return plan
+
+
+def get_insurance_product(
+    db: Session, product_id: int = None, product_code: str = None
+) -> Optional[models.InsuranceProduct]:
+    if product_id:
+        return db.query(models.InsuranceProduct).filter(
+            models.InsuranceProduct.id == product_id
+        ).first()
+    if product_code:
+        return db.query(models.InsuranceProduct).filter(
+            models.InsuranceProduct.product_code == product_code
+        ).first()
+    return None
+
+
+def list_insurance_products(
+    db: Session, skip: int = 0, limit: int = 100, only_active: bool = True
+) -> list:
+    q = db.query(models.InsuranceProduct)
+    if only_active:
+        q = q.filter(models.InsuranceProduct.is_active == True)
+    return q.order_by(models.InsuranceProduct.id).offset(skip).limit(limit).all()
+
+
+def update_insurance_product(
+    db: Session, product_id: int, update_data: dict
+) -> Optional[models.InsuranceProduct]:
+    product = get_insurance_product(db, product_id=product_id)
+    if not product:
+        return None
+
+    for key, value in update_data.items():
+        if value is None:
+            continue
+        if key in ["applicable_cargo_types", "excluded_items"] and isinstance(value, list):
+            value = [v.value if hasattr(v, "value") else v for v in value]
+        if key in ["min_temperature_class", "max_temperature_class"] and value:
+            value = value.value if hasattr(value, "value") else value
+        setattr(product, key, value)
+
+    db.commit()
+    db.refresh(product)
+    return product
+
+
+def delete_insurance_product(db: Session, product_id: int) -> Optional[models.InsuranceProduct]:
+    product = get_insurance_product(db, product_id=product_id)
+    if product:
+        product.is_active = False
+        db.commit()
+        db.refresh(product)
+    return product
+
+
+def calculate_premium(
+    product: models.InsuranceProduct,
+    declared_value: float,
+    hazard_class: Optional[int],
+    temperature_class: Optional[str],
+) -> dict:
+    base_rate = product.base_rate_pct
+    hazard_coeff = 1.0
+    cold_chain_coeff = 1.0
+    high_value_coeff = 1.0
+
+    if hazard_class is not None and product.hazard_surcharge_coeff > 1.0:
+        hazard_coeff = product.hazard_surcharge_coeff
+
+    temp_class = (temperature_class or "AMBIENT").upper()
+    if temp_class in ["FROZEN", "REFRIGERATED"] and product.cold_chain_surcharge_coeff > 1.0:
+        cold_chain_coeff = product.cold_chain_surcharge_coeff
+
+    if (
+        product.high_value_threshold is not None
+        and declared_value > product.high_value_threshold
+        and product.high_value_surcharge_coeff > 1.0
+    ):
+        high_value_coeff = product.high_value_surcharge_coeff
+
+    final_rate = base_rate * hazard_coeff * cold_chain_coeff * high_value_coeff
+    premium = declared_value * (final_rate / 100.0)
+
+    deductible_summary = {
+        "deductible_amount": product.deductible_amount,
+        "deductible_rate_pct": product.deductible_rate_pct,
+        "excluded_items": product.excluded_items,
+        "summary": f"免赔额: {product.deductible_amount} CNY 或损失金额的 {product.deductible_rate_pct}%, 以高者为准"
+    }
+
+    breakdown = {
+        "declared_value": declared_value,
+        "base_rate_pct": base_rate,
+        "hazard_coeff": hazard_coeff,
+        "cold_chain_coeff": cold_chain_coeff,
+        "high_value_coeff": high_value_coeff,
+        "final_rate_pct": round(final_rate, 4),
+        "premium": round(premium, 2),
+    }
+
+    return {
+        "base_rate_pct": base_rate,
+        "hazard_coeff": hazard_coeff,
+        "cold_chain_coeff": cold_chain_coeff,
+        "high_value_coeff": high_value_coeff,
+        "final_rate_pct": round(final_rate, 4),
+        "premium": round(premium, 2),
+        "breakdown": breakdown,
+        "deductible_summary": deductible_summary,
+    }
+
+
+def is_product_applicable(
+    product: models.InsuranceProduct,
+    cargo_type: str,
+    hazard_class: Optional[int],
+    temperature_class: Optional[str],
+    declared_value: float,
+) -> bool:
+    if not product.is_active:
+        return False
+
+    if product.applicable_cargo_types:
+        ct = cargo_type.value if hasattr(cargo_type, "value") else cargo_type
+        if ct not in product.applicable_cargo_types:
+            return False
+
+    temp_class = (temperature_class or "AMBIENT").upper()
+    temp_priority = TEMP_PRIORITY.get(temp_class, 0)
+
+    if product.min_temperature_class:
+        min_priority = TEMP_PRIORITY.get(product.min_temperature_class.upper(), 0)
+        if temp_priority < min_priority:
+            return False
+
+    if product.max_temperature_class:
+        max_priority = TEMP_PRIORITY.get(product.max_temperature_class.upper(), 0)
+        if temp_priority > max_priority:
+            return False
+
+    if product.min_hazard_class is not None:
+        hc = hazard_class if hazard_class is not None else 0
+        if hc < product.min_hazard_class:
+            return False
+
+    if product.max_hazard_class is not None:
+        hc = hazard_class if hazard_class is not None else 0
+        if hc > product.max_hazard_class:
+            return False
+
+    if product.max_unit_value is not None and declared_value > product.max_unit_value:
+        return False
+
+    return True
+
+
+def match_insurance_products_for_cargo(
+    db: Session,
+    cargo_type: str,
+    hazard_class: Optional[int],
+    temperature_class: Optional[str],
+    declared_value: float,
+) -> list:
+    active_products = list_insurance_products(db, only_active=True)
+    matched = []
+
+    for product in active_products:
+        if is_product_applicable(product, cargo_type, hazard_class, temperature_class, declared_value):
+            premium_result = calculate_premium(product, declared_value, hazard_class, temperature_class)
+            matched.append({
+                "product_id": product.id,
+                "product_code": product.product_code,
+                "product_name": product.product_name,
+                "estimated_premium": premium_result["premium"],
+                "base_rate_pct": premium_result["base_rate_pct"],
+                "final_rate_pct": premium_result["final_rate_pct"],
+                "breakdown": premium_result["breakdown"],
+                "deductible_summary": premium_result["deductible_summary"],
+            })
+
+    matched.sort(key=lambda x: x["estimated_premium"])
+    return matched[:3]
+
+
+def match_insurance_for_plan(
+    db: Session, plan_id: int
+) -> dict:
+    plan = get_packing_plan(db, plan_id=plan_id)
+    if not plan:
+        return {"error": "配载方案不存在"}
+
+    packed_cargos = get_packed_cargos(db, plan_id=plan_id)
+    match_results = []
+    match_id = generate_match_id()
+
+    for pc in packed_cargos:
+        cargo = get_cargo(db, cargo_id=pc.cargo_id)
+        if not cargo:
+            continue
+
+        cargo_type = cargo.cargo_type or "GENERAL"
+        hazard_class = pc.hazard_class if hasattr(pc, "hazard_class") else cargo.hazard_class
+        temperature_class = (
+            pc.temperature_class
+            if hasattr(pc, "temperature_class")
+            else cargo.temperature_class
+        )
+        declared_value = getattr(cargo, "declared_value", 0.0) or 0.0
+
+        matched_products = match_insurance_products_for_cargo(
+            db, cargo_type, hazard_class, temperature_class, declared_value
+        )
+
+        match_results.append({
+            "packed_cargo_id": pc.id,
+            "cargo_id": pc.cargo_id,
+            "cargo_name": pc.cargo_name,
+            "cargo_type": cargo_type,
+            "hazard_class": hazard_class,
+            "temperature_class": temperature_class,
+            "declared_value": declared_value,
+            "matched_products": matched_products,
+        })
+
+    return {
+        "match_id": match_id,
+        "plan_id": plan.id,
+        "plan_no": plan.plan_no,
+        "total_cargos": len(match_results),
+        "match_results": match_results,
+    }
+
+
+_match_result_cache = {}
+
+
+def cache_match_result(match_id: str, result: dict):
+    _match_result_cache[match_id] = result
+
+
+def get_cached_match_result(match_id: str) -> Optional[dict]:
+    return _match_result_cache.get(match_id)
+
+
+def create_insurance_policy(
+    db: Session, policy_data: dict, policy_items_data: list
+) -> models.InsurancePolicy:
+    from datetime import datetime, timedelta
+
+    plan = _resolve_packing_plan(policy_data["plan_identifier"], db)
+    if not plan:
+        raise ValueError("配载方案不存在")
+
+    policy_no = generate_policy_no()
+    period_days = policy_data.get("insurance_period_days", 30)
+    effective_date = datetime.utcnow()
+    expiry_date = effective_date + timedelta(days=period_days)
+
+    db_policy = models.InsurancePolicy(
+        policy_no=policy_no,
+        plan_id=plan.id,
+        plan_no=plan.plan_no,
+        plan_version=plan.version or 1,
+        policyholder_name=policy_data["policyholder_name"],
+        policyholder_contact=policy_data.get("policyholder_contact"),
+        voyage_no=policy_data.get("voyage_no"),
+        container_no=plan.container_no,
+        shipment_no=plan.shipment_no,
+        currency="CNY",
+        insurance_period_days=period_days,
+        effective_date=effective_date,
+        expiry_date=expiry_date,
+        status="draft",
+        created_by=policy_data.get("created_by"),
+        remarks=policy_data.get("remarks"),
+    )
+    db.add(db_policy)
+    db.flush()
+
+    total_insured = 0.0
+    total_premium = 0.0
+
+    for item_data in policy_items_data:
+        pc = db.query(models.PackedCargo).filter(
+            models.PackedCargo.id == item_data["packed_cargo_id"]
+        ).first()
+        if not pc:
+            continue
+
+        cargo = get_cargo(db, cargo_id=pc.cargo_id)
+        if not cargo:
+            continue
+
+        product = get_insurance_product(db, product_id=item_data["product_id"])
+        if not product:
+            continue
+
+        cargo_type = cargo.cargo_type or "GENERAL"
+        hazard_class = getattr(pc, "hazard_class", None) or cargo.hazard_class
+        temperature_class = (
+            getattr(pc, "temperature_class", None) or cargo.temperature_class
+        )
+        declared_value = getattr(cargo, "declared_value", 0.0) or 0.0
+
+        if not is_product_applicable(product, cargo_type, hazard_class, temperature_class, declared_value):
+            raise ValueError(f"保险产品[{product.product_name}]不适用于货物[{cargo.name}]")
+
+        premium_result = calculate_premium(product, declared_value, hazard_class, temperature_class)
+
+        all_matched = match_insurance_products_for_cargo(
+            db, cargo_type, hazard_class, temperature_class, declared_value
+        )
+
+        db_item = models.InsurancePolicyItem(
+            policy_id=db_policy.id,
+            product_id=product.id,
+            packed_cargo_id=pc.id,
+            cargo_id=pc.cargo_id,
+            cargo_name=pc.cargo_name,
+            cargo_type=cargo_type,
+            hazard_class=hazard_class,
+            temperature_class=temperature_class,
+            declared_value=declared_value,
+            base_rate_pct=premium_result["base_rate_pct"],
+            hazard_coeff=premium_result["hazard_coeff"],
+            cold_chain_coeff=premium_result["cold_chain_coeff"],
+            high_value_coeff=premium_result["high_value_coeff"],
+            final_rate_pct=premium_result["final_rate_pct"],
+            premium=premium_result["premium"],
+            deductible_summary=premium_result["deductible_summary"],
+            alternative_products=all_matched,
+        )
+        db.add(db_item)
+
+        total_insured += declared_value
+        total_premium += premium_result["premium"]
+
+    db_policy.total_insured_amount = round(total_insured, 2)
+    db_policy.total_premium = round(total_premium, 2)
+
+    db.commit()
+    db.refresh(db_policy)
+    return db_policy
+
+
+def get_insurance_policy(
+    db: Session, policy_id: int = None, policy_no: str = None
+) -> Optional[models.InsurancePolicy]:
+    if policy_id:
+        return db.query(models.InsurancePolicy).filter(
+            models.InsurancePolicy.id == policy_id
+        ).first()
+    if policy_no:
+        return db.query(models.InsurancePolicy).filter(
+            models.InsurancePolicy.policy_no == policy_no
+        ).first()
+    return None
+
+
+def list_insurance_policies(
+    db: Session,
+    skip: int = 0,
+    limit: int = 100,
+    plan_id: int = None,
+    status: str = None,
+    product_id: int = None,
+) -> list:
+    q = db.query(models.InsurancePolicy)
+
+    if plan_id:
+        q = q.filter(models.InsurancePolicy.plan_id == plan_id)
+    if status:
+        q = q.filter(models.InsurancePolicy.status == status)
+    if product_id:
+        q = q.join(models.InsurancePolicyItem).filter(
+            models.InsurancePolicyItem.product_id == product_id
+        )
+
+    return q.order_by(models.InsurancePolicy.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def get_policy_items(db: Session, policy_id: int) -> list:
+    return db.query(models.InsurancePolicyItem).filter(
+        models.InsurancePolicyItem.policy_id == policy_id
+    ).all()
+
+
+def update_insurance_policy(
+    db: Session, policy_id: int, update_data: dict
+) -> Optional[models.InsurancePolicy]:
+    policy = get_insurance_policy(db, policy_id=policy_id)
+    if not policy:
+        return None
+
+    if policy.status == "accepted":
+        raise ValueError("已承保的投保单不允许修改")
+
+    if policy.status == "surrendered":
+        raise ValueError("已退保的投保单不允许修改")
+
+    if "policy_items" in update_data and update_data["policy_items"] is not None:
+        db.query(models.InsurancePolicyItem).filter(
+            models.InsurancePolicyItem.policy_id == policy_id
+        ).delete()
+
+        total_insured = 0.0
+        total_premium = 0.0
+
+        for item_data in update_data["policy_items"]:
+            pc = db.query(models.PackedCargo).filter(
+                models.PackedCargo.id == item_data["packed_cargo_id"]
+            ).first()
+            if not pc:
+                continue
+
+            cargo = get_cargo(db, cargo_id=pc.cargo_id)
+            if not cargo:
+                continue
+
+            product = get_insurance_product(db, product_id=item_data["product_id"])
+            if not product:
+                continue
+
+            cargo_type = cargo.cargo_type or "GENERAL"
+            hazard_class = getattr(pc, "hazard_class", None) or cargo.hazard_class
+            temperature_class = (
+                getattr(pc, "temperature_class", None) or cargo.temperature_class
+            )
+            declared_value = getattr(cargo, "declared_value", 0.0) or 0.0
+
+            if not is_product_applicable(product, cargo_type, hazard_class, temperature_class, declared_value):
+                raise ValueError(f"保险产品[{product.product_name}]不适用于货物[{cargo.name}]")
+
+            premium_result = calculate_premium(product, declared_value, hazard_class, temperature_class)
+            all_matched = match_insurance_products_for_cargo(
+                db, cargo_type, hazard_class, temperature_class, declared_value
+            )
+
+            db_item = models.InsurancePolicyItem(
+                policy_id=policy.id,
+                product_id=product.id,
+                packed_cargo_id=pc.id,
+                cargo_id=pc.cargo_id,
+                cargo_name=pc.cargo_name,
+                cargo_type=cargo_type,
+                hazard_class=hazard_class,
+                temperature_class=temperature_class,
+                declared_value=declared_value,
+                base_rate_pct=premium_result["base_rate_pct"],
+                hazard_coeff=premium_result["hazard_coeff"],
+                cold_chain_coeff=premium_result["cold_chain_coeff"],
+                high_value_coeff=premium_result["high_value_coeff"],
+                final_rate_pct=premium_result["final_rate_pct"],
+                premium=premium_result["premium"],
+                deductible_summary=premium_result["deductible_summary"],
+                alternative_products=all_matched,
+            )
+            db.add(db_item)
+
+            total_insured += declared_value
+            total_premium += premium_result["premium"]
+
+        policy.total_insured_amount = round(total_insured, 2)
+        policy.total_premium = round(total_premium, 2)
+
+    for key in ["policyholder_name", "policyholder_contact", "voyage_no", "insurance_period_days", "remarks"]:
+        if key in update_data and update_data[key] is not None:
+            setattr(policy, key, update_data[key])
+
+    from datetime import datetime, timedelta
+    if "insurance_period_days" in update_data and update_data["insurance_period_days"] is not None:
+        policy.effective_date = datetime.utcnow()
+        policy.expiry_date = policy.effective_date + timedelta(days=update_data["insurance_period_days"])
+
+    db.commit()
+    db.refresh(policy)
+    return policy
+
+
+def transition_policy_status(
+    db: Session, policy_id: int, target_status: str, handled_by: str = None, remarks: str = None
+) -> Optional[models.InsurancePolicy]:
+    from datetime import datetime
+
+    policy = get_insurance_policy(db, policy_id=policy_id)
+    if not policy:
+        return None
+
+    current_status = policy.status
+    valid_transitions = {
+        "draft": ["submitted", "surrendered"],
+        "submitted": ["draft", "accepted", "surrendered"],
+        "accepted": ["surrendered"],
+        "surrendered": [],
+    }
+
+    if target_status not in valid_transitions.get(current_status, []):
+        raise ValueError(f"不允许从 {current_status} 状态变更为 {target_status}")
+
+    policy.status = target_status
+    policy.status_changed_at = datetime.utcnow()
+
+    if target_status == "submitted":
+        policy.submitted_at = datetime.utcnow()
+    elif target_status == "accepted":
+        policy.accepted_at = datetime.utcnow()
+
+    if remarks:
+        if policy.remarks:
+            policy.remarks = f"{policy.remarks}\n状态变更({current_status}->{target_status}): {remarks}"
+        else:
+            policy.remarks = f"状态变更({current_status}->{target_status}): {remarks}"
+
+    db.commit()
+    db.refresh(policy)
+    return policy
+
+
+def surrender_policy(
+    db: Session, policy_id: int, surrender_reason: str, handled_by: str = None, remarks: str = None
+) -> dict:
+    from datetime import datetime
+
+    policy = get_insurance_policy(db, policy_id=policy_id)
+    if not policy:
+        return {"error": "投保单不存在"}
+
+    if policy.status not in ["draft", "submitted", "accepted"]:
+        return {"error": f"当前状态({policy.status})不允许退保"}
+
+    if policy.surrender_record:
+        return {"error": "该投保单已退保"}
+
+    now = datetime.utcnow()
+    effective_date = policy.effective_date or now
+    total_days = policy.insurance_period_days
+
+    if policy.status == "accepted" and policy.accepted_at:
+        used_td = now - policy.accepted_at
+        used_days = max(0, used_td.days + 1)
+    else:
+        used_days = 0
+
+    if used_days >= total_days:
+        refund_ratio = 0.0
+    else:
+        refund_ratio = (total_days - used_days) / total_days
+
+    refund_amount = round(policy.total_premium * refund_ratio, 2)
+
+    surrender_no = generate_surrender_no()
+    surrender_record = models.InsuranceSurrenderRecord(
+        policy_id=policy.id,
+        surrender_no=surrender_no,
+        surrender_reason=surrender_reason,
+        total_premium=policy.total_premium,
+        used_days=used_days,
+        total_days=total_days,
+        refund_ratio=round(refund_ratio, 4),
+        refund_amount=refund_amount,
+        surrendered_at=now,
+        handled_by=handled_by,
+        remarks=remarks,
+    )
+    db.add(surrender_record)
+
+    policy.status = "surrendered"
+    policy.status_changed_at = now
+    if policy.remarks:
+        policy.remarks = f"{policy.remarks}\n退保原因: {surrender_reason}"
+    else:
+        policy.remarks = f"退保原因: {surrender_reason}"
+
+    db.commit()
+    db.refresh(policy)
+    db.refresh(surrender_record)
+
+    return {
+        "policy_id": policy.id,
+        "policy_no": policy.policy_no,
+        "status": policy.status,
+        "surrender_record": {
+            "id": surrender_record.id,
+            "surrender_no": surrender_record.surrender_no,
+            "surrender_reason": surrender_record.surrender_reason,
+            "total_premium": surrender_record.total_premium,
+            "used_days": surrender_record.used_days,
+            "total_days": surrender_record.total_days,
+            "refund_ratio": surrender_record.refund_ratio,
+            "refund_amount": surrender_record.refund_amount,
+            "surrendered_at": surrender_record.surrendered_at.isoformat() if surrender_record.surrendered_at else None,
+            "handled_by": surrender_record.handled_by,
+            "remarks": surrender_record.remarks,
+        },
+    }
+
+
+def get_insurance_product_statistics(db: Session) -> list:
+    products = list_insurance_products(db, only_active=True)
+    stats = []
+
+    for product in products:
+        items = db.query(models.InsurancePolicyItem).filter(
+            models.InsurancePolicyItem.product_id == product.id,
+        ).all()
+
+        policy_ids = list(set(item.policy_id for item in items))
+        accepted_policies = db.query(models.InsurancePolicy).filter(
+            models.InsurancePolicy.id.in_(policy_ids),
+            models.InsurancePolicy.status.in_(["submitted", "accepted"]),
+        ).all()
+
+        total_premium = sum(item.premium for item in items)
+        total_insured = sum(item.declared_value for item in items)
+
+        stats.append({
+            "product_id": product.id,
+            "product_code": product.product_code,
+            "product_name": product.product_name,
+            "total_policies": len(accepted_policies),
+            "total_premium": round(total_premium, 2),
+            "total_insured_amount": round(total_insured, 2),
+        })
+
+    return stats
+
+
+def get_insurance_statistics_by_product(db: Session, start_date=None, end_date=None) -> list:
+    """按保险产品统计出单量和总保费,支持日期过滤"""
+    products = list_insurance_products(db, only_active=True)
+    stats = []
+
+    for product in products:
+        q = db.query(models.InsurancePolicyItem).filter(
+            models.InsurancePolicyItem.product_id == product.id,
+        )
+
+        if start_date or end_date:
+            q = q.join(models.InsurancePolicy)
+            if start_date:
+                q = q.filter(models.InsurancePolicy.created_at >= start_date)
+            if end_date:
+                q = q.filter(models.InsurancePolicy.created_at <= end_date)
+
+        items = q.all()
+
+        policy_ids = list(set(item.policy_id for item in items))
+        policy_q = db.query(models.InsurancePolicy).filter(
+            models.InsurancePolicy.id.in_(policy_ids),
+            models.InsurancePolicy.status.in_(["submitted", "accepted"]),
+        )
+
+        if start_date:
+            policy_q = policy_q.filter(models.InsurancePolicy.created_at >= start_date)
+        if end_date:
+            policy_q = policy_q.filter(models.InsurancePolicy.created_at <= end_date)
+
+        accepted_policies = policy_q.all()
+
+        total_premium = sum(item.premium for item in items)
+        total_insured = sum(item.declared_value for item in items)
+
+        stats.append({
+            "product_id": product.id,
+            "product_code": product.product_code,
+            "product_name": product.product_name,
+            "total_policies": len(accepted_policies),
+            "total_premium": round(total_premium, 2),
+            "total_insured_amount": round(total_insured, 2),
+        })
+
+    return stats
+
+
+def get_policies_by_plan(db: Session, plan_id: int) -> list:
+    return db.query(models.InsurancePolicy).filter(
+        models.InsurancePolicy.plan_id == plan_id
+    ).order_by(models.InsurancePolicy.created_at.desc()).all()
+
+
+def get_insurance_policies_by_plan(db: Session, plan_id: int) -> list:
+    """按配载方案ID查询投保历史"""
+    return get_policies_by_plan(db, plan_id)
+
+
+def get_surrender_record_by_policy(db: Session, policy_id: int) -> Optional[models.InsuranceSurrenderRecord]:
+    """根据投保单ID获取退保记录"""
+    return db.query(models.InsuranceSurrenderRecord).filter(
+        models.InsuranceSurrenderRecord.policy_id == policy_id
+    ).first()
+
+
+def generate_insurance_policy_from_plan(
+    db: Session, plan_id: int, policy_info
+) -> models.InsurancePolicy:
+    """从配载方案一键生成投保单,自动为每件货物选择最便宜的保险产品"""
+    plan = get_packing_plan(db, plan_id=plan_id)
+    if not plan:
+        raise ValueError("配载方案不存在")
+
+    match_result = match_insurance_for_plan(db, plan_id)
+    if "error" in match_result:
+        raise ValueError(match_result["error"])
+
+    policy_items = []
+    for item in match_result["match_results"]:
+        if item["matched_products"]:
+            selected_product = item["matched_products"][0]
+            policy_items.append({
+                "packed_cargo_id": item["packed_cargo_id"],
+                "product_id": selected_product["product_id"],
+            })
+
+    if not policy_items:
+        raise ValueError("没有可投保的货物或没有匹配的保险产品")
+
+    policy_data = policy_info.model_dump() if hasattr(policy_info, 'model_dump') else dict(policy_info)
+    policy_data["plan_identifier"] = str(plan_id)
+
+    return create_insurance_policy(db, policy_data, policy_items)
+
+
+def create_default_insurance_products(db: Session):
+    existing = db.query(models.InsuranceProduct).first()
+    if existing:
+        return
+
+    products = [
+        {
+            "product_code": "INS-GEN-001",
+            "product_name": "普通货运险",
+            "description": "适用于普通货物运输，保障基本风险",
+            "is_active": True,
+            "applicable_cargo_types": ["GENERAL", "ELECTRONICS", "FRAGILE", "FOOD"],
+            "min_temperature_class": None,
+            "max_temperature_class": "AMBIENT",
+            "min_hazard_class": None,
+            "max_hazard_class": None,
+            "max_unit_value": 500000.0,
+            "base_rate_pct": 0.15,
+            "hazard_surcharge_coeff": 1.0,
+            "cold_chain_surcharge_coeff": 1.0,
+            "high_value_threshold": 100000.0,
+            "high_value_surcharge_coeff": 1.2,
+            "deductible_amount": 500.0,
+            "deductible_rate_pct": 5.0,
+            "excluded_items": [
+                "不可抗力造成的损失",
+                "货物本身缺陷、自然损耗",
+                "包装不善造成的损失",
+                "战争、军事行动、扣押",
+            ],
+        },
+        {
+            "product_code": "INS-COL-001",
+            "product_name": "冷链专项险",
+            "description": "专为冷藏、冷冻货物设计，保障温控失效风险",
+            "is_active": True,
+            "applicable_cargo_types": ["GENERAL", "FOOD", "ELECTRONICS"],
+            "min_temperature_class": "REFRIGERATED",
+            "max_temperature_class": "FROZEN",
+            "min_hazard_class": None,
+            "max_hazard_class": None,
+            "max_unit_value": 1000000.0,
+            "base_rate_pct": 0.25,
+            "hazard_surcharge_coeff": 1.0,
+            "cold_chain_surcharge_coeff": 1.3,
+            "high_value_threshold": 200000.0,
+            "high_value_surcharge_coeff": 1.3,
+            "deductible_amount": 1000.0,
+            "deductible_rate_pct": 3.0,
+            "excluded_items": [
+                "不可抗力造成的损失",
+                "货物本身缺陷、自然损耗",
+                "温度异常是由于货主预冷不足造成的",
+                "战争、军事行动、扣押",
+                "停电超过48小时且未采取应急措施",
+            ],
+        },
+        {
+            "product_code": "INS-HAZ-001",
+            "product_name": "危化品特约险",
+            "description": "专为危险品运输设计，涵盖泄漏、污染等特殊风险",
+            "is_active": True,
+            "applicable_cargo_types": ["HAZARDOUS", "LIQUID", "GENERAL"],
+            "min_temperature_class": None,
+            "max_temperature_class": None,
+            "min_hazard_class": 1,
+            "max_hazard_class": 6,
+            "max_unit_value": 2000000.0,
+            "base_rate_pct": 0.50,
+            "hazard_surcharge_coeff": 1.8,
+            "cold_chain_surcharge_coeff": 1.0,
+            "high_value_threshold": 500000.0,
+            "high_value_surcharge_coeff": 1.5,
+            "deductible_amount": 2000.0,
+            "deductible_rate_pct": 8.0,
+            "excluded_items": [
+                "不可抗力造成的损失",
+                "货物本身缺陷、自然损耗",
+                "未按规定包装、张贴危险品标识",
+                "战争、军事行动、扣押",
+                "核辐射、核爆炸",
+                "故意行为或重大过失",
+            ],
+        },
+    ]
+
+    for p in products:
+        create_insurance_product(db, p)
+
+
+def create_demo_insurance_policy(db: Session):
+    from datetime import datetime, timedelta
+
+    existing = db.query(models.InsurancePolicy).filter(
+        models.InsurancePolicy.status == "accepted"
+    ).first()
+    if existing:
+        return
+
+    products = list_insurance_products(db)
+    if not products:
+        create_default_insurance_products(db)
+        products = list_insurance_products(db)
+
+    plans = get_packing_plans(db, limit=1)
+    if not plans:
+        return
+
+    plan = plans[0]
+
+    demo_cargos = [
+        {
+            "cargo_type": "ELECTRONICS",
+            "hazard_class": None,
+            "temperature_class": "AMBIENT",
+            "declared_value": 50000.0,
+            "name": "智能手机配件",
+        },
+        {
+            "cargo_type": "FOOD",
+            "hazard_class": None,
+            "temperature_class": "REFRIGERATED",
+            "declared_value": 30000.0,
+            "name": "进口海鲜",
+        },
+        {
+            "cargo_type": "HAZARDOUS",
+            "hazard_class": 3,
+            "temperature_class": "AMBIENT",
+            "declared_value": 80000.0,
+            "name": "工业化学品",
+        },
+    ]
+
+    policy_items = []
+    temp_cargos = []
+
+    for i, demo_cargo in enumerate(demo_cargos):
+        db_cargo = models.Cargo(
+            name=demo_cargo["name"],
+            length=500,
+            width=400,
+            height=300,
+            weight=50,
+            cargo_type=demo_cargo["cargo_type"],
+            hazard_class=demo_cargo["hazard_class"],
+            temperature_class=demo_cargo["temperature_class"],
+            declared_value=demo_cargo["declared_value"],
+        )
+        db.add(db_cargo)
+        db.flush()
+        temp_cargos.append(db_cargo)
+
+        db_packed = models.PackedCargo(
+            plan_id=plan.id,
+            cargo_id=db_cargo.id,
+            cargo_name=db_cargo.name,
+            x=0,
+            y=0,
+            z=0,
+            length=db_cargo.length,
+            width=db_cargo.width,
+            height=db_cargo.height,
+            weight=db_cargo.weight,
+            orientation="0",
+            temperature_class=db_cargo.temperature_class,
+        )
+        db.add(db_packed)
+        db.flush()
+
+        matched = match_insurance_products_for_cargo(
+            db,
+            cargo_type=demo_cargo["cargo_type"],
+            hazard_class=demo_cargo["hazard_class"],
+            temperature_class=demo_cargo["temperature_class"],
+            declared_value=demo_cargo["declared_value"],
+        )
+        if matched:
+            policy_items.append({
+                "packed_cargo_id": db_packed.id,
+                "product_id": matched[0]["product_id"],
+            })
+
+    if not policy_items:
+        for c in temp_cargos:
+            db.delete(c)
+        db.rollback()
+        return
+
+    try:
+        policy = create_insurance_policy(
+            db,
+            {
+                "plan_identifier": str(plan.id),
+                "policyholder_name": "演示货主有限公司",
+                "policyholder_contact": "400-888-8888",
+                "voyage_no": "VOY-DEMO-2026",
+                "insurance_period_days": 30,
+                "created_by": "system",
+                "remarks": "这是一份演示投保单，用于系统功能展示",
+            },
+            policy_items,
+        )
+
+        transition_policy_status(db, policy.id, "submitted", handled_by="system")
+        transition_policy_status(db, policy.id, "accepted", handled_by="system", remarks="演示数据自动承保")
+
+    except Exception:
+        db.rollback()
+
+
 

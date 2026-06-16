@@ -32,7 +32,9 @@ class Cargo(Base):
     hazard_class = Column(Integer, nullable=True, comment="危险品等级 1-6类，None为普通货物")
     declared_name = Column(String, nullable=True, comment="海关申报品名")
     declared_weight = Column(Float, nullable=True, comment="海关申报重量 kg")
+    declared_value = Column(Float, default=0.0, comment="申报价值 CNY")
     temperature_class = Column(String, nullable=True, default="AMBIENT", comment="温控等级: FROZEN冷冻(-18℃以下)/REFRIGERATED冷藏(0-5℃)/AMBIENT常温")
+    cargo_type = Column(String, nullable=True, default="GENERAL", comment="货物类型: GENERAL普通货物/ELECTRONICS电子产品/FRAGILE易碎品/LIQUID液体/HAZARDOUS危险品/FOOD食品")
 
 
 class PackingPlan(Base):
@@ -1040,3 +1042,128 @@ class ClaimAlertEvent(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
     rule = relationship("ClaimAlertRule")
+
+
+# ==================== 保险模块 Models ====================
+
+class InsuranceProduct(Base):
+    __tablename__ = "insurance_products"
+
+    id = Column(Integer, primary_key=True, index=True)
+    product_code = Column(String, unique=True, index=True, comment="保险产品编码")
+    product_name = Column(String, index=True, comment="保险产品名称")
+    description = Column(Text, nullable=True, comment="产品描述")
+    is_active = Column(Boolean, default=True, comment="是否启用")
+
+    applicable_cargo_types = Column(JSON, default=list, comment="适用的货物类型列表, 如 ['GENERAL', 'ELECTRONICS']")
+    min_temperature_class = Column(String, nullable=True, comment="最低温控等级 (FROZEN/REFRIGERATED/AMBIENT)")
+    max_temperature_class = Column(String, nullable=True, comment="最高温控等级")
+    min_hazard_class = Column(Integer, nullable=True, comment="最低危险品等级 1-6")
+    max_hazard_class = Column(Integer, nullable=True, comment="最高危险品等级 1-6")
+    max_unit_value = Column(Float, nullable=True, comment="单件最大价值上限, None表示无限制")
+
+    base_rate_pct = Column(Float, default=0.0, comment="基础费率百分比, 如0.15表示0.15%")
+    hazard_surcharge_coeff = Column(Float, default=1.0, comment="危险品加费系数, 如1.5表示加收50%")
+    cold_chain_surcharge_coeff = Column(Float, default=1.0, comment="冷链加费系数")
+    high_value_threshold = Column(Float, nullable=True, comment="高价值加费阈值, 超过此价值加收")
+    high_value_surcharge_coeff = Column(Float, default=1.0, comment="高价值加费系数")
+
+    deductible_amount = Column(Float, default=0.0, comment="免赔额 CNY")
+    deductible_rate_pct = Column(Float, default=0.0, comment="免赔率百分比, 如5表示损失金额的5%免赔")
+    excluded_items = Column(JSON, default=list, comment="不保事项列表")
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    policy_items = relationship("InsurancePolicyItem", back_populates="product")
+
+
+class InsurancePolicy(Base):
+    __tablename__ = "insurance_policies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    policy_no = Column(String, unique=True, index=True, comment="投保单编号")
+    plan_id = Column(Integer, ForeignKey("packing_plans.id"), comment="关联配载方案ID")
+    plan_no = Column(String, index=True, comment="关联配载方案编号")
+    plan_version = Column(Integer, comment="关联配载方案版本")
+
+    policyholder_name = Column(String, comment="投保人名称")
+    policyholder_contact = Column(String, nullable=True, comment="投保人联系方式")
+    voyage_no = Column(String, nullable=True, comment="承运航次")
+    container_no = Column(String, nullable=True, comment="箱号")
+    shipment_no = Column(String, nullable=True, comment="运单号/提单号")
+
+    total_insured_amount = Column(Float, default=0.0, comment="总保额 CNY")
+    total_premium = Column(Float, default=0.0, comment="总保费 CNY")
+    currency = Column(String, default="CNY", comment="币种")
+
+    insurance_period_days = Column(Integer, default=30, comment="保险期限 天数")
+    effective_date = Column(DateTime, nullable=True, comment="生效日期")
+    expiry_date = Column(DateTime, nullable=True, comment="到期日期")
+
+    status = Column(String, default="draft", comment="状态: draft草稿/submitted已提交/accepted已承保/surrendered已退保")
+    status_changed_at = Column(DateTime, nullable=True, comment="状态变更时间")
+    submitted_at = Column(DateTime, nullable=True, comment="提交时间")
+    accepted_at = Column(DateTime, nullable=True, comment="承保时间")
+
+    created_by = Column(String, nullable=True, comment="创建人")
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    remarks = Column(Text, nullable=True, comment="备注")
+
+    plan = relationship("PackingPlan")
+    policy_items = relationship("InsurancePolicyItem", back_populates="policy", cascade="all, delete-orphan")
+    surrender_record = relationship("InsuranceSurrenderRecord", back_populates="policy", uselist=False, cascade="all, delete-orphan")
+
+
+class InsurancePolicyItem(Base):
+    __tablename__ = "insurance_policy_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    policy_id = Column(Integer, ForeignKey("insurance_policies.id"))
+    product_id = Column(Integer, ForeignKey("insurance_products.id"), comment="选中的保险产品ID")
+
+    packed_cargo_id = Column(Integer, ForeignKey("packed_cargos.id"), comment="关联已装货物ID")
+    cargo_id = Column(Integer, comment="货物ID")
+    cargo_name = Column(String, comment="货物名称")
+    cargo_type = Column(String, comment="货物类型快照")
+    hazard_class = Column(Integer, nullable=True, comment="危险品等级快照")
+    temperature_class = Column(String, nullable=True, comment="温控等级快照")
+
+    declared_value = Column(Float, default=0.0, comment="申报价值(保额) CNY")
+    base_rate_pct = Column(Float, default=0.0, comment="适用基础费率百分比")
+    hazard_coeff = Column(Float, default=1.0, comment="危险品系数")
+    cold_chain_coeff = Column(Float, default=1.0, comment="冷链系数")
+    high_value_coeff = Column(Float, default=1.0, comment="高价值系数")
+    final_rate_pct = Column(Float, default=0.0, comment="最终费率百分比")
+    premium = Column(Float, default=0.0, comment="保费 CNY")
+
+    deductible_summary = Column(JSON, default=dict, comment="免赔条款摘要")
+    alternative_products = Column(JSON, default=list, comment="备选保险产品列表(前3个)")
+
+    created_at = Column(DateTime, server_default=func.now())
+
+    policy = relationship("InsurancePolicy", back_populates="policy_items")
+    product = relationship("InsuranceProduct", back_populates="policy_items")
+    packed_cargo = relationship("PackedCargo")
+
+
+class InsuranceSurrenderRecord(Base):
+    __tablename__ = "insurance_surrender_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    policy_id = Column(Integer, ForeignKey("insurance_policies.id"), unique=True)
+    surrender_no = Column(String, unique=True, index=True, comment="退保编号")
+
+    surrender_reason = Column(Text, comment="退保原因")
+    total_premium = Column(Float, default=0.0, comment="原总保费")
+    used_days = Column(Integer, default=0, comment="已使用天数")
+    total_days = Column(Integer, default=0, comment="保险期限总天数")
+    refund_ratio = Column(Float, default=0.0, comment="退费比例")
+    refund_amount = Column(Float, default=0.0, comment="退费金额 CNY")
+
+    surrendered_at = Column(DateTime, server_default=func.now(), comment="退保时间")
+    handled_by = Column(String, nullable=True, comment="处理人")
+    remarks = Column(Text, nullable=True, comment="备注")
+
+    policy = relationship("InsurancePolicy", back_populates="surrender_record")

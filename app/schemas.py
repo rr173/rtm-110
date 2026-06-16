@@ -10,6 +10,15 @@ class TemperatureClassEnum(str, Enum):
     AMBIENT = "AMBIENT"
 
 
+class CargoTypeEnum(str, Enum):
+    GENERAL = "GENERAL"
+    ELECTRONICS = "ELECTRONICS"
+    FRAGILE = "FRAGILE"
+    LIQUID = "LIQUID"
+    HAZARDOUS = "HAZARDOUS"
+    FOOD = "FOOD"
+
+
 class ContainerBase(BaseModel):
     name: str
     length: float = Field(gt=0, description="内部长度 mm")
@@ -43,9 +52,14 @@ class CargoBase(BaseModel):
     hazard_class: Optional[int] = Field(default=None, ge=1, le=6, description="危险品等级 1-6类，None为普通货物")
     declared_name: Optional[str] = Field(default=None, description="海关申报品名")
     declared_weight: Optional[float] = Field(default=None, ge=0, description="海关申报重量 kg")
+    declared_value: Optional[float] = Field(default=0.0, ge=0, description="申报价值 CNY")
     temperature_class: Optional[TemperatureClassEnum] = Field(
         default=TemperatureClassEnum.AMBIENT,
         description="温控等级: FROZEN冷冻(-18℃以下)/REFRIGERATED冷藏(0-5℃)/AMBIENT常温"
+    )
+    cargo_type: Optional[CargoTypeEnum] = Field(
+        default=CargoTypeEnum.GENERAL,
+        description="货物类型: GENERAL普通货物/ELECTRONICS电子产品/FRAGILE易碎品/LIQUID液体/HAZARDOUS危险品/FOOD食品"
     )
 
 
@@ -66,7 +80,9 @@ class CargoUpdate(BaseModel):
     hazard_class: Optional[int] = None
     declared_name: Optional[str] = None
     declared_weight: Optional[float] = None
+    declared_value: Optional[float] = None
     temperature_class: Optional[TemperatureClassEnum] = None
+    cargo_type: Optional[CargoTypeEnum] = None
 
 
 class Cargo(CargoBase):
@@ -2164,4 +2180,321 @@ class AlertEventQuery(BaseModel):
 class AlertEngineRunResult(BaseModel):
     triggered_count: int
     triggered_events: List[AlertEvent] = []
+
+
+# ==================== 保险模块 Schemas ====================
+
+class InsurancePolicyStatusEnum(str, Enum):
+    DRAFT = "draft"
+    SUBMITTED = "submitted"
+    ACCEPTED = "accepted"
+    SURRENDERED = "surrendered"
+
+
+class InsuranceProductBase(BaseModel):
+    product_code: str = Field(description="保险产品编码(唯一)")
+    product_name: str = Field(description="保险产品名称")
+    description: Optional[str] = Field(default=None, description="产品描述")
+    is_active: bool = Field(default=True, description="是否启用")
+
+    applicable_cargo_types: List[CargoTypeEnum] = Field(default_factory=list, description="适用的货物类型列表")
+    min_temperature_class: Optional[TemperatureClassEnum] = Field(default=None, description="最低温控等级")
+    max_temperature_class: Optional[TemperatureClassEnum] = Field(default=None, description="最高温控等级")
+    min_hazard_class: Optional[int] = Field(default=None, ge=1, le=6, description="最低危险品等级 1-6")
+    max_hazard_class: Optional[int] = Field(default=None, ge=1, le=6, description="最高危险品等级 1-6")
+    max_unit_value: Optional[float] = Field(default=None, ge=0, description="单件最大价值上限, None表示无限制")
+
+    base_rate_pct: float = Field(default=0.0, ge=0, description="基础费率百分比, 如0.15表示0.15%")
+    hazard_surcharge_coeff: float = Field(default=1.0, ge=1.0, description="危险品加费系数, 如1.5表示加收50%")
+    cold_chain_surcharge_coeff: float = Field(default=1.0, ge=1.0, description="冷链加费系数")
+    high_value_threshold: Optional[float] = Field(default=None, ge=0, description="高价值加费阈值")
+    high_value_surcharge_coeff: float = Field(default=1.0, ge=1.0, description="高价值加费系数")
+
+    deductible_amount: float = Field(default=0.0, ge=0, description="免赔额 CNY")
+    deductible_rate_pct: float = Field(default=0.0, ge=0, description="免赔率百分比, 如5表示损失金额的5%免赔")
+    excluded_items: List[str] = Field(default_factory=list, description="不保事项列表")
+
+
+class InsuranceProductCreate(InsuranceProductBase):
+    pass
+
+
+class InsuranceProductUpdate(BaseModel):
+    product_name: Optional[str] = None
+    description: Optional[str] = None
+    is_active: Optional[bool] = None
+    applicable_cargo_types: Optional[List[CargoTypeEnum]] = None
+    min_temperature_class: Optional[TemperatureClassEnum] = None
+    max_temperature_class: Optional[TemperatureClassEnum] = None
+    min_hazard_class: Optional[int] = None
+    max_hazard_class: Optional[int] = None
+    max_unit_value: Optional[float] = None
+    base_rate_pct: Optional[float] = None
+    hazard_surcharge_coeff: Optional[float] = None
+    cold_chain_surcharge_coeff: Optional[float] = None
+    high_value_threshold: Optional[float] = None
+    high_value_surcharge_coeff: Optional[float] = None
+    deductible_amount: Optional[float] = None
+    deductible_rate_pct: Optional[float] = None
+    excluded_items: Optional[List[str]] = None
+
+
+class InsuranceProduct(InsuranceProductBase):
+    id: int
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class MatchedInsuranceProduct(BaseModel):
+    product_id: int
+    product_code: str
+    product_name: str
+    estimated_premium: float = Field(description="预估保费")
+    base_rate_pct: float
+    final_rate_pct: float
+    breakdown: Dict[str, Any] = Field(description="保费计算明细")
+    deductible_summary: Dict[str, Any] = Field(description="免赔条款摘要")
+
+
+class InsuranceProductMatch(BaseModel):
+    product_id: int
+    product_code: str
+    product_name: str
+    estimated_premium: float = Field(description="预估保费")
+    base_rate_pct: float
+    final_rate_pct: float
+    breakdown: Dict[str, Any] = Field(description="保费计算明细")
+    deductible_summary: Dict[str, Any] = Field(description="免赔条款摘要")
+
+
+class InsuranceMatchRequest(BaseModel):
+    plan_identifier: str = Field(description="配载方案ID或方案编号")
+
+
+class InsuranceSingleCargoMatchRequest(BaseModel):
+    cargo_type: CargoTypeEnum = Field(description="货物类型")
+    declared_value: float = Field(gt=0, description="申报价值 CNY")
+    hazard_class: Optional[int] = Field(default=None, ge=1, le=6, description="危险品等级 1-6")
+    temperature_class: Optional[TemperatureClassEnum] = Field(default=TemperatureClassEnum.AMBIENT, description="温控等级")
+
+
+class InsurancePremiumCalculateRequest(BaseModel):
+    product_id: int = Field(description="保险产品ID")
+    declared_value: float = Field(gt=0, description="申报价值 CNY")
+    hazard_class: Optional[int] = Field(default=None, ge=1, le=6, description="危险品等级 1-6")
+    temperature_class: Optional[TemperatureClassEnum] = Field(default=TemperatureClassEnum.AMBIENT, description="温控等级")
+
+
+class InsurancePremiumCalculation(BaseModel):
+    base_rate_pct: float
+    hazard_coeff: float
+    cold_chain_coeff: float
+    high_value_coeff: float
+    final_rate_pct: float
+    premium: float
+    breakdown: Dict[str, Any]
+    deductible_summary: Dict[str, Any]
+
+
+class InsurancePolicyGenerateRequest(BaseModel):
+    policyholder_name: str = Field(description="投保人名称")
+    policyholder_contact: Optional[str] = Field(default=None, description="投保人联系方式")
+    voyage_no: Optional[str] = Field(default=None, description="承运航次")
+    insurance_period_days: int = Field(default=30, ge=1, description="保险期限 天数")
+    created_by: Optional[str] = Field(default=None, description="创建人")
+    remarks: Optional[str] = Field(default=None, description="备注")
+    auto_select_cheapest: bool = Field(default=True, description="是否自动选择最便宜的保险产品")
+
+
+class InsurancePolicyStatusTransition(BaseModel):
+    new_status: InsurancePolicyStatusEnum = Field(description="目标状态")
+    remark: Optional[str] = Field(default=None, description="状态变更备注")
+
+
+class InsuranceSurrenderResponse(BaseModel):
+    policy_id: int
+    policy_no: str
+    surrender_no: str
+    surrender_reason: str
+    total_premium: float
+    used_days: int
+    total_days: int
+    refund_ratio: float
+    refund_amount: float
+    new_status: str
+    surrendered_at: str
+
+
+class InsuranceProductStatistic(BaseModel):
+    product_id: int
+    product_code: str
+    product_name: str
+    total_policies: int = Field(description="出单量")
+    total_premium: float = Field(description="总保费 CNY")
+    total_insured_amount: float = Field(description="总保额 CNY")
+
+
+class InsuranceMatchResultItem(BaseModel):
+    packed_cargo_id: int
+    cargo_id: int
+    cargo_name: str
+    cargo_type: str
+    hazard_class: Optional[int]
+    temperature_class: Optional[str]
+    declared_value: float
+    matched_products: List[MatchedInsuranceProduct] = Field(description="按保费从低到高排序的匹配产品(最多3个)")
+
+
+class InsuranceMatchResponse(BaseModel):
+    plan_id: int
+    plan_no: str
+    match_id: str
+    total_cargos: int
+    match_results: List[InsuranceMatchResultItem]
+
+
+class InsurancePolicyItemBase(BaseModel):
+    packed_cargo_id: int
+    product_id: int = Field(description="选中的保险产品ID")
+
+
+class InsurancePolicyItemCreate(InsurancePolicyItemBase):
+    pass
+
+
+class InsurancePolicyItem(InsurancePolicyItemBase):
+    id: int
+    policy_id: int
+    cargo_id: int
+    cargo_name: str
+    cargo_type: str
+    hazard_class: Optional[int]
+    temperature_class: Optional[str]
+    declared_value: float
+    base_rate_pct: float
+    hazard_coeff: float
+    cold_chain_coeff: float
+    high_value_coeff: float
+    final_rate_pct: float
+    premium: float
+    deductible_summary: Dict[str, Any] = {}
+    alternative_products: List[Dict[str, Any]] = []
+    created_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class InsurancePolicyBase(BaseModel):
+    plan_identifier: str = Field(description="配载方案ID或方案编号")
+    policyholder_name: str = Field(description="投保人名称")
+    policyholder_contact: Optional[str] = Field(default=None, description="投保人联系方式")
+    voyage_no: Optional[str] = Field(default=None, description="承运航次")
+    insurance_period_days: int = Field(default=30, ge=1, description="保险期限 天数")
+    created_by: Optional[str] = Field(default=None, description="创建人")
+    remarks: Optional[str] = Field(default=None, description="备注")
+
+
+class InsurancePolicyCreate(InsurancePolicyBase):
+    policy_items: List[InsurancePolicyItemCreate] = Field(description="逐件货物的保险产品选择")
+
+
+class InsurancePolicyUpdate(BaseModel):
+    policyholder_name: Optional[str] = None
+    policyholder_contact: Optional[str] = None
+    voyage_no: Optional[str] = None
+    insurance_period_days: Optional[int] = None
+    remarks: Optional[str] = None
+    policy_items: Optional[List[InsurancePolicyItemCreate]] = None
+
+
+class InsurancePolicy(InsurancePolicyBase):
+    id: int
+    policy_no: str
+    plan_id: int
+    plan_no: str
+    plan_version: int
+    container_no: Optional[str] = None
+    shipment_no: Optional[str] = None
+    total_insured_amount: float
+    total_premium: float
+    currency: str
+    effective_date: Optional[str] = None
+    expiry_date: Optional[str] = None
+    status: str
+    status_changed_at: Optional[str] = None
+    submitted_at: Optional[str] = None
+    accepted_at: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class InsurancePolicyDetail(InsurancePolicy):
+    policy_items: List[InsurancePolicyItem] = []
+    surrender_record: Optional[Dict[str, Any]] = None
+
+
+class InsurancePolicyStatusTransitionRequest(BaseModel):
+    target_status: InsurancePolicyStatusEnum = Field(description="目标状态")
+    handled_by: Optional[str] = Field(default=None, description="处理人")
+    remarks: Optional[str] = Field(default=None, description="备注")
+
+
+class InsuranceSurrenderRequest(BaseModel):
+    surrender_reason: str = Field(description="退保原因")
+    handled_by: Optional[str] = Field(default=None, description="处理人")
+    remarks: Optional[str] = Field(default=None, description="备注")
+
+
+class InsuranceSurrenderRecord(BaseModel):
+    id: int
+    policy_id: int
+    surrender_no: str
+    surrender_reason: str
+    total_premium: float
+    used_days: int
+    total_days: int
+    refund_ratio: float
+    refund_amount: float
+    surrendered_at: Optional[str] = None
+    handled_by: Optional[str] = None
+    remarks: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class InsuranceProductStats(BaseModel):
+    product_id: int
+    product_code: str
+    product_name: str
+    total_policies: int = Field(description="出单量")
+    total_premium: float = Field(description="总保费 CNY")
+    total_insured_amount: float = Field(description="总保额 CNY")
+
+
+class InsurancePolicyQuery(BaseModel):
+    plan_identifier: Optional[str] = Field(default=None, description="按配载方案ID或编号查询")
+    status: Optional[InsurancePolicyStatusEnum] = Field(default=None, description="状态筛选")
+    product_id: Optional[int] = Field(default=None, description="按保险产品ID筛选")
+    skip: int = 0
+    limit: int = 100
+
+
+class InsuranceGenerateRequest(BaseModel):
+    match_id: str = Field(description="匹配结果ID, 用于关联匹配结果")
+    policyholder_name: str = Field(description="投保人名称")
+    policyholder_contact: Optional[str] = Field(default=None, description="投保人联系方式")
+    voyage_no: Optional[str] = Field(default=None, description="承运航次")
+    insurance_period_days: int = Field(default=30, ge=1, description="保险期限 天数")
+    created_by: Optional[str] = Field(default=None, description="创建人")
+    remarks: Optional[str] = Field(default=None, description="备注")
+    use_top_match: bool = Field(default=True, description="是否使用每个货物的第一个(最便宜)匹配产品")
+    custom_selections: Optional[Dict[int, int]] = Field(default=None, description="自定义选择 {packed_cargo_id: product_id}, 如指定则覆盖use_top_match")
 
