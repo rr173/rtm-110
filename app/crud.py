@@ -5067,4 +5067,603 @@ def create_demo_damage_claim(db: Session):
         pass
 
 
+# ==================== 理赔趋势分析 CRUD ====================
+
+def get_claim_trend_analysis(
+    db: Session,
+    time_granularity: str = "month",
+    carrier: Optional[str] = None,
+    container_type: Optional[str] = None,
+    damage_type: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> Dict[str, Any]:
+    from sqlalchemy import func as sa_func
+
+    q = db.query(models.ClaimRecord)
+
+    if carrier:
+        q = q.filter(models.ClaimRecord.shipment_no == carrier)
+
+    if start_date:
+        try:
+            dt_start = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+            q = q.filter(models.ClaimRecord.claim_date >= dt_start)
+        except Exception:
+            pass
+
+    if end_date:
+        try:
+            dt_end = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+            q = q.filter(models.ClaimRecord.claim_date <= dt_end)
+        except Exception:
+            pass
+
+    all_claims = q.all()
+
+    filtered_claim_ids = set()
+    for claim in all_claims:
+        claim_items = db.query(models.ClaimItem).filter(
+            models.ClaimItem.claim_id == claim.id
+        ).all()
+
+        type_match = True
+        if damage_type:
+            type_match = any(ci.damage_type == damage_type for ci in claim_items)
+
+        container_match = True
+        if container_type:
+            plan = get_packing_plan(db, plan_id=claim.plan_id)
+            if plan:
+                container_match = (plan.container_name == container_type)
+            else:
+                container_match = False
+
+        if type_match and container_match:
+            filtered_claim_ids.add(claim.id)
+
+    final_claims = [c for c in all_claims if c.id in filtered_claim_ids]
+
+    period_groups: Dict[str, List[models.ClaimRecord]] = {}
+    for claim in final_claims:
+        if claim.claim_date is None:
+            continue
+        if time_granularity == "quarter":
+            q_num = (claim.claim_date.month - 1) // 3 + 1
+            period_key = f"{claim.claim_date.year}Q{q_num}"
+        else:
+            period_key = claim.claim_date.strftime("%Y-%m")
+        if period_key not in period_groups:
+            period_groups[period_key] = []
+        period_groups[period_key].append(claim)
+
+    periods_data = []
+    total_count = 0
+    total_amount = 0.0
+
+    for period_key in sorted(period_groups.keys()):
+        period_claims = period_groups[period_key]
+        period_count = len(period_claims)
+        period_amount = sum(c.total_claim_amount or 0.0 for c in period_claims)
+        total_count += period_count
+        total_amount += period_amount
+
+        damage_type_stats: Dict[str, Dict[str, Any]] = {}
+        responsibility_stats: Dict[str, float] = {
+            "carrier": 0.0,
+            "packer": 0.0,
+            "shipper": 0.0,
+            "force_majeure": 0.0,
+        }
+
+        for claim in period_claims:
+            responsibility_stats["carrier"] += claim.carrier_responsibility_amount or 0.0
+            responsibility_stats["packer"] += claim.packer_responsibility_amount or 0.0
+            responsibility_stats["shipper"] += claim.shipper_responsibility_amount or 0.0
+            responsibility_stats["force_majeure"] += claim.force_majeure_amount or 0.0
+
+            claim_items = db.query(models.ClaimItem).filter(
+                models.ClaimItem.claim_id == claim.id
+            ).all()
+            for ci in claim_items:
+                dt = ci.damage_type or "unknown"
+                if dt not in damage_type_stats:
+                    damage_type_stats[dt] = {"count": 0, "amount": 0.0}
+                damage_type_stats[dt]["count"] += 1
+                damage_type_stats[dt]["amount"] += ci.claim_amount or 0.0
+
+        damage_distribution = []
+        for dt, stats in damage_type_stats.items():
+            ratio = (stats["amount"] / period_amount) if period_amount > 0 else 0.0
+            damage_distribution.append({
+                "damage_type": dt,
+                "count": stats["count"],
+                "amount": round(stats["amount"], 2),
+                "ratio": round(ratio, 4),
+            })
+        damage_distribution.sort(key=lambda x: x["amount"], reverse=True)
+
+        responsibility_distribution = []
+        for resp, amt in responsibility_stats.items():
+            ratio = (amt / period_amount) if period_amount > 0 else 0.0
+            responsibility_distribution.append({
+                "responsibility": resp,
+                "amount": round(amt, 2),
+                "ratio": round(ratio, 4),
+            })
+        responsibility_distribution.sort(key=lambda x: x["amount"], reverse=True)
+
+        periods_data.append({
+            "period": period_key,
+            "claim_count": period_count,
+            "total_amount": round(period_amount, 2),
+            "damage_type_distribution": damage_distribution,
+            "responsibility_distribution": responsibility_distribution,
+        })
+
+    return {
+        "time_granularity": time_granularity,
+        "total_claim_count": total_count,
+        "total_claim_amount": round(total_amount, 2),
+        "periods": periods_data,
+        "applied_filters": {
+            "carrier": carrier,
+            "container_type": container_type,
+            "damage_type": damage_type,
+            "start_date": start_date,
+            "end_date": end_date,
+        },
+    }
+
+
+# ==================== 预警规则 CRUD ====================
+
+def generate_alert_rule_no() -> str:
+    return f"RULE-{uuid.uuid4().hex[:8].upper()}"
+
+
+def generate_alert_event_no() -> str:
+    return f"ALERT-{uuid.uuid4().hex[:8].upper()}"
+
+
+def get_alert_rule(db: Session, rule_id: int = None, rule_no: str = None):
+    if rule_id:
+        return db.query(models.ClaimAlertRule).filter(
+            models.ClaimAlertRule.id == rule_id
+        ).first()
+    if rule_no:
+        return db.query(models.ClaimAlertRule).filter(
+            models.ClaimAlertRule.rule_no == rule_no
+        ).first()
+    return None
+
+
+def list_alert_rules(db: Session, skip: int = 0, limit: int = 100, only_active: bool = False):
+    q = db.query(models.ClaimAlertRule)
+    if only_active:
+        q = q.filter(models.ClaimAlertRule.is_active == True)
+    return q.order_by(models.ClaimAlertRule.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def create_alert_rule(db: Session, rule_data: Dict[str, Any]):
+    rule_no = rule_data.get("rule_no") or generate_alert_rule_no()
+    db_rule = models.ClaimAlertRule(
+        rule_no=rule_no,
+        rule_name=rule_data.get("rule_name"),
+        rule_type=rule_data.get("rule_type"),
+        description=rule_data.get("description"),
+        is_active=rule_data.get("is_active", True),
+        scope=rule_data.get("scope"),
+        scope_value=rule_data.get("scope_value"),
+        threshold_value=rule_data.get("threshold_value"),
+        consecutive_months=rule_data.get("consecutive_months", 1),
+        time_granularity=rule_data.get("time_granularity", "month"),
+        suggested_action=rule_data.get("suggested_action"),
+        created_by=rule_data.get("created_by"),
+    )
+    db.add(db_rule)
+    db.commit()
+    db.refresh(db_rule)
+    return db_rule
+
+
+def update_alert_rule(db: Session, rule_id: int, update_data: Dict[str, Any]):
+    rule = get_alert_rule(db, rule_id=rule_id)
+    if not rule:
+        return None
+    for key, value in update_data.items():
+        if value is not None and hasattr(rule, key):
+            setattr(rule, key, value)
+    db.commit()
+    db.refresh(rule)
+    return rule
+
+
+def delete_alert_rule(db: Session, rule_id: int):
+    rule = get_alert_rule(db, rule_id=rule_id)
+    if not rule:
+        return None
+    db.delete(rule)
+    db.commit()
+    return rule
+
+
+# ==================== 预警事件 CRUD ====================
+
+def get_alert_event(db: Session, event_id: int = None, event_no: str = None):
+    if event_id:
+        return db.query(models.ClaimAlertEvent).filter(
+            models.ClaimAlertEvent.id == event_id
+        ).first()
+    if event_no:
+        return db.query(models.ClaimAlertEvent).filter(
+            models.ClaimAlertEvent.event_no == event_no
+        ).first()
+    return None
+
+
+def list_alert_events(
+    db: Session,
+    status: Optional[str] = None,
+    only_pending: bool = False,
+    rule_id: Optional[int] = None,
+    skip: int = 0,
+    limit: int = 100,
+):
+    q = db.query(models.ClaimAlertEvent)
+    if only_pending:
+        q = q.filter(models.ClaimAlertEvent.status.in_(["pending", "processing"]))
+    elif status:
+        q = q.filter(models.ClaimAlertEvent.status == status)
+    if rule_id:
+        q = q.filter(models.ClaimAlertEvent.rule_id == rule_id)
+    return q.order_by(models.ClaimAlertEvent.trigger_time.desc()).offset(skip).limit(limit).all()
+
+
+def create_alert_event(db: Session, event_data: Dict[str, Any]):
+    event_no = event_data.get("event_no") or generate_alert_event_no()
+    db_event = models.ClaimAlertEvent(
+        event_no=event_no,
+        rule_id=event_data.get("rule_id"),
+        rule_no=event_data.get("rule_no"),
+        rule_name=event_data.get("rule_name"),
+        trigger_condition=event_data.get("trigger_condition"),
+        trigger_period=event_data.get("trigger_period"),
+        scope=event_data.get("scope"),
+        scope_value=event_data.get("scope_value"),
+        actual_value=event_data.get("actual_value", 0.0),
+        threshold_value=event_data.get("threshold_value", 0.0),
+        related_claim_ids=event_data.get("related_claim_ids", []),
+        suggested_action=event_data.get("suggested_action"),
+        status=event_data.get("status", "pending"),
+    )
+    db.add(db_event)
+    db.commit()
+    db.refresh(db_event)
+    return db_event
+
+
+def close_alert_event(db: Session, event_id: int, handling_notes: str, handler: Optional[str] = None):
+    event = get_alert_event(db, event_id=event_id)
+    if not event:
+        return None
+    event.status = "closed"
+    event.handler = handler
+    event.handled_at = datetime.now()
+    event.handling_notes = handling_notes
+    db.commit()
+    db.refresh(event)
+    return event
+
+
+def handle_alert_event(db: Session, event_id: int, handler: Optional[str] = None, handling_notes: Optional[str] = None):
+    event = get_alert_event(db, event_id=event_id)
+    if not event:
+        return None
+    event.status = "handled"
+    event.handler = handler
+    event.handled_at = datetime.now()
+    if handling_notes:
+        event.handling_notes = handling_notes
+    db.commit()
+    db.refresh(event)
+    return event
+
+
+# ==================== 预警规则引擎 ====================
+
+def _check_event_exists(db: Session, rule_id: int, trigger_period: str, scope_value: Optional[str]) -> bool:
+    q = db.query(models.ClaimAlertEvent).filter(
+        models.ClaimAlertEvent.rule_id == rule_id,
+        models.ClaimAlertEvent.trigger_period == trigger_period,
+    )
+    if scope_value:
+        q = q.filter(models.ClaimAlertEvent.scope_value == scope_value)
+    return q.first() is not None
+
+
+def _get_monthly_claims_for_scope(
+    db: Session,
+    scope: Optional[str],
+    scope_value: Optional[str],
+) -> Dict[str, List[models.ClaimRecord]]:
+    q = db.query(models.ClaimRecord)
+    all_claims = q.all()
+
+    result: Dict[str, List[models.ClaimRecord]] = {}
+
+    for claim in all_claims:
+        if claim.claim_date is None:
+            continue
+        period_key = claim.claim_date.strftime("%Y-%m")
+
+        match = True
+        if scope == "carrier" and scope_value:
+            if claim.shipment_no != scope_value:
+                match = False
+        elif scope == "container_type" and scope_value:
+            plan = get_packing_plan(db, plan_id=claim.plan_id)
+            if not plan or plan.container_name != scope_value:
+                match = False
+
+        if match:
+            if period_key not in result:
+                result[period_key] = []
+            result[period_key].append(claim)
+
+    return result
+
+
+def _get_monthly_damage_type_ratio(
+    db: Session,
+    damage_type: Optional[str],
+) -> Dict[str, Dict[str, Any]]:
+    all_claims = db.query(models.ClaimRecord).all()
+
+    result: Dict[str, Dict[str, Any]] = {}
+
+    for claim in all_claims:
+        if claim.claim_date is None:
+            continue
+        period_key = claim.claim_date.strftime("%Y-%m")
+
+        claim_items = db.query(models.ClaimItem).filter(
+            models.ClaimItem.claim_id == claim.id
+        ).all()
+
+        if period_key not in result:
+            result[period_key] = {"total_amount": 0.0, "type_amount": 0.0, "claim_ids": []}
+
+        period_total = sum(ci.claim_amount or 0.0 for ci in claim_items)
+        result[period_key]["total_amount"] += period_total
+        result[period_key]["claim_ids"].append(claim.id)
+
+        if damage_type:
+            type_amount = sum(
+                (ci.claim_amount or 0.0) for ci in claim_items
+                if ci.damage_type == damage_type
+            )
+            result[period_key]["type_amount"] += type_amount
+
+    return result
+
+
+def run_alert_engine(db: Session) -> Dict[str, Any]:
+    active_rules = list_alert_rules(db, only_active=True)
+    triggered_events = []
+
+    for rule in active_rules:
+        try:
+            events = _evaluate_alert_rule(db, rule)
+            triggered_events.extend(events)
+        except Exception:
+            continue
+
+    return {
+        "triggered_count": len(triggered_events),
+        "triggered_events": triggered_events,
+    }
+
+
+def _evaluate_alert_rule(db: Session, rule: models.ClaimAlertRule) -> List[models.ClaimAlertEvent]:
+    events = []
+
+    if rule.rule_type == "amount_threshold":
+        events = _evaluate_amount_threshold(db, rule)
+    elif rule.rule_type == "consecutive_amount":
+        events = _evaluate_consecutive_amount(db, rule)
+    elif rule.rule_type == "ratio_threshold":
+        events = _evaluate_ratio_threshold(db, rule)
+
+    return events
+
+
+def _evaluate_amount_threshold(db: Session, rule: models.ClaimAlertRule) -> List[models.ClaimAlertEvent]:
+    events = []
+    monthly_data = _get_monthly_claims_for_scope(db, rule.scope, rule.scope_value)
+
+    for period_key, claims in sorted(monthly_data.items()):
+        total_amount = sum(c.total_claim_amount or 0.0 for c in claims)
+        if total_amount >= rule.threshold_value:
+            if _check_event_exists(db, rule.id, period_key, rule.scope_value):
+                continue
+
+            claim_ids = [c.id for c in claims]
+            event_data = {
+                "rule_id": rule.id,
+                "rule_no": rule.rule_no,
+                "rule_name": rule.rule_name,
+                "trigger_condition": f"{rule.scope_value or '全局'}单月理赔金额 {total_amount:.2f} 超过阈值 {rule.threshold_value:.2f}",
+                "trigger_period": period_key,
+                "scope": rule.scope,
+                "scope_value": rule.scope_value,
+                "actual_value": round(total_amount, 2),
+                "threshold_value": rule.threshold_value,
+                "related_claim_ids": claim_ids,
+                "suggested_action": rule.suggested_action or "请核查该时间段内的理赔情况，分析原因并采取相应措施",
+            }
+            event = create_alert_event(db, event_data)
+            events.append(event)
+
+    return events
+
+
+def _evaluate_consecutive_amount(db: Session, rule: models.ClaimAlertRule) -> List[models.ClaimAlertEvent]:
+    events = []
+    monthly_data = _get_monthly_claims_for_scope(db, rule.scope, rule.scope_value)
+
+    if not monthly_data:
+        return events
+
+    sorted_periods = sorted(monthly_data.keys())
+    consecutive_count = rule.consecutive_months or 3
+
+    for i in range(len(sorted_periods) - consecutive_count + 1):
+        window_periods = sorted_periods[i:i + consecutive_count]
+
+        all_over_threshold = True
+        total_window_amount = 0.0
+        all_claim_ids = []
+
+        try:
+            first_year, first_month = map(int, window_periods[0].split("-"))
+            last_year, last_month = map(int, window_periods[-1].split("-"))
+            months_diff = (last_year - first_year) * 12 + (last_month - first_month)
+            if months_diff != consecutive_count - 1:
+                continue
+        except Exception:
+            continue
+
+        for period_key in window_periods:
+            claims = monthly_data[period_key]
+            period_amount = sum(c.total_claim_amount or 0.0 for c in claims)
+            total_window_amount += period_amount
+            all_claim_ids.extend([c.id for c in claims])
+            if period_amount < rule.threshold_value:
+                all_over_threshold = False
+                break
+
+        if all_over_threshold:
+            trigger_period = window_periods[-1]
+            if _check_event_exists(db, rule.id, trigger_period, rule.scope_value):
+                continue
+
+            avg_amount = total_window_amount / consecutive_count
+            event_data = {
+                "rule_id": rule.id,
+                "rule_no": rule.rule_no,
+                "rule_name": rule.rule_name,
+                "trigger_condition": f"{rule.scope_value or '全局'}连续{consecutive_count}个月({window_periods[0]}至{trigger_period})每月理赔金额均超过阈值 {rule.threshold_value:.2f}，平均金额 {avg_amount:.2f}",
+                "trigger_period": trigger_period,
+                "scope": rule.scope,
+                "scope_value": rule.scope_value,
+                "actual_value": round(avg_amount, 2),
+                "threshold_value": rule.threshold_value,
+                "related_claim_ids": all_claim_ids,
+                "suggested_action": rule.suggested_action or "连续多月超阈值，请深入分析根本原因，考虑更换承运商或优化装箱方案",
+            }
+            event = create_alert_event(db, event_data)
+            events.append(event)
+
+    return events
+
+
+def _evaluate_ratio_threshold(db: Session, rule: models.ClaimAlertRule) -> List[models.ClaimAlertEvent]:
+    events = []
+    target_type = rule.scope_value if rule.scope == "damage_type" else None
+    monthly_data = _get_monthly_damage_type_ratio(db, target_type)
+
+    for period_key, data in sorted(monthly_data.items()):
+        total_amount = data.get("total_amount", 0.0)
+        type_amount = data.get("type_amount", 0.0)
+        if total_amount <= 0:
+            continue
+
+        ratio = (type_amount / total_amount) * 100
+
+        if ratio >= rule.threshold_value:
+            if _check_event_exists(db, rule.id, period_key, target_type):
+                continue
+
+            event_data = {
+                "rule_id": rule.id,
+                "rule_no": rule.rule_no,
+                "rule_name": rule.rule_name,
+                "trigger_condition": f"损坏类型[{target_type or '未指定'}]单月占比 {ratio:.2f}% 超过阈值 {rule.threshold_value:.2f}%",
+                "trigger_period": period_key,
+                "scope": rule.scope,
+                "scope_value": target_type,
+                "actual_value": round(ratio, 2),
+                "threshold_value": rule.threshold_value,
+                "related_claim_ids": data.get("claim_ids", []),
+                "suggested_action": rule.suggested_action or f"该损坏类型占比过高，请重点排查{target_type}类问题的成因",
+            }
+            event = create_alert_event(db, event_data)
+            events.append(event)
+
+    return events
+
+
+# ==================== 预置预警规则和演示数据 ====================
+
+def create_default_alert_rules_and_demo_event(db: Session):
+    existing_rules = db.query(models.ClaimAlertRule).first()
+    if not existing_rules:
+        rule1 = create_alert_rule(db, {
+            "rule_no": "RULE-AMOUNT-001",
+            "rule_name": "承运商单月理赔金额阈值预警",
+            "rule_type": "amount_threshold",
+            "description": "当同一承运商单月理赔金额超过指定阈值时触发预警",
+            "is_active": True,
+            "scope": "carrier",
+            "scope_value": None,
+            "threshold_value": 50000.0,
+            "consecutive_months": 1,
+            "time_granularity": "month",
+            "suggested_action": "请核查该承运商该月的所有理赔记录，分析是否存在暴力装卸、运输不当等问题，必要时约谈承运商或启动考核流程",
+            "created_by": "system",
+        })
+
+        rule2 = create_alert_rule(db, {
+            "rule_no": "RULE-RATIO-001",
+            "rule_name": "单类型损坏占比预警",
+            "rule_type": "ratio_threshold",
+            "description": "当某种损坏类型单月理赔金额占比超过阈值时触发预警",
+            "is_active": True,
+            "scope": "damage_type",
+            "scope_value": "crush",
+            "threshold_value": 40.0,
+            "consecutive_months": 1,
+            "time_granularity": "month",
+            "suggested_action": "挤压损坏占比过高，请检查配载方案的堆码层数、货物承压能力和顶面负载计算是否合理，必要时调整装箱策略或增加衬垫",
+            "created_by": "system",
+        })
+
+    existing_events = db.query(models.ClaimAlertEvent).first()
+    if not existing_events:
+        demo_rule = db.query(models.ClaimAlertRule).filter(
+            models.ClaimAlertRule.rule_no == "RULE-RATIO-001"
+        ).first()
+
+        if demo_rule:
+            demo_claims = db.query(models.ClaimRecord).all()
+            demo_claim_ids = [c.id for c in demo_claims] if demo_claims else []
+
+            create_alert_event(db, {
+                "event_no": "ALERT-DEMO-001",
+                "rule_id": demo_rule.id,
+                "rule_no": demo_rule.rule_no,
+                "rule_name": demo_rule.rule_name,
+                "trigger_condition": "演示预警: 损坏类型[crush]单月占比 45.50% 超过阈值 40.00%",
+                "trigger_period": "2026-05",
+                "scope": "damage_type",
+                "scope_value": "crush",
+                "actual_value": 45.50,
+                "threshold_value": 40.00,
+                "related_claim_ids": demo_claim_ids,
+                "suggested_action": "这是一条演示预警事件。挤压损坏占比过高，请检查配载方案的堆码层数、货物承压能力和顶面负载计算是否合理",
+                "status": "pending",
+            })
+
+
 

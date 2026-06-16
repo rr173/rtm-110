@@ -56,6 +56,7 @@ def startup_event():
     crud.create_demo_unloading_routes(db)
     crud.create_default_rate_schemes(db)
     crud.create_demo_damage_claim(db)
+    crud.create_default_alert_rules_and_demo_event(db)
 
 
 @app.get("/")
@@ -4400,6 +4401,446 @@ def delete_damage_inspection_api(
         "message": "删除成功",
         "inspection_id": inspection.id,
         "inspection_no": inspection.inspection_no,
+    }
+
+
+# ==================== 理赔趋势分析 API ====================
+
+@app.post("/damage/claims/trend", response_model=schemas.TrendAnalysisResult)
+def get_claim_trend_analysis_api(
+    request: schemas.TrendAnalysisRequest,
+    db: Session = Depends(get_db)
+):
+    result = crud.get_claim_trend_analysis(
+        db,
+        time_granularity=request.time_granularity,
+        carrier=request.carrier,
+        container_type=request.container_type,
+        damage_type=request.damage_type,
+        start_date=request.start_date,
+        end_date=request.end_date,
+    )
+    return result
+
+
+# ==================== 预警规则管理 API ====================
+
+def _resolve_alert_rule(rule_identifier: str, db: Session):
+    rule = None
+    if rule_identifier.isdigit():
+        rule = crud.get_alert_rule(db, rule_id=int(rule_identifier))
+    if rule is None:
+        rule = crud.get_alert_rule(db, rule_no=rule_identifier)
+    return rule
+
+
+@app.get("/damage/alerts/rules", response_model=List[schemas.AlertRule])
+def list_alert_rules_api(
+    only_active: bool = False,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    rules = crud.list_alert_rules(db, skip=skip, limit=limit, only_active=only_active)
+    result = []
+    for r in rules:
+        result.append({
+            "id": r.id,
+            "rule_no": r.rule_no,
+            "rule_name": r.rule_name,
+            "rule_type": r.rule_type,
+            "description": r.description,
+            "is_active": r.is_active,
+            "scope": r.scope,
+            "scope_value": r.scope_value,
+            "threshold_value": r.threshold_value,
+            "consecutive_months": r.consecutive_months,
+            "time_granularity": r.time_granularity,
+            "suggested_action": r.suggested_action,
+            "created_by": r.created_by,
+            "created_at": r.created_at.isoformat() if r.created_at else "",
+            "updated_at": r.updated_at.isoformat() if r.updated_at else "",
+        })
+    return result
+
+
+@app.post("/damage/alerts/rules", response_model=schemas.AlertRule)
+def create_alert_rule_api(
+    request: schemas.AlertRuleCreate,
+    db: Session = Depends(get_db)
+):
+    rule = crud.create_alert_rule(db, request.model_dump())
+    return {
+        "id": rule.id,
+        "rule_no": rule.rule_no,
+        "rule_name": rule.rule_name,
+        "rule_type": rule.rule_type,
+        "description": rule.description,
+        "is_active": rule.is_active,
+        "scope": rule.scope,
+        "scope_value": rule.scope_value,
+        "threshold_value": rule.threshold_value,
+        "consecutive_months": rule.consecutive_months,
+        "time_granularity": rule.time_granularity,
+        "suggested_action": rule.suggested_action,
+        "created_by": rule.created_by,
+        "created_at": rule.created_at.isoformat() if rule.created_at else "",
+        "updated_at": rule.updated_at.isoformat() if rule.updated_at else "",
+    }
+
+
+@app.get("/damage/alerts/rules/{rule_identifier}", response_model=schemas.AlertRule)
+def get_alert_rule_api(
+    rule_identifier: str,
+    db: Session = Depends(get_db)
+):
+    rule = _resolve_alert_rule(rule_identifier, db)
+    if not rule:
+        raise HTTPException(status_code=404, detail="预警规则不存在")
+    return {
+        "id": rule.id,
+        "rule_no": rule.rule_no,
+        "rule_name": rule.rule_name,
+        "rule_type": rule.rule_type,
+        "description": rule.description,
+        "is_active": rule.is_active,
+        "scope": rule.scope,
+        "scope_value": rule.scope_value,
+        "threshold_value": rule.threshold_value,
+        "consecutive_months": rule.consecutive_months,
+        "time_granularity": rule.time_granularity,
+        "suggested_action": rule.suggested_action,
+        "created_by": rule.created_by,
+        "created_at": rule.created_at.isoformat() if rule.created_at else "",
+        "updated_at": rule.updated_at.isoformat() if rule.updated_at else "",
+    }
+
+
+@app.put("/damage/alerts/rules/{rule_identifier}", response_model=schemas.AlertRule)
+def update_alert_rule_api(
+    rule_identifier: str,
+    request: schemas.AlertRuleUpdate,
+    db: Session = Depends(get_db)
+):
+    rule = _resolve_alert_rule(rule_identifier, db)
+    if not rule:
+        raise HTTPException(status_code=404, detail="预警规则不存在")
+    updated = crud.update_alert_rule(db, rule.id, request.model_dump(exclude_unset=True))
+    return {
+        "id": updated.id,
+        "rule_no": updated.rule_no,
+        "rule_name": updated.rule_name,
+        "rule_type": updated.rule_type,
+        "description": updated.description,
+        "is_active": updated.is_active,
+        "scope": updated.scope,
+        "scope_value": updated.scope_value,
+        "threshold_value": updated.threshold_value,
+        "consecutive_months": updated.consecutive_months,
+        "time_granularity": updated.time_granularity,
+        "suggested_action": updated.suggested_action,
+        "created_by": updated.created_by,
+        "created_at": updated.created_at.isoformat() if updated.created_at else "",
+        "updated_at": updated.updated_at.isoformat() if updated.updated_at else "",
+    }
+
+
+@app.delete("/damage/alerts/rules/{rule_identifier}")
+def delete_alert_rule_api(
+    rule_identifier: str,
+    db: Session = Depends(get_db)
+):
+    rule = _resolve_alert_rule(rule_identifier, db)
+    if not rule:
+        raise HTTPException(status_code=404, detail="预警规则不存在")
+    crud.delete_alert_rule(db, rule.id)
+    return {
+        "message": "删除成功",
+        "rule_id": rule.id,
+        "rule_no": rule.rule_no,
+    }
+
+
+# ==================== 预警引擎运行 API ====================
+
+@app.post("/damage/alerts/engine/run", response_model=schemas.AlertEngineRunResult)
+def run_alert_engine_api(db: Session = Depends(get_db)):
+    result = crud.run_alert_engine(db)
+    events_data = []
+    for e in result["triggered_events"]:
+        events_data.append({
+            "id": e.id,
+            "event_no": e.event_no,
+            "rule_id": e.rule_id,
+            "rule_no": e.rule_no,
+            "rule_name": e.rule_name,
+            "trigger_time": e.trigger_time.isoformat() if e.trigger_time else "",
+            "trigger_condition": e.trigger_condition,
+            "trigger_period": e.trigger_period,
+            "scope": e.scope,
+            "scope_value": e.scope_value,
+            "actual_value": e.actual_value,
+            "threshold_value": e.threshold_value,
+            "related_claim_ids": e.related_claim_ids or [],
+            "suggested_action": e.suggested_action,
+            "status": e.status,
+            "handler": e.handler,
+            "handled_at": e.handled_at.isoformat() if e.handled_at else None,
+            "handling_notes": e.handling_notes,
+            "created_at": e.created_at.isoformat() if e.created_at else "",
+            "updated_at": e.updated_at.isoformat() if e.updated_at else "",
+        })
+    return {
+        "triggered_count": result["triggered_count"],
+        "triggered_events": events_data,
+    }
+
+
+# ==================== 预警事件管理 API ====================
+
+def _resolve_alert_event(event_identifier: str, db: Session):
+    event = None
+    if event_identifier.isdigit():
+        event = crud.get_alert_event(db, event_id=int(event_identifier))
+    if event is None:
+        event = crud.get_alert_event(db, event_no=event_identifier)
+    return event
+
+
+@app.get("/damage/alerts/events", response_model=List[schemas.AlertEvent])
+def list_alert_events_api(
+    status: Optional[str] = None,
+    only_pending: bool = False,
+    rule_id: Optional[int] = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    events = crud.list_alert_events(
+        db,
+        status=status,
+        only_pending=only_pending,
+        rule_id=rule_id,
+        skip=skip,
+        limit=limit,
+    )
+    result = []
+    for e in events:
+        result.append({
+            "id": e.id,
+            "event_no": e.event_no,
+            "rule_id": e.rule_id,
+            "rule_no": e.rule_no,
+            "rule_name": e.rule_name,
+            "trigger_time": e.trigger_time.isoformat() if e.trigger_time else "",
+            "trigger_condition": e.trigger_condition,
+            "trigger_period": e.trigger_period,
+            "scope": e.scope,
+            "scope_value": e.scope_value,
+            "actual_value": e.actual_value,
+            "threshold_value": e.threshold_value,
+            "related_claim_ids": e.related_claim_ids or [],
+            "suggested_action": e.suggested_action,
+            "status": e.status,
+            "handler": e.handler,
+            "handled_at": e.handled_at.isoformat() if e.handled_at else None,
+            "handling_notes": e.handling_notes,
+            "created_at": e.created_at.isoformat() if e.created_at else "",
+            "updated_at": e.updated_at.isoformat() if e.updated_at else "",
+        })
+    return result
+
+
+@app.get("/damage/alerts/events/{event_identifier}", response_model=schemas.AlertEventDetail)
+def get_alert_event_detail_api(
+    event_identifier: str,
+    db: Session = Depends(get_db)
+):
+    event = _resolve_alert_event(event_identifier, db)
+    if not event:
+        raise HTTPException(status_code=404, detail="预警事件不存在")
+
+    related_claims = []
+    if event.related_claim_ids:
+        for cid in event.related_claim_ids:
+            claim = crud.get_claim_record(db, claim_id=cid)
+            if claim:
+                related_claims.append({
+                    "id": claim.id,
+                    "claim_no": claim.claim_no,
+                    "plan_no": claim.plan_no,
+                    "container_no": claim.container_no,
+                    "shipment_no": claim.shipment_no,
+                    "total_claim_amount": claim.total_claim_amount,
+                    "status": claim.status,
+                    "claim_date": claim.claim_date.isoformat() if claim.claim_date else None,
+                })
+
+    return {
+        "id": event.id,
+        "event_no": event.event_no,
+        "rule_id": event.rule_id,
+        "rule_no": event.rule_no,
+        "rule_name": event.rule_name,
+        "trigger_time": event.trigger_time.isoformat() if event.trigger_time else "",
+        "trigger_condition": event.trigger_condition,
+        "trigger_period": event.trigger_period,
+        "scope": event.scope,
+        "scope_value": event.scope_value,
+        "actual_value": event.actual_value,
+        "threshold_value": event.threshold_value,
+        "related_claim_ids": event.related_claim_ids or [],
+        "suggested_action": event.suggested_action,
+        "status": event.status,
+        "handler": event.handler,
+        "handled_at": event.handled_at.isoformat() if event.handled_at else None,
+        "handling_notes": event.handling_notes,
+        "created_at": event.created_at.isoformat() if event.created_at else "",
+        "updated_at": event.updated_at.isoformat() if event.updated_at else "",
+        "related_claims": related_claims,
+    }
+
+
+@app.post("/damage/alerts/events/{event_identifier}/close", response_model=schemas.AlertEvent)
+def close_alert_event_api(
+    event_identifier: str,
+    request: schemas.AlertEventCloseRequest,
+    db: Session = Depends(get_db)
+):
+    if not request.handling_notes or not request.handling_notes.strip():
+        raise HTTPException(status_code=400, detail="关闭预警事件必须填写处理说明")
+    event = _resolve_alert_event(event_identifier, db)
+    if not event:
+        raise HTTPException(status_code=404, detail="预警事件不存在")
+    closed = crud.close_alert_event(db, event.id, request.handling_notes.strip(), request.handler)
+    return {
+        "id": closed.id,
+        "event_no": closed.event_no,
+        "rule_id": closed.rule_id,
+        "rule_no": closed.rule_no,
+        "rule_name": closed.rule_name,
+        "trigger_time": closed.trigger_time.isoformat() if closed.trigger_time else "",
+        "trigger_condition": closed.trigger_condition,
+        "trigger_period": closed.trigger_period,
+        "scope": closed.scope,
+        "scope_value": closed.scope_value,
+        "actual_value": closed.actual_value,
+        "threshold_value": closed.threshold_value,
+        "related_claim_ids": closed.related_claim_ids or [],
+        "suggested_action": closed.suggested_action,
+        "status": closed.status,
+        "handler": closed.handler,
+        "handled_at": closed.handled_at.isoformat() if closed.handled_at else None,
+        "handling_notes": closed.handling_notes,
+        "created_at": closed.created_at.isoformat() if closed.created_at else "",
+        "updated_at": closed.updated_at.isoformat() if closed.updated_at else "",
+    }
+
+
+@app.post("/damage/alerts/events/{event_identifier}/handle", response_model=schemas.AlertEvent)
+def handle_alert_event_api(
+    event_identifier: str,
+    request: schemas.AlertEventHandleRequest,
+    db: Session = Depends(get_db)
+):
+    event = _resolve_alert_event(event_identifier, db)
+    if not event:
+        raise HTTPException(status_code=404, detail="预警事件不存在")
+    handled = crud.handle_alert_event(db, event.id, request.handler, request.handling_notes)
+    return {
+        "id": handled.id,
+        "event_no": handled.event_no,
+        "rule_id": handled.rule_id,
+        "rule_no": handled.rule_no,
+        "rule_name": handled.rule_name,
+        "trigger_time": handled.trigger_time.isoformat() if handled.trigger_time else "",
+        "trigger_condition": handled.trigger_condition,
+        "trigger_period": handled.trigger_period,
+        "scope": handled.scope,
+        "scope_value": handled.scope_value,
+        "actual_value": handled.actual_value,
+        "threshold_value": handled.threshold_value,
+        "related_claim_ids": handled.related_claim_ids or [],
+        "suggested_action": handled.suggested_action,
+        "status": handled.status,
+        "handler": handled.handler,
+        "handled_at": handled.handled_at.isoformat() if handled.handled_at else None,
+        "handling_notes": handled.handling_notes,
+        "created_at": handled.created_at.isoformat() if handled.created_at else "",
+        "updated_at": handled.updated_at.isoformat() if handled.updated_at else "",
+    }
+
+
+@app.get("/damage/alerts/events/pending")
+def get_pending_alert_events_api(
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    events = crud.list_alert_events(db, only_pending=True, skip=skip, limit=limit)
+    result = []
+    for e in events:
+        result.append({
+            "id": e.id,
+            "event_no": e.event_no,
+            "rule_id": e.rule_id,
+            "rule_no": e.rule_no,
+            "rule_name": e.rule_name,
+            "trigger_time": e.trigger_time.isoformat() if e.trigger_time else "",
+            "trigger_condition": e.trigger_condition,
+            "trigger_period": e.trigger_period,
+            "scope": e.scope,
+            "scope_value": e.scope_value,
+            "actual_value": e.actual_value,
+            "threshold_value": e.threshold_value,
+            "related_claim_count": len(e.related_claim_ids or []),
+            "suggested_action": e.suggested_action,
+            "status": e.status,
+            "handler": e.handler,
+            "created_at": e.created_at.isoformat() if e.created_at else "",
+        })
+    return {
+        "total": len(result),
+        "events": result,
+    }
+
+
+@app.get("/damage/alerts/events/history")
+def get_history_alert_events_api(
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    events = crud.list_alert_events(
+        db,
+        only_pending=False,
+        skip=skip,
+        limit=limit,
+    )
+    result = []
+    for e in events:
+        result.append({
+            "id": e.id,
+            "event_no": e.event_no,
+            "rule_id": e.rule_id,
+            "rule_no": e.rule_no,
+            "rule_name": e.rule_name,
+            "trigger_time": e.trigger_time.isoformat() if e.trigger_time else "",
+            "trigger_condition": e.trigger_condition,
+            "trigger_period": e.trigger_period,
+            "scope": e.scope,
+            "scope_value": e.scope_value,
+            "actual_value": e.actual_value,
+            "threshold_value": e.threshold_value,
+            "status": e.status,
+            "handler": e.handler,
+            "handled_at": e.handled_at.isoformat() if e.handled_at else None,
+            "handling_notes": e.handling_notes,
+            "created_at": e.created_at.isoformat() if e.created_at else "",
+        })
+    return {
+        "total": len(result),
+        "events": result,
     }
 
 

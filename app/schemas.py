@@ -2003,3 +2003,165 @@ class ClaimQuery(BaseModel):
     skip: int = 0
     limit: int = 100
 
+
+# ==================== 理赔趋势分析 Schemas ====================
+
+class TrendAnalysisRequest(BaseModel):
+    time_granularity: str = Field(default="month", description="时间粒度: month月/quarter季度")
+    carrier: Optional[str] = Field(default=None, description="按承运商筛选")
+    container_type: Optional[str] = Field(default=None, description="按箱型筛选(container_name)")
+    damage_type: Optional[str] = Field(default=None, description="按损坏类型筛选")
+    start_date: Optional[str] = Field(default=None, description="开始日期 ISO格式")
+    end_date: Optional[str] = Field(default=None, description="结束日期 ISO格式")
+
+
+class DamageTypeRatio(BaseModel):
+    damage_type: str
+    count: int
+    amount: float
+    ratio: float
+
+
+class ResponsibilityRatio(BaseModel):
+    responsibility: str
+    amount: float
+    ratio: float
+
+
+class TrendPeriodData(BaseModel):
+    period: str
+    claim_count: int
+    total_amount: float
+    damage_type_distribution: List[DamageTypeRatio] = []
+    responsibility_distribution: List[ResponsibilityRatio] = []
+
+
+class TrendAnalysisResult(BaseModel):
+    time_granularity: str
+    total_claim_count: int
+    total_claim_amount: float
+    periods: List[TrendPeriodData] = []
+    applied_filters: Dict[str, Any] = {}
+
+
+# ==================== 预警规则 Schemas ====================
+
+class AlertRuleTypeEnum(str, Enum):
+    AMOUNT_THRESHOLD = "amount_threshold"
+    RATIO_THRESHOLD = "ratio_threshold"
+    CONSECUTIVE_AMOUNT = "consecutive_amount"
+
+
+class AlertRuleScopeEnum(str, Enum):
+    CARRIER = "carrier"
+    DAMAGE_TYPE = "damage_type"
+    CONTAINER_TYPE = "container_type"
+    ALL = "all"
+
+
+class AlertRuleBase(BaseModel):
+    rule_name: str = Field(description="规则名称")
+    rule_type: AlertRuleTypeEnum = Field(description="规则类型")
+    description: Optional[str] = Field(default=None, description="规则描述")
+    is_active: bool = Field(default=True, description="是否启用")
+    scope: Optional[AlertRuleScopeEnum] = Field(default=AlertRuleScopeEnum.ALL, description="适用范围")
+    scope_value: Optional[str] = Field(default=None, description="适用范围具体值")
+    threshold_value: float = Field(gt=0, description="阈值")
+    consecutive_months: int = Field(default=1, ge=1, description="连续月份数")
+    time_granularity: str = Field(default="month", description="时间粒度: month/quarter")
+    suggested_action: Optional[str] = Field(default=None, description="建议措施")
+    created_by: Optional[str] = Field(default=None, description="创建人")
+
+
+class AlertRuleCreate(AlertRuleBase):
+    pass
+
+
+class AlertRuleUpdate(BaseModel):
+    rule_name: Optional[str] = None
+    rule_type: Optional[AlertRuleTypeEnum] = None
+    description: Optional[str] = None
+    is_active: Optional[bool] = None
+    scope: Optional[AlertRuleScopeEnum] = None
+    scope_value: Optional[str] = None
+    threshold_value: Optional[float] = None
+    consecutive_months: Optional[int] = None
+    time_granularity: Optional[str] = None
+    suggested_action: Optional[str] = None
+
+
+class AlertRule(AlertRuleBase):
+    id: int
+    rule_no: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ==================== 预警事件 Schemas ====================
+
+class AlertEventStatusEnum(str, Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    CLOSED = "closed"
+    HANDLED = "handled"
+
+
+class AlertEventCloseRequest(BaseModel):
+    handling_notes: str = Field(description="处理说明(必填)")
+    handler: Optional[str] = Field(default=None, description="处理人")
+
+
+class AlertEventHandleRequest(BaseModel):
+    handler: Optional[str] = Field(default=None, description="处理人")
+    handling_notes: Optional[str] = Field(default=None, description="处理说明")
+
+
+class AlertEventBase(BaseModel):
+    pass
+
+
+class AlertEvent(AlertEventBase):
+    id: int
+    event_no: str
+    rule_id: int
+    rule_no: str
+    rule_name: str
+    trigger_time: Optional[str] = None
+    trigger_condition: str
+    trigger_period: str
+    scope: Optional[str] = None
+    scope_value: Optional[str] = None
+    actual_value: float
+    threshold_value: float
+    related_claim_ids: List[int] = []
+    suggested_action: Optional[str] = None
+    status: str
+    handler: Optional[str] = None
+    handled_at: Optional[str] = None
+    handling_notes: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class AlertEventDetail(AlertEvent):
+    related_claims: List[Dict[str, Any]] = []
+
+
+class AlertEventQuery(BaseModel):
+    status: Optional[str] = Field(default=None, description="按状态筛选")
+    only_pending: Optional[bool] = Field(default=False, description="仅查询未处理")
+    rule_id: Optional[int] = Field(default=None, description="按规则ID筛选")
+    skip: int = 0
+    limit: int = 100
+
+
+class AlertEngineRunResult(BaseModel):
+    triggered_count: int
+    triggered_events: List[AlertEvent] = []
+

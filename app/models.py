@@ -993,3 +993,50 @@ class ClaimItem(Base):
 
     claim = relationship("ClaimRecord", back_populates="claim_items")
     inspection_item = relationship("InspectionCargoItem")
+
+
+class ClaimAlertRule(Base):
+    __tablename__ = "claim_alert_rules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    rule_no = Column(String, unique=True, index=True, comment="规则编号")
+    rule_name = Column(String, comment="规则名称")
+    rule_type = Column(String, comment="规则类型: amount_threshold金额阈值/ratio_threshold占比阈值/consecutive_amount连续金额")
+    description = Column(Text, nullable=True, comment="规则描述")
+    is_active = Column(Boolean, default=True, comment="是否启用")
+    scope = Column(String, nullable=True, comment="适用范围: carrier承运商/damage_type损坏类型/container_type箱型/all全部")
+    scope_value = Column(String, nullable=True, comment="适用范围具体值，如承运商名称、损坏类型编码")
+    threshold_value = Column(Float, comment="阈值，如金额数值或占比百分比(0-100)")
+    consecutive_months = Column(Integer, default=1, comment="连续月份数，用于连续类规则")
+    time_granularity = Column(String, default="month", comment="时间粒度: month月/quarter季度")
+    suggested_action = Column(Text, nullable=True, comment="建议措施")
+    created_by = Column(String, nullable=True, comment="创建人")
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class ClaimAlertEvent(Base):
+    __tablename__ = "claim_alert_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_no = Column(String, unique=True, index=True, comment="预警事件编号")
+    rule_id = Column(Integer, ForeignKey("claim_alert_rules.id"), comment="触发的规则ID")
+    rule_no = Column(String, comment="触发的规则编号")
+    rule_name = Column(String, comment="触发的规则名称")
+    trigger_time = Column(DateTime, server_default=func.now(), comment="触发时间")
+    trigger_condition = Column(Text, comment="触发条件说明")
+    trigger_period = Column(String, comment="触发的时间段，如2026-06或2026Q2")
+    scope = Column(String, nullable=True, comment="适用范围")
+    scope_value = Column(String, nullable=True, comment="适用范围具体值")
+    actual_value = Column(Float, comment="实际触发值，如实际金额或实际占比")
+    threshold_value = Column(Float, comment="阈值")
+    related_claim_ids = Column(JSON, default=list, comment="关联的理赔记录ID列表")
+    suggested_action = Column(Text, nullable=True, comment="建议措施")
+    status = Column(String, default="pending", comment="状态: pending待处理/processing处理中/closed已关闭/handled已处理")
+    handler = Column(String, nullable=True, comment="处理人")
+    handled_at = Column(DateTime, nullable=True, comment="处理时间")
+    handling_notes = Column(Text, nullable=True, comment="处理说明")
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    rule = relationship("ClaimAlertRule")
