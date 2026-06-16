@@ -1780,3 +1780,226 @@ class RateCompareResult(BaseModel):
     per_cargo_diffs: List[PerCargoCostDiff]
     recommendation: str
 
+
+# ==================== 货损理赔与责任判定 Schemas ====================
+
+class DamageStatusEnum(str, Enum):
+    INTACT = "intact"
+    MINOR_DAMAGE = "minor_damage"
+    SEVERE_DAMAGE = "severe_damage"
+    LOST = "lost"
+
+
+class DamageTypeEnum(str, Enum):
+    CRUSH = "crush"
+    WET = "wet"
+    TILT = "tilt"
+    TEMPERATURE = "temperature"
+    CHEMICAL = "chemical"
+
+
+class ConfidenceLevelEnum(str, Enum):
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+class ResponsibilityEnum(str, Enum):
+    CARRIER = "carrier"
+    PACKER = "packer"
+    SHIPPER = "shipper"
+    FORCE_MAJEURE = "force_majeure"
+
+
+class InspectionCargoItemBase(BaseModel):
+    packed_cargo_id: int = Field(description="关联已装货物ID")
+    damage_status: DamageStatusEnum = Field(description="损坏状态")
+    damage_type: Optional[DamageTypeEnum] = Field(default=None, description="损坏类型")
+    declared_value: float = Field(default=0.0, ge=0, description="申报价值")
+    damage_description: Optional[str] = Field(default=None, description="损坏描述")
+
+
+class InspectionCargoItemCreate(InspectionCargoItemBase):
+    pass
+
+
+class InspectionCargoItemUpdate(BaseModel):
+    damage_status: Optional[DamageStatusEnum] = None
+    damage_type: Optional[DamageTypeEnum] = None
+    declared_value: Optional[float] = None
+    damage_description: Optional[str] = None
+
+
+class InspectionCargoItem(InspectionCargoItemBase):
+    id: int
+    inspection_id: int
+    cargo_id: int
+    cargo_name: str
+    item_no: int
+    position_x: float = 0.0
+    position_y: float = 0.0
+    position_z: float = 0.0
+    length: float = 0.0
+    width: float = 0.0
+    height: float = 0.0
+    weight: float = 0.0
+    max_top_load: float = 0.0
+    temperature_class: Optional[str] = None
+    hazard_class: Optional[int] = None
+    stack_layer: int = 1
+    is_door_side: bool = False
+    is_bottom_layer: bool = False
+    top_pressure_weight: float = 0.0
+
+    class Config:
+        from_attributes = True
+
+
+class CargoDamageInspectionBase(BaseModel):
+    plan_identifier: str = Field(description="配载方案ID或方案编号")
+    inspector: Optional[str] = Field(default=None, description="检验员")
+    inspection_date: Optional[str] = Field(default=None, description="检验日期 ISO格式")
+    remarks: Optional[str] = Field(default=None, description="检验备注")
+
+
+class CargoDamageInspectionCreate(CargoDamageInspectionBase):
+    inspection_items: List[InspectionCargoItemCreate] = Field(description="检验货物明细列表")
+
+
+class CargoDamageInspectionSubmit(BaseModel):
+    pass
+
+
+class DamageInferenceBase(BaseModel):
+    inferred_cause: str
+    confidence_level: str
+    responsibility: str
+    explanation: Optional[str] = None
+    evidence_list: List[str] = []
+    inference_detail: Dict[str, Any] = {}
+
+
+class DamageInference(DamageInferenceBase):
+    id: int
+    inspection_id: int
+    inspection_item_id: int
+    cargo_id: int
+    cargo_name: str
+    created_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ClaimItemBase(BaseModel):
+    damage_status: str
+    damage_type: Optional[str] = None
+    declared_value: float
+    claim_ratio: float
+    claim_amount: float
+    primary_responsibility: str
+
+
+class ClaimItem(ClaimItemBase):
+    id: int
+    claim_id: int
+    inspection_item_id: int
+    cargo_id: int
+    cargo_name: str
+    created_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ClaimRecordBase(BaseModel):
+    total_declared_value: float = 0.0
+    total_claim_amount: float = 0.0
+    minor_damage_amount: float = 0.0
+    severe_damage_amount: float = 0.0
+    lost_amount: float = 0.0
+    carrier_responsibility_amount: float = 0.0
+    packer_responsibility_amount: float = 0.0
+    shipper_responsibility_amount: float = 0.0
+    force_majeure_amount: float = 0.0
+
+
+class ClaimRecord(ClaimRecordBase):
+    id: int
+    claim_no: str
+    inspection_id: int
+    plan_id: int
+    plan_no: str
+    container_no: Optional[str] = None
+    shipment_no: Optional[str] = None
+    status: str
+    handler: Optional[str] = None
+    remarks: Optional[str] = None
+    claim_date: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ClaimRecordDetail(ClaimRecord):
+    claim_items: List[ClaimItem] = []
+
+
+class CargoDamageInspection(CargoDamageInspectionBase):
+    id: int
+    inspection_no: str
+    plan_id: int
+    plan_no: str
+    plan_version: int
+    container_no: Optional[str] = None
+    shipment_no: Optional[str] = None
+    total_cargos: int = 0
+    intact_count: int = 0
+    minor_damage_count: int = 0
+    severe_damage_count: int = 0
+    lost_count: int = 0
+    status: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class CargoDamageInspectionDetail(CargoDamageInspection):
+    inspection_items: List[InspectionCargoItem] = []
+    damage_inferences: List[DamageInference] = []
+    claim_record: Optional[ClaimRecordDetail] = None
+
+
+class DamageAnalysisResult(BaseModel):
+    inspection_id: int
+    inspection_no: str
+    inferences: List[DamageInferenceBase]
+    claim_summary: Dict[str, Any]
+
+
+class ClaimStatisticsByResponsibility(BaseModel):
+    carrier_amount: float = 0.0
+    packer_amount: float = 0.0
+    shipper_amount: float = 0.0
+    force_majeure_amount: float = 0.0
+    total_amount: float = 0.0
+    claim_count: int = 0
+
+
+class DamageInspectionQuery(BaseModel):
+    plan_identifier: Optional[str] = Field(default=None, description="按配载方案ID或编号查询")
+    status: Optional[str] = Field(default=None, description="状态筛选")
+    skip: int = 0
+    limit: int = 100
+
+
+class ClaimQuery(BaseModel):
+    plan_identifier: Optional[str] = Field(default=None, description="按配载方案ID或编号查询")
+    status: Optional[str] = Field(default=None, description="状态筛选")
+    skip: int = 0
+    limit: int = 100
+

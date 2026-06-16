@@ -4540,3 +4540,528 @@ def create_default_rate_schemes(db: Session):
         create_rate_scheme(db, scheme_info, container_rates)
 
 
+# ==================== 货损理赔 CRUD Functions ====================
+
+def generate_inspection_no() -> str:
+    return f"INSP-{uuid.uuid4().hex[:8].upper()}"
+
+
+def generate_claim_no() -> str:
+    return f"CLAIM-{uuid.uuid4().hex[:8].upper()}"
+
+
+def resolve_packing_plan(db: Session, plan_identifier: str):
+    plan = None
+    if plan_identifier.isdigit():
+        plan = get_packing_plan(db, plan_id=int(plan_identifier))
+    if plan is None:
+        plan = get_packing_plan(db, plan_no=plan_identifier)
+    return plan
+
+
+def get_damage_inspection(db: Session, inspection_id: int = None, inspection_no: str = None):
+    if inspection_id:
+        return db.query(models.CargoDamageInspection).filter(
+            models.CargoDamageInspection.id == inspection_id
+        ).first()
+    if inspection_no:
+        return db.query(models.CargoDamageInspection).filter(
+            models.CargoDamageInspection.inspection_no == inspection_no
+        ).first()
+    return None
+
+
+def list_damage_inspections(
+    db: Session,
+    plan_identifier: str = None,
+    status: str = None,
+    skip: int = 0,
+    limit: int = 100
+):
+    q = db.query(models.CargoDamageInspection)
+    if plan_identifier:
+        plan = resolve_packing_plan(db, plan_identifier)
+        if plan:
+            q = q.filter(models.CargoDamageInspection.plan_id == plan.id)
+    if status:
+        q = q.filter(models.CargoDamageInspection.status == status)
+    return q.order_by(models.CargoDamageInspection.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def get_inspection_items(db: Session, inspection_id: int) -> list:
+    return db.query(models.InspectionCargoItem).filter(
+        models.InspectionCargoItem.inspection_id == inspection_id
+    ).order_by(models.InspectionCargoItem.item_no).all()
+
+
+def get_damage_inferences(db: Session, inspection_id: int) -> list:
+    return db.query(models.DamageInference).filter(
+        models.DamageInference.inspection_id == inspection_id
+    ).all()
+
+
+def get_claim_record(db: Session, claim_id: int = None, claim_no: str = None):
+    if claim_id:
+        return db.query(models.ClaimRecord).filter(
+            models.ClaimRecord.id == claim_id
+        ).first()
+    if claim_no:
+        return db.query(models.ClaimRecord).filter(
+            models.ClaimRecord.claim_no == claim_no
+        ).first()
+    return None
+
+
+def list_claim_records(
+    db: Session,
+    plan_identifier: str = None,
+    status: str = None,
+    skip: int = 0,
+    limit: int = 100
+):
+    q = db.query(models.ClaimRecord)
+    if plan_identifier:
+        plan = resolve_packing_plan(db, plan_identifier)
+        if plan:
+            q = q.filter(models.ClaimRecord.plan_id == plan.id)
+    if status:
+        q = q.filter(models.ClaimRecord.status == status)
+    return q.order_by(models.ClaimRecord.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def get_claim_items(db: Session, claim_id: int) -> list:
+    return db.query(models.ClaimItem).filter(
+        models.ClaimItem.claim_id == claim_id
+    ).all()
+
+
+def get_claim_statistics_by_responsibility(
+    db: Session,
+    plan_identifier: str = None
+) -> dict:
+    q = db.query(models.ClaimRecord)
+    if plan_identifier:
+        plan = resolve_packing_plan(db, plan_identifier)
+        if plan:
+            q = q.filter(models.ClaimRecord.plan_id == plan.id)
+    
+    claims = q.all()
+    
+    stats = {
+        "carrier_amount": 0.0,
+        "packer_amount": 0.0,
+        "shipper_amount": 0.0,
+        "force_majeure_amount": 0.0,
+        "total_amount": 0.0,
+        "claim_count": len(claims),
+    }
+    
+    for claim in claims:
+        stats["carrier_amount"] += claim.carrier_responsibility_amount or 0
+        stats["packer_amount"] += claim.packer_responsibility_amount or 0
+        stats["shipper_amount"] += claim.shipper_responsibility_amount or 0
+        stats["force_majeure_amount"] += claim.force_majeure_amount or 0
+        stats["total_amount"] += claim.total_claim_amount or 0
+    
+    for key in stats:
+        if key.endswith("_amount") or key == "total_amount":
+            stats[key] = round(stats[key], 2)
+    
+    return stats
+
+
+def create_damage_inspection(
+    db: Session,
+    inspection_data: dict,
+    inspection_items_data: list
+) -> models.CargoDamageInspection:
+    from datetime import datetime as _dt
+    
+    plan_identifier = inspection_data.get("plan_identifier")
+    plan = resolve_packing_plan(db, plan_identifier)
+    if not plan:
+        raise ValueError("配载方案不存在")
+    
+    container = get_container(db, container_id=plan.container_id)
+    if not container:
+        raise ValueError("关联集装箱信息不存在")
+    
+    packed_cargos = get_packed_cargos(db, plan_id=plan.id)
+    packed_cargo_map = {pc.id: pc for pc in packed_cargos}
+    
+    inspection_no = inspection_data.get("inspection_no") or generate_inspection_no()
+    
+    inspection_date = None
+    if inspection_data.get("inspection_date"):
+        date_str = inspection_data["inspection_date"]
+        if isinstance(date_str, str):
+            for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d"):
+                try:
+                    inspection_date = _dt.strptime(date_str, fmt)
+                    break
+                except ValueError:
+                    continue
+    
+    db_inspection = models.CargoDamageInspection(
+        inspection_no=inspection_no,
+        plan_id=plan.id,
+        plan_no=plan.plan_no,
+        plan_version=plan.version or 1,
+        container_no=plan.container_no,
+        shipment_no=plan.shipment_no,
+        inspection_date=inspection_date,
+        inspector=inspection_data.get("inspector"),
+        total_cargos=len(packed_cargos),
+        intact_count=0,
+        minor_damage_count=0,
+        severe_damage_count=0,
+        lost_count=0,
+        remarks=inspection_data.get("remarks"),
+        status=inspection_data.get("status", "draft"),
+    )
+    db.add(db_inspection)
+    db.flush()
+    
+    intact_count = 0
+    minor_count = 0
+    severe_count = 0
+    lost_count = 0
+    
+    from app.damage_claim_engine import (
+        DAMAGE_STATUS_INTACT,
+        DAMAGE_STATUS_MINOR,
+        DAMAGE_STATUS_SEVERE,
+        DAMAGE_STATUS_LOST,
+        _calculate_top_pressure,
+        _calculate_stack_layer,
+        _is_door_side,
+        _is_bottom_layer,
+    )
+    
+    all_cargos_for_calc = []
+    for pc in packed_cargos:
+        all_cargos_for_calc.append({
+            "id": pc.id,
+            "x": pc.x,
+            "y": pc.y,
+            "z": pc.z,
+            "length": pc.length,
+            "width": pc.width,
+            "height": pc.height,
+            "weight": pc.weight,
+        })
+    
+    for idx, item_data in enumerate(inspection_items_data):
+        packed_cargo_id = item_data.get("packed_cargo_id")
+        pc = packed_cargo_map.get(packed_cargo_id)
+        
+        if not pc:
+            continue
+        
+        damage_status = item_data.get("damage_status", DAMAGE_STATUS_INTACT)
+        damage_type = item_data.get("damage_type")
+        
+        if damage_status == DAMAGE_STATUS_INTACT:
+            intact_count += 1
+        elif damage_status == DAMAGE_STATUS_MINOR:
+            minor_count += 1
+        elif damage_status == DAMAGE_STATUS_SEVERE:
+            severe_count += 1
+        elif damage_status == DAMAGE_STATUS_LOST:
+            lost_count += 1
+        
+        cargo_dict = {
+            "id": pc.id,
+            "x": pc.x,
+            "y": pc.y,
+            "z": pc.z,
+            "length": pc.length,
+            "width": pc.width,
+            "height": pc.height,
+            "weight": pc.weight,
+        }
+        
+        top_pressure = _calculate_top_pressure(cargo_dict, all_cargos_for_calc)
+        stack_layer = _calculate_stack_layer(cargo_dict, all_cargos_for_calc)
+        is_door_side = _is_door_side(cargo_dict, container.length)
+        is_bottom = _is_bottom_layer(cargo_dict)
+        
+        db_item = models.InspectionCargoItem(
+            inspection_id=db_inspection.id,
+            packed_cargo_id=pc.id,
+            cargo_id=pc.cargo_id,
+            cargo_name=pc.cargo_name,
+            item_no=idx + 1,
+            damage_status=damage_status,
+            damage_type=damage_type.value if hasattr(damage_type, 'value') else damage_type,
+            declared_value=item_data.get("declared_value", 0),
+            damage_description=item_data.get("damage_description"),
+            position_x=pc.x,
+            position_y=pc.y,
+            position_z=pc.z,
+            length=pc.length,
+            width=pc.width,
+            height=pc.height,
+            weight=pc.weight,
+            max_top_load=pc.max_top_load or 0,
+            temperature_class=pc.temperature_class,
+            hazard_class=getattr(pc, 'hazard_class', None),
+            stack_layer=stack_layer,
+            is_door_side=is_door_side,
+            is_bottom_layer=is_bottom,
+            top_pressure_weight=round(top_pressure, 2),
+        )
+        db.add(db_item)
+    
+    db_inspection.intact_count = intact_count
+    db_inspection.minor_damage_count = minor_count
+    db_inspection.severe_damage_count = severe_count
+    db_inspection.lost_count = lost_count
+    
+    db.commit()
+    db.refresh(db_inspection)
+    return db_inspection
+
+
+def run_damage_analysis(db: Session, inspection_id: int) -> dict:
+    from app.damage_claim_engine import analyze_damage_and_generate_claim
+    
+    inspection = get_damage_inspection(db, inspection_id=inspection_id)
+    if not inspection:
+        raise ValueError("检验记录不存在")
+    
+    plan = get_packing_plan(db, plan_id=inspection.plan_id)
+    if not plan:
+        raise ValueError("关联配载方案不存在")
+    
+    container = get_container(db, container_id=plan.container_id)
+    if not container:
+        raise ValueError("关联集装箱信息不存在")
+    
+    inspection_items = get_inspection_items(db, inspection_id)
+    packed_cargos = get_packed_cargos(db, plan_id=plan.id)
+    
+    hazard_matrix = db.query(models.HazardSegregationMatrix).filter(
+        models.HazardSegregationMatrix.is_active == True
+    ).all()
+    hazard_matrix_data = []
+    for hm in hazard_matrix:
+        hazard_matrix_data.append({
+            "class_a": hm.class_a,
+            "class_b": hm.class_b,
+            "min_distance_mm": hm.min_distance_mm,
+            "segregation_level": hm.segregation_level,
+        })
+    
+    plan_data = {
+        "cog_x": plan.cog_x,
+        "cog_y": plan.cog_y,
+        "cog_z": plan.cog_z,
+        "cog_offset_x_ratio": plan.cog_offset_x_ratio,
+        "cog_offset_y_ratio": plan.cog_offset_y_ratio,
+    }
+    
+    inspection_items_data = []
+    for item in inspection_items:
+        inspection_items_data.append({
+            "id": item.id,
+            "cargo_id": item.cargo_id,
+            "cargo_name": item.cargo_name,
+            "damage_status": item.damage_status,
+            "damage_type": item.damage_type,
+            "declared_value": item.declared_value,
+            "position_x": item.position_x,
+            "position_y": item.position_y,
+            "position_z": item.position_z,
+            "x": item.position_x,
+            "y": item.position_y,
+            "z": item.position_z,
+            "length": item.length,
+            "width": item.width,
+            "height": item.height,
+            "weight": item.weight,
+            "max_top_load": item.max_top_load,
+            "temperature_class": item.temperature_class,
+            "hazard_class": item.hazard_class,
+            "stack_layer": item.stack_layer,
+            "is_door_side": item.is_door_side,
+            "is_bottom_layer": item.is_bottom_layer,
+            "top_pressure_weight": item.top_pressure_weight,
+        })
+    
+    packed_cargos_data = []
+    for pc in packed_cargos:
+        packed_cargos_data.append({
+            "id": pc.id,
+            "packed_cargo_id": pc.id,
+            "cargo_id": pc.cargo_id,
+            "cargo_name": pc.cargo_name,
+            "x": pc.x,
+            "y": pc.y,
+            "z": pc.z,
+            "length": pc.length,
+            "width": pc.width,
+            "height": pc.height,
+            "weight": pc.weight,
+            "max_top_load": pc.max_top_load or 0,
+            "temperature_class": pc.temperature_class or "AMBIENT",
+            "hazard_class": getattr(pc, 'hazard_class', None),
+        })
+    
+    result = analyze_damage_and_generate_claim(
+        {"inspection_items": inspection_items_data},
+        plan_data,
+        packed_cargos_data,
+        container.length,
+        hazard_matrix_data
+    )
+    
+    db.query(models.DamageInference).filter(
+        models.DamageInference.inspection_id == inspection_id
+    ).delete()
+    
+    for inf in result["inferences"]:
+        db_inf = models.DamageInference(
+            inspection_id=inspection_id,
+            inspection_item_id=inf.get("inspection_item_id"),
+            cargo_id=inf.get("cargo_id"),
+            cargo_name=inf.get("cargo_name"),
+            inferred_cause=inf.get("inferred_cause"),
+            confidence_level=inf.get("confidence_level"),
+            responsibility=inf.get("responsibility"),
+            inference_detail=inf.get("inference_detail", {}),
+            evidence_list=inf.get("evidence_list", []),
+            explanation=inf.get("explanation"),
+        )
+        db.add(db_inf)
+    
+    claim_summary = result["claim_summary"]
+    
+    existing_claim = db.query(models.ClaimRecord).filter(
+        models.ClaimRecord.inspection_id == inspection_id
+    ).first()
+    
+    if existing_claim:
+        db.query(models.ClaimItem).filter(
+            models.ClaimItem.claim_id == existing_claim.id
+        ).delete()
+        db.delete(existing_claim)
+    
+    claim_no = generate_claim_no()
+    db_claim = models.ClaimRecord(
+        claim_no=claim_no,
+        inspection_id=inspection_id,
+        plan_id=inspection.plan_id,
+        plan_no=inspection.plan_no,
+        container_no=inspection.container_no,
+        shipment_no=inspection.shipment_no,
+        total_declared_value=claim_summary.get("total_declared_value", 0),
+        total_claim_amount=claim_summary.get("total_claim_amount", 0),
+        minor_damage_amount=claim_summary.get("minor_damage_amount", 0),
+        severe_damage_amount=claim_summary.get("severe_damage_amount", 0),
+        lost_amount=claim_summary.get("lost_amount", 0),
+        carrier_responsibility_amount=claim_summary.get("carrier_responsibility_amount", 0),
+        packer_responsibility_amount=claim_summary.get("packer_responsibility_amount", 0),
+        shipper_responsibility_amount=claim_summary.get("shipper_responsibility_amount", 0),
+        force_majeure_amount=claim_summary.get("force_majeure_amount", 0),
+        status="pending",
+        claim_date=inspection.inspection_date,
+    )
+    db.add(db_claim)
+    db.flush()
+    
+    for ci in claim_summary.get("claim_items", []):
+        db_ci = models.ClaimItem(
+            claim_id=db_claim.id,
+            inspection_item_id=ci.get("inspection_item_id"),
+            cargo_id=ci.get("cargo_id"),
+            cargo_name=ci.get("cargo_name"),
+            damage_status=ci.get("damage_status"),
+            damage_type=ci.get("damage_type"),
+            declared_value=ci.get("declared_value", 0),
+            claim_ratio=ci.get("claim_ratio", 0),
+            claim_amount=ci.get("claim_amount", 0),
+            primary_responsibility=ci.get("primary_responsibility"),
+        )
+        db.add(db_ci)
+    
+    inspection.status = "submitted"
+    
+    db.commit()
+    db.refresh(inspection)
+    db.refresh(db_claim)
+    
+    return {
+        "inspection_id": inspection.id,
+        "inspection_no": inspection.inspection_no,
+        "inferences": result["inferences"],
+        "claim_summary": claim_summary,
+        "claim_id": db_claim.id,
+        "claim_no": db_claim.claim_no,
+    }
+
+
+def create_demo_damage_claim(db: Session):
+    existing = db.query(models.CargoDamageInspection).first()
+    if existing:
+        return
+    
+    plans = db.query(models.PackingPlan).all()
+    if not plans:
+        create_demo_review_record(db)
+        plans = db.query(models.PackingPlan).all()
+    
+    if not plans:
+        return
+    
+    plan = plans[0]
+    packed_cargos = get_packed_cargos(db, plan_id=plan.id)
+    if not packed_cargos or len(packed_cargos) < 2:
+        return
+    
+    from app.damage_claim_engine import (
+        DAMAGE_STATUS_MINOR,
+        DAMAGE_STATUS_SEVERE,
+        DAMAGE_TYPE_CRUSH,
+        DAMAGE_TYPE_WET,
+    )
+    
+    bottom_cargos = sorted(packed_cargos, key=lambda c: c.z)
+    door_side_cargos = sorted(packed_cargos, key=lambda c: -(c.x + c.length))
+    
+    damaged_cargo_1 = bottom_cargos[0] if bottom_cargos else packed_cargos[0]
+    damaged_cargo_2 = door_side_cargos[0] if door_side_cargos and door_side_cargos[0].id != damaged_cargo_1.id else packed_cargos[1]
+    
+    inspection_items = [
+        {
+            "packed_cargo_id": damaged_cargo_1.id,
+            "damage_status": DAMAGE_STATUS_SEVERE,
+            "damage_type": DAMAGE_TYPE_CRUSH,
+            "declared_value": 5000.0,
+            "damage_description": "货物顶部明显凹陷，内部货物受损严重",
+        },
+        {
+            "packed_cargo_id": damaged_cargo_2.id,
+            "damage_status": DAMAGE_STATUS_MINOR,
+            "damage_type": DAMAGE_TYPE_WET,
+            "declared_value": 3000.0,
+            "damage_description": "外包装箱有水渍痕迹，内容物部分受潮",
+        },
+    ]
+    
+    inspection_data = {
+        "plan_identifier": str(plan.id),
+        "inspector": "demo_inspector",
+        "inspection_date": "2026-06-15T10:30:00",
+        "remarks": "演示货损理赔记录-到港检验发现2件货物受损",
+        "status": "draft",
+    }
+    
+    try:
+        inspection = create_damage_inspection(db, inspection_data, inspection_items)
+        run_damage_analysis(db, inspection.id)
+    except Exception:
+        pass
+
+
+

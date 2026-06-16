@@ -862,3 +862,134 @@ class CargoCostAllocation(Base):
     box_detail = relationship("BoxCostDetail")
     plan = relationship("PackingPlan")
     packed_cargo = relationship("PackedCargo")
+
+
+class CargoDamageInspection(Base):
+    __tablename__ = "cargo_damage_inspections"
+
+    id = Column(Integer, primary_key=True, index=True)
+    inspection_no = Column(String, unique=True, index=True, comment="检验记录编号")
+    plan_id = Column(Integer, ForeignKey("packing_plans.id"), comment="关联配载方案ID")
+    plan_no = Column(String, index=True, comment="关联方案编号")
+    plan_version = Column(Integer, comment="关联方案版本")
+    container_no = Column(String, nullable=True, comment="集装箱箱号")
+    shipment_no = Column(String, nullable=True, comment="运单号/提单号")
+    inspection_date = Column(DateTime, comment="检验日期")
+    inspector = Column(String, nullable=True, comment="检验员")
+    total_cargos = Column(Integer, default=0, comment="总件数")
+    intact_count = Column(Integer, default=0, comment="完好件数")
+    minor_damage_count = Column(Integer, default=0, comment="轻微损坏件数")
+    severe_damage_count = Column(Integer, default=0, comment="严重损坏件数")
+    lost_count = Column(Integer, default=0, comment="灭失件数")
+    remarks = Column(Text, nullable=True, comment="检验备注")
+    status = Column(String, default="draft", comment="状态: draft草稿/submitted已提交")
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    plan = relationship("PackingPlan")
+    inspection_items = relationship("InspectionCargoItem", back_populates="inspection", cascade="all, delete-orphan")
+    damage_inferences = relationship("DamageInference", back_populates="inspection", cascade="all, delete-orphan")
+    claim_record = relationship("ClaimRecord", back_populates="inspection", uselist=False, cascade="all, delete-orphan")
+
+
+class InspectionCargoItem(Base):
+    __tablename__ = "inspection_cargo_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    inspection_id = Column(Integer, ForeignKey("cargo_damage_inspections.id"))
+    packed_cargo_id = Column(Integer, ForeignKey("packed_cargos.id"), comment="关联已装货物ID")
+    cargo_id = Column(Integer, comment="货物ID")
+    cargo_name = Column(String, comment="货物名称")
+    item_no = Column(Integer, comment="件号/序号")
+    damage_status = Column(String, comment="损坏状态: intact完好/minor_damage轻微损坏/severe_damage严重损坏/lost灭失")
+    damage_type = Column(String, nullable=True, comment="损坏类型: crush挤压/wet浸湿/tilt倾倒/temperature温度失控/chemical化学污染")
+    declared_value = Column(Float, default=0.0, comment="申报价值")
+    damage_description = Column(Text, nullable=True, comment="损坏描述")
+    position_x = Column(Float, comment="位置X坐标 mm (方案快照)")
+    position_y = Column(Float, comment="位置Y坐标 mm (方案快照)")
+    position_z = Column(Float, comment="位置Z坐标 mm (方案快照)")
+    length = Column(Float, comment="长度 mm (方案快照)")
+    width = Column(Float, comment="宽度 mm (方案快照)")
+    height = Column(Float, comment="高度 mm (方案快照)")
+    weight = Column(Float, comment="重量 kg (方案快照)")
+    max_top_load = Column(Float, default=0.0, comment="顶面最大承压 kg (方案快照)")
+    temperature_class = Column(String, nullable=True, default="AMBIENT", comment="温控等级 (方案快照)")
+    hazard_class = Column(Integer, nullable=True, comment="危险品等级 (方案快照)")
+    stack_layer = Column(Integer, default=1, comment="堆叠层号")
+    is_door_side = Column(Boolean, default=False, comment="是否位于箱门侧")
+    is_bottom_layer = Column(Boolean, default=False, comment="是否位于底层")
+    top_pressure_weight = Column(Float, default=0.0, comment="上方累计承压 kg")
+
+    inspection = relationship("CargoDamageInspection", back_populates="inspection_items")
+    packed_cargo = relationship("PackedCargo")
+
+
+class DamageInference(Base):
+    __tablename__ = "damage_inferences"
+
+    id = Column(Integer, primary_key=True, index=True)
+    inspection_id = Column(Integer, ForeignKey("cargo_damage_inspections.id"))
+    inspection_item_id = Column(Integer, ForeignKey("inspection_cargo_items.id"))
+    cargo_id = Column(Integer, comment="货物ID")
+    cargo_name = Column(String, comment="货物名称")
+    inferred_cause = Column(String, comment="推断致损原因: crush挤压/wet浸湿/tilt倾倒/temperature温度失控/chemical化学污染")
+    confidence_level = Column(String, comment="置信度: high高/medium中/low低")
+    responsibility = Column(String, comment="责任归属: carrier承运方/packer装箱方/shipper货主/force_majeure不可抗力")
+    inference_detail = Column(JSON, default=dict, comment="推断详情")
+    evidence_list = Column(JSON, default=list, comment="证据列表")
+    explanation = Column(Text, comment="推断说明")
+    created_at = Column(DateTime, server_default=func.now())
+
+    inspection = relationship("CargoDamageInspection", back_populates="damage_inferences")
+    inspection_item = relationship("InspectionCargoItem")
+
+
+class ClaimRecord(Base):
+    __tablename__ = "claim_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    claim_no = Column(String, unique=True, index=True, comment="理赔编号")
+    inspection_id = Column(Integer, ForeignKey("cargo_damage_inspections.id"))
+    plan_id = Column(Integer, ForeignKey("packing_plans.id"))
+    plan_no = Column(String, index=True, comment="关联方案编号")
+    container_no = Column(String, nullable=True, comment="集装箱箱号")
+    shipment_no = Column(String, nullable=True, comment="运单号/提单号")
+    total_declared_value = Column(Float, default=0.0, comment="总申报价值")
+    total_claim_amount = Column(Float, default=0.0, comment="总理赔金额")
+    minor_damage_amount = Column(Float, default=0.0, comment="轻微损坏理赔金额")
+    severe_damage_amount = Column(Float, default=0.0, comment="严重损坏理赔金额")
+    lost_amount = Column(Float, default=0.0, comment="灭失理赔金额")
+    carrier_responsibility_amount = Column(Float, default=0.0, comment="承运方责任金额")
+    packer_responsibility_amount = Column(Float, default=0.0, comment="装箱方责任金额")
+    shipper_responsibility_amount = Column(Float, default=0.0, comment="货主责任金额")
+    force_majeure_amount = Column(Float, default=0.0, comment="不可抗力金额")
+    status = Column(String, default="pending", comment="状态: pending待处理/approved已赔付/rejected已驳回")
+    claim_date = Column(DateTime, comment="理赔日期")
+    handler = Column(String, nullable=True, comment="处理人")
+    remarks = Column(Text, nullable=True, comment="备注")
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    inspection = relationship("CargoDamageInspection", back_populates="claim_record")
+    plan = relationship("PackingPlan")
+    claim_items = relationship("ClaimItem", back_populates="claim", cascade="all, delete-orphan")
+
+
+class ClaimItem(Base):
+    __tablename__ = "claim_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    claim_id = Column(Integer, ForeignKey("claim_records.id"))
+    inspection_item_id = Column(Integer, ForeignKey("inspection_cargo_items.id"))
+    cargo_id = Column(Integer, comment="货物ID")
+    cargo_name = Column(String, comment="货物名称")
+    damage_status = Column(String, comment="损坏状态")
+    damage_type = Column(String, nullable=True, comment="损坏类型")
+    declared_value = Column(Float, default=0.0, comment="申报价值")
+    claim_ratio = Column(Float, default=0.0, comment="理赔比例")
+    claim_amount = Column(Float, default=0.0, comment="理赔金额")
+    primary_responsibility = Column(String, comment="主要责任方")
+    created_at = Column(DateTime, server_default=func.now())
+
+    claim = relationship("ClaimRecord", back_populates="claim_items")
+    inspection_item = relationship("InspectionCargoItem")

@@ -55,6 +55,7 @@ def startup_event():
     crud.create_demo_review_record(db)
     crud.create_demo_unloading_routes(db)
     crud.create_default_rate_schemes(db)
+    crud.create_demo_damage_claim(db)
 
 
 @app.get("/")
@@ -4026,5 +4027,379 @@ def compare_rate_schemes(request: schemas.RateCompareRequest, db: Session = Depe
         raise HTTPException(status_code=400, detail=result["error"])
 
     return result
+
+
+# ==================== 货损理赔与责任判定 API ====================
+
+def _resolve_damage_inspection(inspection_identifier: str, db: Session):
+    inspection = None
+    if inspection_identifier.isdigit():
+        inspection = crud.get_damage_inspection(db, inspection_id=int(inspection_identifier))
+    if inspection is None:
+        inspection = crud.get_damage_inspection(db, inspection_no=inspection_identifier)
+    return inspection
+
+
+def _resolve_claim_record(claim_identifier: str, db: Session):
+    claim = None
+    if claim_identifier.isdigit():
+        claim = crud.get_claim_record(db, claim_id=int(claim_identifier))
+    if claim is None:
+        claim = crud.get_claim_record(db, claim_no=claim_identifier)
+    return claim
+
+
+@app.post("/damage/inspections", response_model=schemas.CargoDamageInspection)
+def create_damage_inspection_api(
+    request: schemas.CargoDamageInspectionCreate,
+    db: Session = Depends(get_db)
+):
+    try:
+        inspection = crud.create_damage_inspection(
+            db,
+            request.model_dump(),
+            [item.model_dump() for item in request.inspection_items]
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "id": inspection.id,
+        "inspection_no": inspection.inspection_no,
+        "plan_identifier": str(inspection.plan_id),
+        "plan_id": inspection.plan_id,
+        "plan_no": inspection.plan_no,
+        "plan_version": inspection.plan_version or 1,
+        "container_no": inspection.container_no,
+        "shipment_no": inspection.shipment_no,
+        "inspector": inspection.inspector,
+        "inspection_date": inspection.inspection_date.isoformat() if inspection.inspection_date else None,
+        "total_cargos": inspection.total_cargos,
+        "intact_count": inspection.intact_count,
+        "minor_damage_count": inspection.minor_damage_count,
+        "severe_damage_count": inspection.severe_damage_count,
+        "lost_count": inspection.lost_count,
+        "remarks": inspection.remarks,
+        "status": inspection.status,
+        "created_at": inspection.created_at.isoformat() if inspection.created_at else "",
+        "updated_at": inspection.updated_at.isoformat() if inspection.updated_at else "",
+    }
+
+
+@app.post("/damage/inspections/{inspection_identifier}/analyze")
+def run_damage_analysis_api(
+    inspection_identifier: str,
+    db: Session = Depends(get_db)
+):
+    inspection = _resolve_damage_inspection(inspection_identifier, db)
+    if not inspection:
+        raise HTTPException(status_code=404, detail="检验记录不存在")
+
+    try:
+        result = crud.run_damage_analysis(db, inspection.id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return result
+
+
+@app.get("/damage/inspections")
+def list_damage_inspections_api(
+    plan_identifier: Optional[str] = None,
+    status: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    inspections = crud.list_damage_inspections(
+        db,
+        plan_identifier=plan_identifier,
+        status=status,
+        skip=skip,
+        limit=limit
+    )
+    result = []
+    for insp in inspections:
+        result.append({
+            "id": insp.id,
+            "inspection_no": insp.inspection_no,
+            "plan_id": insp.plan_id,
+            "plan_no": insp.plan_no,
+            "plan_version": insp.plan_version or 1,
+            "container_no": insp.container_no,
+            "shipment_no": insp.shipment_no,
+            "inspector": insp.inspector,
+            "inspection_date": insp.inspection_date.isoformat() if insp.inspection_date else None,
+            "total_cargos": insp.total_cargos,
+            "intact_count": insp.intact_count,
+            "minor_damage_count": insp.minor_damage_count,
+            "severe_damage_count": insp.severe_damage_count,
+            "lost_count": insp.lost_count,
+            "status": insp.status,
+            "remarks": insp.remarks,
+            "created_at": insp.created_at.isoformat() if insp.created_at else "",
+            "updated_at": insp.updated_at.isoformat() if insp.updated_at else "",
+        })
+    return result
+
+
+@app.get("/damage/inspections/{inspection_identifier}", response_model=schemas.CargoDamageInspectionDetail)
+def get_damage_inspection_detail_api(
+    inspection_identifier: str,
+    db: Session = Depends(get_db)
+):
+    inspection = _resolve_damage_inspection(inspection_identifier, db)
+    if not inspection:
+        raise HTTPException(status_code=404, detail="检验记录不存在")
+
+    inspection_items = crud.get_inspection_items(db, inspection.id)
+    damage_inferences = crud.get_damage_inferences(db, inspection.id)
+
+    claim_record = None
+    claim_items = []
+    if hasattr(inspection, 'claim_record') and inspection.claim_record:
+        claim_record = inspection.claim_record
+        claim_items = crud.get_claim_items(db, claim_record.id)
+
+    items_list = []
+    for item in inspection_items:
+        items_list.append({
+            "id": item.id,
+            "inspection_id": item.inspection_id,
+            "packed_cargo_id": item.packed_cargo_id,
+            "cargo_id": item.cargo_id,
+            "cargo_name": item.cargo_name,
+            "item_no": item.item_no,
+            "damage_status": item.damage_status,
+            "damage_type": item.damage_type,
+            "declared_value": item.declared_value,
+            "damage_description": item.damage_description,
+            "position_x": item.position_x,
+            "position_y": item.position_y,
+            "position_z": item.position_z,
+            "length": item.length,
+            "width": item.width,
+            "height": item.height,
+            "weight": item.weight,
+            "max_top_load": item.max_top_load,
+            "temperature_class": item.temperature_class,
+            "hazard_class": item.hazard_class,
+            "stack_layer": item.stack_layer,
+            "is_door_side": item.is_door_side,
+            "is_bottom_layer": item.is_bottom_layer,
+            "top_pressure_weight": item.top_pressure_weight,
+        })
+
+    inferences_list = []
+    for inf in damage_inferences:
+        inferences_list.append({
+            "id": inf.id,
+            "inspection_id": inf.inspection_id,
+            "inspection_item_id": inf.inspection_item_id,
+            "cargo_id": inf.cargo_id,
+            "cargo_name": inf.cargo_name,
+            "inferred_cause": inf.inferred_cause,
+            "confidence_level": inf.confidence_level,
+            "responsibility": inf.responsibility,
+            "inference_detail": inf.inference_detail or {},
+            "evidence_list": inf.evidence_list or [],
+            "explanation": inf.explanation,
+            "created_at": inf.created_at.isoformat() if inf.created_at else "",
+        })
+
+    claim_data = None
+    if claim_record:
+        claim_items_list = []
+        for ci in claim_items:
+            claim_items_list.append({
+                "id": ci.id,
+                "claim_id": ci.claim_id,
+                "inspection_item_id": ci.inspection_item_id,
+                "cargo_id": ci.cargo_id,
+                "cargo_name": ci.cargo_name,
+                "damage_status": ci.damage_status,
+                "damage_type": ci.damage_type,
+                "declared_value": ci.declared_value,
+                "claim_ratio": ci.claim_ratio,
+                "claim_amount": ci.claim_amount,
+                "primary_responsibility": ci.primary_responsibility,
+                "created_at": ci.created_at.isoformat() if ci.created_at else "",
+            })
+        claim_data = {
+            "id": claim_record.id,
+            "claim_no": claim_record.claim_no,
+            "inspection_id": claim_record.inspection_id,
+            "plan_id": claim_record.plan_id,
+            "plan_no": claim_record.plan_no,
+            "container_no": claim_record.container_no,
+            "shipment_no": claim_record.shipment_no,
+            "total_declared_value": claim_record.total_declared_value,
+            "total_claim_amount": claim_record.total_claim_amount,
+            "minor_damage_amount": claim_record.minor_damage_amount,
+            "severe_damage_amount": claim_record.severe_damage_amount,
+            "lost_amount": claim_record.lost_amount,
+            "carrier_responsibility_amount": claim_record.carrier_responsibility_amount,
+            "packer_responsibility_amount": claim_record.packer_responsibility_amount,
+            "shipper_responsibility_amount": claim_record.shipper_responsibility_amount,
+            "force_majeure_amount": claim_record.force_majeure_amount,
+            "status": claim_record.status,
+            "handler": claim_record.handler,
+            "remarks": claim_record.remarks,
+            "claim_date": claim_record.claim_date.isoformat() if claim_record.claim_date else None,
+            "created_at": claim_record.created_at.isoformat() if claim_record.created_at else "",
+            "updated_at": claim_record.updated_at.isoformat() if claim_record.updated_at else "",
+            "claim_items": claim_items_list,
+        }
+
+    return {
+        "id": inspection.id,
+        "inspection_no": inspection.inspection_no,
+        "plan_identifier": str(inspection.plan_id),
+        "plan_id": inspection.plan_id,
+        "plan_no": inspection.plan_no,
+        "plan_version": inspection.plan_version or 1,
+        "container_no": inspection.container_no,
+        "shipment_no": inspection.shipment_no,
+        "inspector": inspection.inspector,
+        "inspection_date": inspection.inspection_date.isoformat() if inspection.inspection_date else None,
+        "total_cargos": inspection.total_cargos,
+        "intact_count": inspection.intact_count,
+        "minor_damage_count": inspection.minor_damage_count,
+        "severe_damage_count": inspection.severe_damage_count,
+        "lost_count": inspection.lost_count,
+        "remarks": inspection.remarks,
+        "status": inspection.status,
+        "created_at": inspection.created_at.isoformat() if inspection.created_at else "",
+        "updated_at": inspection.updated_at.isoformat() if inspection.updated_at else "",
+        "inspection_items": items_list,
+        "damage_inferences": inferences_list,
+        "claim_record": claim_data,
+    }
+
+
+@app.get("/damage/claims")
+def list_claim_records_api(
+    plan_identifier: Optional[str] = None,
+    status: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    claims = crud.list_claim_records(
+        db,
+        plan_identifier=plan_identifier,
+        status=status,
+        skip=skip,
+        limit=limit
+    )
+    result = []
+    for claim in claims:
+        result.append({
+            "id": claim.id,
+            "claim_no": claim.claim_no,
+            "inspection_id": claim.inspection_id,
+            "plan_id": claim.plan_id,
+            "plan_no": claim.plan_no,
+            "container_no": claim.container_no,
+            "shipment_no": claim.shipment_no,
+            "total_declared_value": claim.total_declared_value,
+            "total_claim_amount": claim.total_claim_amount,
+            "minor_damage_amount": claim.minor_damage_amount,
+            "severe_damage_amount": claim.severe_damage_amount,
+            "lost_amount": claim.lost_amount,
+            "carrier_responsibility_amount": claim.carrier_responsibility_amount,
+            "packer_responsibility_amount": claim.packer_responsibility_amount,
+            "shipper_responsibility_amount": claim.shipper_responsibility_amount,
+            "force_majeure_amount": claim.force_majeure_amount,
+            "status": claim.status,
+            "handler": claim.handler,
+            "remarks": claim.remarks,
+            "claim_date": claim.claim_date.isoformat() if claim.claim_date else None,
+            "created_at": claim.created_at.isoformat() if claim.created_at else "",
+            "updated_at": claim.updated_at.isoformat() if claim.updated_at else "",
+        })
+    return result
+
+
+@app.get("/damage/claims/statistics")
+def get_claim_statistics_api(
+    plan_identifier: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    stats = crud.get_claim_statistics_by_responsibility(db, plan_identifier=plan_identifier)
+    return stats
+
+
+@app.get("/damage/claims/{claim_identifier}", response_model=schemas.ClaimRecordDetail)
+def get_claim_record_detail_api(
+    claim_identifier: str,
+    db: Session = Depends(get_db)
+):
+    claim = _resolve_claim_record(claim_identifier, db)
+    if not claim:
+        raise HTTPException(status_code=404, detail="理赔记录不存在")
+
+    claim_items = crud.get_claim_items(db, claim.id)
+    claim_items_list = []
+    for ci in claim_items:
+        claim_items_list.append({
+            "id": ci.id,
+            "claim_id": ci.claim_id,
+            "inspection_item_id": ci.inspection_item_id,
+            "cargo_id": ci.cargo_id,
+            "cargo_name": ci.cargo_name,
+            "damage_status": ci.damage_status,
+            "damage_type": ci.damage_type,
+            "declared_value": ci.declared_value,
+            "claim_ratio": ci.claim_ratio,
+            "claim_amount": ci.claim_amount,
+            "primary_responsibility": ci.primary_responsibility,
+            "created_at": ci.created_at.isoformat() if ci.created_at else "",
+        })
+
+    return {
+        "id": claim.id,
+        "claim_no": claim.claim_no,
+        "inspection_id": claim.inspection_id,
+        "plan_id": claim.plan_id,
+        "plan_no": claim.plan_no,
+        "container_no": claim.container_no,
+        "shipment_no": claim.shipment_no,
+        "total_declared_value": claim.total_declared_value,
+        "total_claim_amount": claim.total_claim_amount,
+        "minor_damage_amount": claim.minor_damage_amount,
+        "severe_damage_amount": claim.severe_damage_amount,
+        "lost_amount": claim.lost_amount,
+        "carrier_responsibility_amount": claim.carrier_responsibility_amount,
+        "packer_responsibility_amount": claim.packer_responsibility_amount,
+        "shipper_responsibility_amount": claim.shipper_responsibility_amount,
+        "force_majeure_amount": claim.force_majeure_amount,
+        "status": claim.status,
+        "handler": claim.handler,
+        "remarks": claim.remarks,
+        "claim_date": claim.claim_date.isoformat() if claim.claim_date else None,
+        "created_at": claim.created_at.isoformat() if claim.created_at else "",
+        "updated_at": claim.updated_at.isoformat() if claim.updated_at else "",
+        "claim_items": claim_items_list,
+    }
+
+
+@app.delete("/damage/inspections/{inspection_identifier}")
+def delete_damage_inspection_api(
+    inspection_identifier: str,
+    db: Session = Depends(get_db)
+):
+    inspection = _resolve_damage_inspection(inspection_identifier, db)
+    if not inspection:
+        raise HTTPException(status_code=404, detail="检验记录不存在")
+
+    db.delete(inspection)
+    db.commit()
+
+    return {
+        "message": "删除成功",
+        "inspection_id": inspection.id,
+        "inspection_no": inspection.inspection_no,
+    }
 
 
