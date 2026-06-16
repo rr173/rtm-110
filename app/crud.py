@@ -5719,7 +5719,7 @@ def create_insurance_product(db: Session, product_data: dict) -> models.Insuranc
     db.add(db_product)
     db.commit()
     db.refresh(db_product)
-    return result
+    return db_product
 
 
 def _resolve_packing_plan(plan_identifier: str, db: Session):
