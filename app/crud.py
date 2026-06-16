@@ -4920,6 +4920,19 @@ def run_damage_analysis(db: Session, inspection_id: int) -> dict:
         models.DamageInference.inspection_id == inspection_id
     ).delete()
     
+    existing_claim = db.query(models.ClaimRecord).filter(
+        models.ClaimRecord.inspection_id == inspection_id
+    ).first()
+    
+    if existing_claim:
+        db.query(models.ClaimItem).filter(
+            models.ClaimItem.claim_id == existing_claim.id
+        ).delete()
+        db.delete(existing_claim)
+    
+    db.flush()
+    db.expire_all()
+    
     for inf in result["inferences"]:
         db_inf = models.DamageInference(
             inspection_id=inspection_id,
@@ -4936,16 +4949,6 @@ def run_damage_analysis(db: Session, inspection_id: int) -> dict:
         db.add(db_inf)
     
     claim_summary = result["claim_summary"]
-    
-    existing_claim = db.query(models.ClaimRecord).filter(
-        models.ClaimRecord.inspection_id == inspection_id
-    ).first()
-    
-    if existing_claim:
-        db.query(models.ClaimItem).filter(
-            models.ClaimItem.claim_id == existing_claim.id
-        ).delete()
-        db.delete(existing_claim)
     
     claim_no = generate_claim_no()
     db_claim = models.ClaimRecord(

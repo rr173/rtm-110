@@ -1,130 +1,126 @@
-import urllib.request, json
+#!/usr/bin/env python3
+import sys
+sys.path.insert(0, '/Users/chengjie/bytedance/newcj/rtm-110')
 
-BASE = "http://localhost:8002"
+from app.database import SessionLocal
+from app import models, crud
+from app.damage_claim_engine import (
+    DAMAGE_STATUS_SEVERE,
+    DAMAGE_STATUS_MINOR,
+    DAMAGE_TYPE_CRUSH,
+    DAMAGE_TYPE_WET,
+)
 
-def req(method, path, data=None):
-    url = BASE + path
-    body = json.dumps(data).encode() if data else None
-    r = urllib.request.Request(url, data=body, method=method,
-                               headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(r) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        return {"__error__": True, "code": e.code, "body": e.read().decode()[:500]}
+def test():
+    db = SessionLocal()
+    
+    print("=" * 60)
+    print("测试: 修复验证 - 挤压损坏推断和幂等性")
+    print("=" * 60)
+    
+    # 1. 清理旧的测试数据
+    print("\n1. 清理旧数据...")
+    inspections = db.query(models.CargoDamageInspection).all()
+    for ins in inspections:
+        db.query(models.DamageInference).filter(
+            models.DamageInference.inspection_id == ins.id
+        ).delete()
+        claims = db.query(models.ClaimRecord).filter(
+            models.ClaimRecord.inspection_id == ins.id
+        ).all()
+        for claim in claims:
+            db.query(models.ClaimItem).filter(
+                models.ClaimItem.claim_id == claim.id
+            ).delete()
+            db.delete(claim)
+        db.query(models.InspectionCargoItem).filter(
+            models.InspectionCargoItem.inspection_id == ins.id
+        ).delete()
+        db.delete(ins)
+    db.commit()
+    
+    # 2. 重新生成演示数据
+    print("2. 重新生成演示数据...")
+    crud.create_demo_damage_claim(db)
+    
+    # 3. 验证问题1: 挤压损坏推断
+    print("\n3. 验证问题1: 丙烷气瓶挤压损坏推断")
+    inspection = db.query(models.CargoDamageInspection).first()
+    print(f"   检验记录: {inspection.inspection_no}")
+    
+    items = crud.get_inspection_items(db, inspection.id)
+    for item in items:
+        print(f"   - {item.cargo_name}: status={item.damage_status}, type={item.damage_type}")
+    
+    inferences = db.query(models.DamageInference).filter(
+        models.DamageInference.inspection_id == inspection.id
+    ).all()
+    
+    print(f"\n   推断结果数量: {len(inferences)}")
+    crush_found = False
+    for inf in inferences:
+        print(f"   - {inf.cargo_name}: cause={inf.inferred_cause}, confidence={inf.confidence_level}, resp={inf.responsibility}")
+        if inf.inferred_cause == DAMAGE_TYPE_CRUSH:
+            crush_found = True
+    
+    if crush_found:
+        print("\n   ✓ 挤压损坏推断存在！问题1修复成功。")
+    else:
+        print("\n   ✗ 挤压损坏推断缺失！问题1未修复！")
+    
+    # 4. 验证问题2: 幂等性
+    print("\n4. 验证问题2: 分析接口幂等性")
+    
+    # 获取初始理赔数量
+    claim_count_before = db.query(models.ClaimRecord).filter(
+        models.ClaimRecord.inspection_id == inspection.id
+    ).count()
+    print(f"   首次分析后理赔记录数: {claim_count_before}")
+    
+    # 获取初始理赔金额
+    first_claim = db.query(models.ClaimRecord).filter(
+        models.ClaimRecord.inspection_id == inspection.id
+    ).first()
+    first_amount = first_claim.total_claim_amount if first_claim else 0
+    print(f"   首次分析后理赔金额: {first_amount}")
+    
+    # 再次运行分析
+    print("   再次调用分析接口...")
+    result = crud.run_damage_analysis(db, inspection.id)
+    second_amount = result["claim_summary"]["total_claim_amount"]
+    
+    # 再次统计
+    claim_count_after = db.query(models.ClaimRecord).filter(
+        models.ClaimRecord.inspection_id == inspection.id
+    ).count()
+    print(f"   再次分析后理赔记录数: {claim_count_after}")
+    print(f"   再次分析后理赔金额: {second_amount}")
+    
+    if claim_count_before == claim_count_after and first_amount == second_amount:
+        print("\n   ✓ 幂等性验证通过！记录数和金额都没有变化，问题2修复成功。")
+    else:
+        print(f"\n   ✗ 幂等性验证失败！记录数从{claim_count_before}变成{claim_count_after}，问题2未修复！")
+    
+    # 再跑第三次确保
+    print("\n   第三次调用分析接口...")
+    result3 = crud.run_damage_analysis(db, inspection.id)
+    claim_count_third = db.query(models.ClaimRecord).filter(
+        models.ClaimRecord.inspection_id == inspection.id
+    ).count()
+    third_amount = result3["claim_summary"]["total_claim_amount"]
+    print(f"   第三次分析后理赔记录数: {claim_count_third}")
+    print(f"   第三次分析后理赔金额: {third_amount}")
+    
+    if claim_count_third == 1 and third_amount == first_amount:
+        print("\n   ✓ 三次调用结果一致，幂等性完全可靠！")
+    else:
+        print("\n   ✗ 三次调用结果不一致！")
+    
+    print("\n" + "=" * 60)
+    print("测试完成")
+    print("=" * 60)
+    
+    db.close()
 
-print("=" * 60)
-print("【修复1】品名校验：不一致应判不合格")
-print("=" * 60)
-
-# 创建一个名字完全不同的货物
-bad_cargo = req("POST", "/cargos", {
-    "name": "苹果箱",
-    "length": 400, "width": 300, "height": 300, "weight": 10,
-    "quantity": 3,
-    "declared_name": "Totally Different Name",
-    "declared_weight": 10.0
-})
-print(f"创建货物: id={bad_cargo['id']} name={bad_cargo['name']} declared={bad_cargo['declared_name']}")
-
-# 配载
-plans_resp = req("POST", "/packing/compare?save=true", {
-    "cargo_ids": [bad_cargo["id"]],
-    "container_ids": [],
-    "enable_split": False
-})
-plan_no = plans_resp["plans"][0]["plan_no"]
-plan_id = plans_resp["plans"][0]["id"]
-print(f"生成方案: {plan_no} 装入={plans_resp['plans'][0]['placed_count']}")
-
-# 合规审计
-audit = req("POST", "/compliance/audit", {"plan_identifier": plan_no})
-print(f"审计结果: passed={audit['is_passed']}")
-print(f"  品名校验: passed={audit['name_check_passed']} 违规数={len(audit['name_violations'])}")
-if audit["name_violations"]:
-    print(f"  违规示例: {audit['name_violations'][0]}")
-
-# 验证品名校验确实失败了
-assert not audit["name_check_passed"], "❌ 品名不一致应该失败但通过了!"
-assert not audit["is_passed"], "❌ 品名不一致整体审计应该失败!"
-print("✅ 品名校验修复成功：不一致判不合格")
-
-print()
-print("=" * 60)
-print("【修复2】审计列表不带筛选也能返回数据")
-print("=" * 60)
-
-all_audits = req("GET", "/compliance/audits?limit=10")
-print(f"直接查审计列表: 返回 {len(all_audits)} 条")
-assert len(all_audits) > 0, "❌ 不带筛选应该能返回审计记录!"
-for a in all_audits[:3]:
-    print(f"  - {a['audit_no']} passed={a['is_passed']} plan={a['plan_no']}")
-print("✅ 审计列表修复成功：不带筛选也返回数据")
-
-print()
-print("=" * 60)
-print("【修复3】按方案查单据 + status过滤生效")
-print("=" * 60)
-
-# 先找一个品名为空的货物(普通家电箱)，让它生成单据
-good_cargos = req("GET", "/cargos?limit=20")
-good = next((c for c in good_cargos if c["name"] == "普通家电箱"), None)
-assert good, "找不到普通家电箱"
-print(f"找到合规货物: id={good['id']} name={good['name']} declared={good['declared_name']}")
-
-# 生成方案
-plans2 = req("POST", "/packing/compare?save=true", {
-    "cargo_ids": [good["id"]],
-    "container_ids": [],
-    "enable_split": False
-})
-plan2_no = plans2["plans"][0]["plan_no"]
-print(f"生成方案: {plan2_no}")
-
-# 设置元信息
-req("PUT", f"/plans/{plan2_no}/meta", {
-    "container_no": "TEST-001",
-    "seal_no": "SEAL-001",
-    "declared_weight": good["weight"] * good["quantity"],
-})
-
-# 生成单据 (PACKING_LIST)
-gen_result = req("POST", "/customs/documents/generate", {
-    "plan_identifier": plan2_no,
-    "document_type": "PACKING_LIST",
-    "issued_by": "测试员"
-})
-assert "created_documents" in gen_result, f"生成失败: {gen_result}"
-pl_no = gen_result["created_documents"]["PACKING_LIST"]["document_no"]
-print(f"生成单据: {pl_no} status=valid")
-
-# 作废它
-voided = req("POST", f"/customs/documents/{pl_no}/void", {"reason": "作废测试"})
-print(f"作废后: status={voided['status']}")
-
-# 查全部单据 (按方案)
-all_by_plan = req("GET", f"/customs/documents?plan_identifier={plan2_no}")
-print(f"按方案查(全部): {len(all_by_plan)} 条")
-for d in all_by_plan:
-    print(f"  - {d['document_no']} {d['status']}")
-
-# 只查 valid
-valid_by_plan = req("GET", f"/customs/documents?plan_identifier={plan2_no}&status=valid")
-print(f"按方案查(valid): {len(valid_by_plan)} 条")
-for d in valid_by_plan:
-    print(f"  - {d['document_no']} {d['status']}")
-
-# 只查 void
-void_by_plan = req("GET", f"/customs/documents?plan_identifier={plan2_no}&status=void")
-print(f"按方案查(void): {len(void_by_plan)} 条")
-for d in void_by_plan:
-    print(f"  - {d['document_no']} {d['status']}")
-
-# 验证
-assert len(all_by_plan) >= 1, "❌ 按方案查全部应该至少有1条"
-assert len(void_by_plan) == 1 and void_by_plan[0]["document_no"] == pl_no, "❌ status=void 过滤不对"
-assert all(d["status"] == "valid" for d in valid_by_plan), "❌ status=valid 过滤后还有非valid的"
-print("✅ 按方案查单据 + status过滤 修复成功")
-
-print()
-print("🥳 三个修复点全部验证通过!")
+if __name__ == "__main__":
+    test()

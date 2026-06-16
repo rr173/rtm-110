@@ -467,6 +467,17 @@ def infer_damage_cause(
         matching_checks = [c for c in applicable_checks if c["cause"] == damage_type]
         if matching_checks:
             applicable_checks = matching_checks
+        else:
+            user_specified_check = next((c for c in all_checks if c["cause"] == damage_type), None)
+            if user_specified_check:
+                user_specified_check["is_applicable"] = True
+                user_specified_check["confidence"] = CONFIDENCE_LOW
+                user_specified_check["evidence"] = [
+                    "检验员已标注该损坏类型，但根据现有配载信息未发现明确致损条件",
+                    "建议结合现场照片和运输过程记录进一步核实"
+                ]
+                user_specified_check["detail"]["note"] = "检验员标注损坏类型，系统低置信度确认"
+                applicable_checks = [user_specified_check] + applicable_checks
 
     confidence_order = {CONFIDENCE_HIGH: 3, CONFIDENCE_MEDIUM: 2, CONFIDENCE_LOW: 1}
     applicable_checks.sort(key=lambda x: confidence_order.get(x["confidence"], 0), reverse=True)
