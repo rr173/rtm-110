@@ -2266,6 +2266,7 @@ class InsuranceProductMatch(BaseModel):
     estimated_premium: float = Field(description="预估保费")
     base_rate_pct: float
     final_rate_pct: float
+    effective_rate: float = Field(description="实际生效费率百分比(含各项加费)")
     breakdown: Dict[str, Any] = Field(description="保费计算明细")
     deductible_summary: Dict[str, Any] = Field(description="免赔条款摘要")
 

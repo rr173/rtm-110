@@ -5870,14 +5870,19 @@ def is_product_applicable(
         if temp_priority > max_priority:
             return False
 
-    if product.min_hazard_class is not None:
-        hc = hazard_class if hazard_class is not None else 0
-        if hc < product.min_hazard_class:
-            return False
+    has_hazard_constraint = (
+        product.min_hazard_class is not None or product.max_hazard_class is not None
+    )
 
-    if product.max_hazard_class is not None:
-        hc = hazard_class if hazard_class is not None else 0
-        if hc > product.max_hazard_class:
+    if hazard_class is not None and hazard_class > 0:
+        if not has_hazard_constraint:
+            return False
+        if product.min_hazard_class is not None and hazard_class < product.min_hazard_class:
+            return False
+        if product.max_hazard_class is not None and hazard_class > product.max_hazard_class:
+            return False
+    else:
+        if has_hazard_constraint and (product.min_hazard_class is not None and product.min_hazard_class > 0):
             return False
 
     if product.max_unit_value is not None and declared_value > product.max_unit_value:
@@ -5906,6 +5911,7 @@ def match_insurance_products_for_cargo(
                 "estimated_premium": premium_result["premium"],
                 "base_rate_pct": premium_result["base_rate_pct"],
                 "final_rate_pct": premium_result["final_rate_pct"],
+                "effective_rate": premium_result["final_rate_pct"],
                 "breakdown": premium_result["breakdown"],
                 "deductible_summary": premium_result["deductible_summary"],
             })

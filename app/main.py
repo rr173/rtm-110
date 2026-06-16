@@ -5196,18 +5196,21 @@ def surrender_insurance_policy(
     
     try:
         result = crud.surrender_policy(db, policy_id, req.surrender_reason)
+        if "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
+        sr = result["surrender_record"]
         return {
             "policy_id": result["policy_id"],
             "policy_no": result["policy_no"],
-            "surrender_no": result["surrender_no"],
-            "surrender_reason": result["surrender_reason"],
-            "total_premium": result["total_premium"],
-            "used_days": result["used_days"],
-            "total_days": result["total_days"],
-            "refund_ratio": result["refund_ratio"],
-            "refund_amount": result["refund_amount"],
-            "new_status": result["new_status"],
-            "surrendered_at": result["surrendered_at"].isoformat() if hasattr(result["surrendered_at"], 'isoformat') else result["surrendered_at"],
+            "surrender_no": sr["surrender_no"],
+            "surrender_reason": sr["surrender_reason"],
+            "total_premium": sr["total_premium"],
+            "used_days": sr["used_days"],
+            "total_days": sr["total_days"],
+            "refund_ratio": sr["refund_ratio"],
+            "refund_amount": sr["refund_amount"],
+            "new_status": result["status"],
+            "surrendered_at": sr["surrendered_at"],
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
