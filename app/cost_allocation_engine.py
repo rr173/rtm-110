@@ -15,6 +15,76 @@ def _round2(value: float) -> float:
     return round(value, 2)
 
 
+def _allocate_with_rounding_adjustment(
+    total_amount: float,
+    items: List[Dict[str, Any]],
+    weight_key: str,
+    target_key: str,
+    amount_key: str = None,
+) -> None:
+    """
+    按权重比例分摊 total_amount 到各 items，自动处理尾差，确保 sum(items[target_key]) == total_amount（精确到分）。
+
+    参数:
+        total_amount: 待分摊的总额
+        items: 待分摊的货物列表（每项是 dict，会原地修改 target_key 字段）
+        weight_key: 权重字段名（如 volume_cbm 用于按体积比例）
+        target_key: 结果写入的字段名
+        amount_key: 可选，如果已在 items 中预先计算了每个item的精确分摊额，用这个字段；否则按 weight_key 计算
+
+    算法: 最大余数法
+        1. 先计算每件货物的精确分摊额，向下取整到分（或四舍五入）
+        2. 计算尾差 = 总额 - sum(已取整的各份额)
+        3. 按权重从大到小排序，逐件加 0.01，直到尾差用完
+    """
+    if total_amount <= 0 or not items:
+        for item in items:
+            item[target_key] = 0.0
+        return
+
+    total_weight = sum(float(item.get(weight_key, 0)) for item in items)
+    if total_weight <= 0:
+        for item in items:
+            item[target_key] = 0.0
+        return
+
+    precise_amounts = []
+    for i, item in enumerate(items):
+        if amount_key and amount_key in item:
+            precise = float(item[amount_key])
+        else:
+            w = float(item.get(weight_key, 0))
+            precise = total_amount * w / total_weight
+        precise_amounts.append(precise)
+
+    floored = [_round2(p) for p in precise_amounts]
+
+    total_floored = sum(floored)
+    rounding_diff = _round2(total_amount - total_floored)
+    diff_cents = int(round(rounding_diff * 100))
+
+    if diff_cents != 0:
+        indexed = []
+        for i, item in enumerate(items):
+            w = float(item.get(weight_key, 0))
+            remainder = precise_amounts[i] - floored[i]
+            indexed.append((i, w, remainder, precise_amounts[i]))
+
+        if diff_cents > 0:
+            indexed.sort(key=lambda x: (-x[2], -x[1], x[0]))
+            for k in range(diff_cents):
+                idx = indexed[k % len(indexed)][0]
+                floored[idx] = _round2(floored[idx] + 0.01)
+        else:
+            indexed.sort(key=lambda x: (x[2], x[1], x[0]))
+            for k in range(abs(diff_cents)):
+                idx = indexed[k % len(indexed)][0]
+                floored[idx] = _round2(floored[idx] - 0.01)
+
+    for i, item in enumerate(items):
+        item[target_key] = floored[i]
+
+
 def _get_hazard_class_for_cargo(db: Session, packed_cargo: models.PackedCargo) -> Optional[int]:
     if hasattr(packed_cargo, 'hazard_class') and packed_cargo.hazard_class:
         return packed_cargo.hazard_class
@@ -431,89 +501,146 @@ def calculate_and_allocate_for_plan(
         total_frozen += frozen_amount
         total_hazard += hazard_amount
 
-        shared_allocations = _allocate_shared_costs(
-            subtotal_shared,
-            analysis["cargos_meta"],
-            analysis["total_volume_cbm"],
-        )
-
+        alloc_items = []
+        total_volume = analysis["total_volume_cbm"]
         for cm in analysis["cargos_meta"]:
             pid = cm["packed_cargo_id"]
-            shared_info = shared_allocations.get(pid, {})
-            volume_ratio = shared_info.get("volume_ratio", 0.0)
-            shared_portion = shared_info.get("shared_portion_total", 0.0)
+            vol = float(cm.get("volume_cbm", 0))
+            ratio = vol / total_volume if total_volume > 0 else 0
+            item = {
+                "packed_cargo_id": pid,
+                "cargo_id": cm["cargo_id"],
+                "cargo_name": cm["cargo_name"],
+                "volume_cbm": vol,
+                "volume_ratio": _round2(ratio),
+                "weight_kg": cm.get("weight_kg", 0),
+                "hazard_class": cm.get("hazard_class"),
+                "temperature_class": cm.get("temperature_class"),
+                "precise_base_freight": base_freight * ratio if base_freight > 0 else 0.0,
+                "precise_overweight": overweight_amount * ratio if overweight_amount > 0 else 0.0,
+                "precise_reefer": 0.0,
+                "precise_frozen": 0.0,
+                "precise_hazard": 0.0,
+                "allocated_base_freight": 0.0,
+                "allocated_overweight_surcharge": 0.0,
+                "allocated_reefer_surcharge": 0.0,
+                "allocated_frozen_surcharge": 0.0,
+                "allocated_hazard_surcharge": 0.0,
+            }
+            alloc_items.append(item)
 
-            allocated_base = _round2(base_freight * volume_ratio) if base_freight > 0 else 0.0
-            allocated_overweight = _round2(overweight_amount * volume_ratio) if overweight_amount > 0 else 0.0
+        _allocate_with_rounding_adjustment(
+            _round2(base_freight),
+            alloc_items,
+            weight_key="volume_cbm",
+            target_key="allocated_base_freight",
+            amount_key="precise_base_freight",
+        )
 
-            dedicated_temp = per_cargo_temp_dedicated.get(pid, 0.0)
-            dedicated_hazard = per_cargo_hazard_dedicated.get(pid, 0.0)
-            dedicated_portion = _round2(dedicated_temp + dedicated_hazard)
+        _allocate_with_rounding_adjustment(
+            _round2(overweight_amount),
+            alloc_items,
+            weight_key="volume_cbm",
+            target_key="allocated_overweight_surcharge",
+            amount_key="precise_overweight",
+        )
 
-            allocated_reefer = 0.0
-            allocated_frozen = 0.0
-            if dedicated_temp > 0:
-                tc = cm.get("temperature_class")
-                if tc == "FROZEN":
-                    reefer_share_per = (reefer_amount / len([
-                        x for x in analysis["cargos_meta"]
-                        if x.get("temperature_class") in ("REFRIGERATED", "FROZEN")
-                    ])) if len([x for x in analysis["cargos_meta"]
-                        if x.get("temperature_class") in ("REFRIGERATED", "FROZEN")]) > 0 else 0
-                    frozen_share_per = (frozen_amount / len([
-                        x for x in analysis["cargos_meta"]
-                        if x.get("temperature_class") == "FROZEN"
-                    ])) if len([x for x in analysis["cargos_meta"]
-                        if x.get("temperature_class") == "FROZEN"]) > 0 else 0
-                    allocated_reefer = _round2(reefer_share_per)
-                    allocated_frozen = _round2(frozen_share_per)
-                elif tc == "REFRIGERATED":
-                    reefer_share_per = (reefer_amount / len([
-                        x for x in analysis["cargos_meta"]
-                        if x.get("temperature_class") in ("REFRIGERATED", "FROZEN")
-                    ])) if len([x for x in analysis["cargos_meta"]
-                        if x.get("temperature_class") in ("REFRIGERATED", "FROZEN")]) > 0 else 0
-                    allocated_reefer = _round2(reefer_share_per)
+        reefer_cargos = [it for it in alloc_items
+                         if it["temperature_class"] in ("REFRIGERATED", "FROZEN")]
+        if reefer_cargos and reefer_amount > 0:
+            for it in reefer_cargos:
+                it["precise_reefer"] = reefer_amount / len(reefer_cargos)
+            _allocate_with_rounding_adjustment(
+                _round2(reefer_amount),
+                reefer_cargos,
+                weight_key="volume_cbm",
+                target_key="allocated_reefer_surcharge",
+                amount_key="precise_reefer",
+            )
 
+        frozen_cargos = [it for it in alloc_items
+                         if it["temperature_class"] == "FROZEN"]
+        if frozen_cargos and frozen_amount > 0:
+            for it in frozen_cargos:
+                it["precise_frozen"] = frozen_amount / len(frozen_cargos)
+            _allocate_with_rounding_adjustment(
+                _round2(frozen_amount),
+                frozen_cargos,
+                weight_key="volume_cbm",
+                target_key="allocated_frozen_surcharge",
+                amount_key="precise_frozen",
+            )
+
+        hazard_classes = analysis["hazard_classes"]
+        for hc in hazard_classes:
+            hc_cargos = [it for it in alloc_items if it["hazard_class"] == hc]
+            if not hc_cargos:
+                continue
+            class_amt = float(per_cargo_hazard_dedicated.get(it["packed_cargo_id"], 0.0)
+                              for it in hc_cargos).__iter__().__next__() if hc_cargos else 0.0
+            total_hazard_for_class = _round2(sum(
+                float(per_cargo_hazard_dedicated.get(it["packed_cargo_id"], 0.0))
+                for it in hc_cargos
+            ))
+            if total_hazard_for_class > 0:
+                for it in hc_cargos:
+                    it["precise_hazard"] = float(per_cargo_hazard_dedicated.get(it["packed_cargo_id"], 0.0))
+                _allocate_with_rounding_adjustment(
+                    total_hazard_for_class,
+                    hc_cargos,
+                    weight_key="volume_cbm",
+                    target_key="allocated_hazard_surcharge",
+                    amount_key="precise_hazard",
+                )
+
+        for item in alloc_items:
+            shared_portion = _round2(item["allocated_base_freight"] + item["allocated_overweight_surcharge"])
+            dedicated_portion = _round2(
+                item["allocated_reefer_surcharge"]
+                + item["allocated_frozen_surcharge"]
+                + item["allocated_hazard_surcharge"]
+            )
             total_alloc = _round2(shared_portion + dedicated_portion)
 
             cargo_allocations_data.append({
                 "plan_id": plan.id,
-                "packed_cargo_id": pid,
-                "cargo_id": cm["cargo_id"],
-                "cargo_name": cm["cargo_name"],
+                "packed_cargo_id": item["packed_cargo_id"],
+                "cargo_id": item["cargo_id"],
+                "cargo_name": item["cargo_name"],
                 "box_index": box_index,
-                "volume_cbm": cm["volume_cbm"],
-                "volume_ratio": _round2(volume_ratio),
-                "weight_kg": cm["weight_kg"],
-                "hazard_class": cm.get("hazard_class"),
-                "temperature_class": cm.get("temperature_class"),
-                "allocated_base_freight": allocated_base,
-                "allocated_overweight_surcharge": allocated_overweight,
-                "allocated_reefer_surcharge": allocated_reefer,
-                "allocated_frozen_surcharge": allocated_frozen,
-                "allocated_hazard_surcharge": dedicated_hazard,
+                "volume_cbm": item["volume_cbm"],
+                "volume_ratio": item["volume_ratio"],
+                "weight_kg": item["weight_kg"],
+                "hazard_class": item["hazard_class"],
+                "temperature_class": item["temperature_class"],
+                "allocated_base_freight": item["allocated_base_freight"],
+                "allocated_overweight_surcharge": item["allocated_overweight_surcharge"],
+                "allocated_reefer_surcharge": item["allocated_reefer_surcharge"],
+                "allocated_frozen_surcharge": item["allocated_frozen_surcharge"],
+                "allocated_hazard_surcharge": item["allocated_hazard_surcharge"],
                 "shared_portion": shared_portion,
                 "dedicated_portion": dedicated_portion,
                 "total_allocated": total_alloc,
                 "allocation_breakdown": {
                     "shared_breakdown": {
-                        "base_freight": allocated_base,
-                        "overweight_surcharge": allocated_overweight,
+                        "base_freight": item["allocated_base_freight"],
+                        "overweight_surcharge": item["allocated_overweight_surcharge"],
                         "total_shared": shared_portion,
                     },
                     "dedicated_breakdown": {
-                        "reefer_surcharge": allocated_reefer,
-                        "frozen_surcharge": allocated_frozen,
-                        "hazard_surcharge": dedicated_hazard,
+                        "reefer_surcharge": item["allocated_reefer_surcharge"],
+                        "frozen_surcharge": item["allocated_frozen_surcharge"],
+                        "hazard_surcharge": item["allocated_hazard_surcharge"],
                         "total_dedicated": dedicated_portion,
                     },
                     "verification": {
-                        "sum_shared_plus_dedicated": _round2(shared_portion + dedicated_portion),
+                        "sum_shared_plus_dedicated": total_alloc,
                         "sum_component_wise": _round2(
-                            allocated_base + allocated_overweight
-                            + allocated_reefer + allocated_frozen
-                            + dedicated_hazard
+                            item["allocated_base_freight"]
+                            + item["allocated_overweight_surcharge"]
+                            + item["allocated_reefer_surcharge"]
+                            + item["allocated_frozen_surcharge"]
+                            + item["allocated_hazard_surcharge"]
                         ),
                     },
                 },
