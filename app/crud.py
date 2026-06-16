@@ -5144,9 +5144,6 @@ def get_claim_trend_analysis(
     for period_key in sorted(period_groups.keys()):
         period_claims = period_groups[period_key]
         period_count = len(period_claims)
-        period_amount = sum(c.total_claim_amount or 0.0 for c in period_claims)
-        total_count += period_count
-        total_amount += period_amount
 
         damage_type_stats: Dict[str, Dict[str, Any]] = {}
         responsibility_stats: Dict[str, float] = {
@@ -5155,22 +5152,32 @@ def get_claim_trend_analysis(
             "shipper": 0.0,
             "force_majeure": 0.0,
         }
+        period_amount = 0.0
 
         for claim in period_claims:
-            responsibility_stats["carrier"] += claim.carrier_responsibility_amount or 0.0
-            responsibility_stats["packer"] += claim.packer_responsibility_amount or 0.0
-            responsibility_stats["shipper"] += claim.shipper_responsibility_amount or 0.0
-            responsibility_stats["force_majeure"] += claim.force_majeure_amount or 0.0
-
             claim_items = db.query(models.ClaimItem).filter(
                 models.ClaimItem.claim_id == claim.id
             ).all()
+
             for ci in claim_items:
                 dt = ci.damage_type or "unknown"
+
+                if damage_type and dt != damage_type:
+                    continue
+
                 if dt not in damage_type_stats:
                     damage_type_stats[dt] = {"count": 0, "amount": 0.0}
                 damage_type_stats[dt]["count"] += 1
-                damage_type_stats[dt]["amount"] += ci.claim_amount or 0.0
+                item_amount = ci.claim_amount or 0.0
+                damage_type_stats[dt]["amount"] += item_amount
+                period_amount += item_amount
+
+                resp = ci.primary_responsibility
+                if resp in responsibility_stats:
+                    responsibility_stats[resp] += item_amount
+
+        total_count += period_count
+        total_amount += period_amount
 
         damage_distribution = []
         for dt, stats in damage_type_stats.items():

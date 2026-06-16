@@ -4651,6 +4651,79 @@ def list_alert_events_api(
     return result
 
 
+@app.get("/damage/alerts/events/pending")
+def get_pending_alert_events_api(
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    events = crud.list_alert_events(db, only_pending=True, skip=skip, limit=limit)
+    result = []
+    for e in events:
+        result.append({
+            "id": e.id,
+            "event_no": e.event_no,
+            "rule_id": e.rule_id,
+            "rule_no": e.rule_no,
+            "rule_name": e.rule_name,
+            "trigger_time": e.trigger_time.isoformat() if e.trigger_time else "",
+            "trigger_condition": e.trigger_condition,
+            "trigger_period": e.trigger_period,
+            "scope": e.scope,
+            "scope_value": e.scope_value,
+            "actual_value": e.actual_value,
+            "threshold_value": e.threshold_value,
+            "related_claim_count": len(e.related_claim_ids or []),
+            "suggested_action": e.suggested_action,
+            "status": e.status,
+            "handler": e.handler,
+            "created_at": e.created_at.isoformat() if e.created_at else "",
+        })
+    return {
+        "total": len(result),
+        "events": result,
+    }
+
+
+@app.get("/damage/alerts/events/history")
+def get_history_alert_events_api(
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    events = crud.list_alert_events(
+        db,
+        only_pending=False,
+        skip=skip,
+        limit=limit,
+    )
+    result = []
+    for e in events:
+        result.append({
+            "id": e.id,
+            "event_no": e.event_no,
+            "rule_id": e.rule_id,
+            "rule_no": e.rule_no,
+            "rule_name": e.rule_name,
+            "trigger_time": e.trigger_time.isoformat() if e.trigger_time else "",
+            "trigger_condition": e.trigger_condition,
+            "trigger_period": e.trigger_period,
+            "scope": e.scope,
+            "scope_value": e.scope_value,
+            "actual_value": e.actual_value,
+            "threshold_value": e.threshold_value,
+            "status": e.status,
+            "handler": e.handler,
+            "handled_at": e.handled_at.isoformat() if e.handled_at else None,
+            "handling_notes": e.handling_notes,
+            "created_at": e.created_at.isoformat() if e.created_at else "",
+        })
+    return {
+        "total": len(result),
+        "events": result,
+    }
+
+
 @app.get("/damage/alerts/events/{event_identifier}", response_model=schemas.AlertEventDetail)
 def get_alert_event_detail_api(
     event_identifier: str,
@@ -4768,79 +4841,6 @@ def handle_alert_event_api(
         "handling_notes": handled.handling_notes,
         "created_at": handled.created_at.isoformat() if handled.created_at else "",
         "updated_at": handled.updated_at.isoformat() if handled.updated_at else "",
-    }
-
-
-@app.get("/damage/alerts/events/pending")
-def get_pending_alert_events_api(
-    skip: int = 0,
-    limit: int = 100,
-    db: Session = Depends(get_db)
-):
-    events = crud.list_alert_events(db, only_pending=True, skip=skip, limit=limit)
-    result = []
-    for e in events:
-        result.append({
-            "id": e.id,
-            "event_no": e.event_no,
-            "rule_id": e.rule_id,
-            "rule_no": e.rule_no,
-            "rule_name": e.rule_name,
-            "trigger_time": e.trigger_time.isoformat() if e.trigger_time else "",
-            "trigger_condition": e.trigger_condition,
-            "trigger_period": e.trigger_period,
-            "scope": e.scope,
-            "scope_value": e.scope_value,
-            "actual_value": e.actual_value,
-            "threshold_value": e.threshold_value,
-            "related_claim_count": len(e.related_claim_ids or []),
-            "suggested_action": e.suggested_action,
-            "status": e.status,
-            "handler": e.handler,
-            "created_at": e.created_at.isoformat() if e.created_at else "",
-        })
-    return {
-        "total": len(result),
-        "events": result,
-    }
-
-
-@app.get("/damage/alerts/events/history")
-def get_history_alert_events_api(
-    skip: int = 0,
-    limit: int = 100,
-    db: Session = Depends(get_db)
-):
-    events = crud.list_alert_events(
-        db,
-        only_pending=False,
-        skip=skip,
-        limit=limit,
-    )
-    result = []
-    for e in events:
-        result.append({
-            "id": e.id,
-            "event_no": e.event_no,
-            "rule_id": e.rule_id,
-            "rule_no": e.rule_no,
-            "rule_name": e.rule_name,
-            "trigger_time": e.trigger_time.isoformat() if e.trigger_time else "",
-            "trigger_condition": e.trigger_condition,
-            "trigger_period": e.trigger_period,
-            "scope": e.scope,
-            "scope_value": e.scope_value,
-            "actual_value": e.actual_value,
-            "threshold_value": e.threshold_value,
-            "status": e.status,
-            "handler": e.handler,
-            "handled_at": e.handled_at.isoformat() if e.handled_at else None,
-            "handling_notes": e.handling_notes,
-            "created_at": e.created_at.isoformat() if e.created_at else "",
-        })
-    return {
-        "total": len(result),
-        "events": result,
     }
 
 
