@@ -5195,7 +5195,13 @@ def surrender_insurance_policy(
         raise HTTPException(status_code=404, detail="投保单不存在")
     
     try:
-        result = crud.surrender_policy(db, policy_id, req.surrender_reason)
+        result = crud.surrender_policy(
+            db, 
+            policy_id, 
+            req.surrender_reason,
+            handled_by=req.handled_by,
+            remarks=req.remarks
+        )
         if "error" in result:
             raise HTTPException(status_code=400, detail=result["error"])
         sr = result["surrender_record"]

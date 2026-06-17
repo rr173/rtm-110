@@ -6040,6 +6040,9 @@ def create_insurance_policy(
         )
         declared_value = getattr(cargo, "declared_value", 0.0) or 0.0
 
+        if declared_value <= 0:
+            continue
+
         if not is_product_applicable(product, cargo_type, hazard_class, temperature_class, declared_value):
             raise ValueError(f"保险产品[{product.product_name}]不适用于货物[{cargo.name}]")
 
@@ -6369,40 +6372,31 @@ def get_insurance_statistics_by_product(db: Session, start_date=None, end_date=N
     stats = []
 
     for product in products:
-        q = db.query(models.InsurancePolicyItem).filter(
+        q = db.query(models.InsurancePolicyItem).join(
+            models.InsurancePolicy,
+            models.InsurancePolicyItem.policy_id == models.InsurancePolicy.id
+        ).filter(
             models.InsurancePolicyItem.product_id == product.id,
-        )
-
-        if start_date or end_date:
-            q = q.join(models.InsurancePolicy)
-            if start_date:
-                q = q.filter(models.InsurancePolicy.created_at >= start_date)
-            if end_date:
-                q = q.filter(models.InsurancePolicy.created_at <= end_date)
-
-        items = q.all()
-
-        policy_ids = list(set(item.policy_id for item in items))
-        policy_q = db.query(models.InsurancePolicy).filter(
-            models.InsurancePolicy.id.in_(policy_ids),
             models.InsurancePolicy.status.in_(["submitted", "accepted"]),
         )
 
         if start_date:
-            policy_q = policy_q.filter(models.InsurancePolicy.created_at >= start_date)
+            q = q.filter(models.InsurancePolicy.created_at >= start_date)
         if end_date:
-            policy_q = policy_q.filter(models.InsurancePolicy.created_at <= end_date)
+            q = q.filter(models.InsurancePolicy.created_at <= end_date)
 
-        accepted_policies = policy_q.all()
+        valid_items = q.all()
 
-        total_premium = sum(item.premium for item in items)
-        total_insured = sum(item.declared_value for item in items)
+        total_premium = sum(item.premium for item in valid_items)
+        total_insured = sum(item.declared_value for item in valid_items)
+        policy_count = len(set(item.policy_id for item in valid_items))
 
         stats.append({
             "product_id": product.id,
             "product_code": product.product_code,
             "product_name": product.product_name,
-            "total_policies": len(accepted_policies),
+            "total_policies": policy_count,
+            "total_items": len(valid_items),
             "total_premium": round(total_premium, 2),
             "total_insured_amount": round(total_insured, 2),
         })
@@ -6442,6 +6436,9 @@ def generate_insurance_policy_from_plan(
 
     policy_items = []
     for item in match_result["match_results"]:
+        declared_value = item.get("declared_value", 0.0) or 0.0
+        if declared_value <= 0:
+            continue
         if item["matched_products"]:
             selected_product = item["matched_products"][0]
             policy_items.append({
